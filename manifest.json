@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.egge21m.omarchy-cashu",
+  "name": "Cashu Wallet",
+  "version": "0.1.0",
+  "author": "Egge21M",
+  "description": "An Omarchy-native shell for a Cashu Wallet.",
+  "kinds": [
+    "bar-widget",
+    "panel",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Cashu Wallet",
+    "description": "Discreet Wallet State indicator and panel trigger",
+    "category": "Finance",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
