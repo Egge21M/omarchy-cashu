@@ -89,19 +89,29 @@ The MVP fulfills its purpose when this journey is reliable, private by default, 
 
 Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable architecture decisions live in [`docs/adr/`](./docs/adr/).
 
-## Slice 1 development
+## Slice 2 development
 
-Slice 1 is an intentionally fixture-backed Omarchy 4 Quattro shell. Its
-headless service owns one shared Wallet State fixture; the bar shows only that
-state, while the panel presents fixture balances and placeholders for setup,
-Receive, Send, and Active Transfers. It does not connect to `cocod` or perform
-wallet operations.
+Slice 2 connects the Omarchy 4 shell to a deterministic loopback mock of the
+provisional cocod v1 contract. The headless Shell Adapter owns HTTP snapshots,
+incremental SSE parsing, revision reconciliation, bounded stream rotation, and
+reconnect backoff. The bar and panel consume only its domain state. Receive and
+Send remain placeholders; this slice performs no wallet lifecycle operations.
+
+Start the mock on its default loopback address:
+
+```bash
+python3 scripts/mock-cocod.py
+```
 
 Run the repeatable static check from the repository root:
 
 ```bash
 ./scripts/smoke.sh
 ```
+
+The smoke suite verifies the mock contract and runs a real incremental SSE
+stream through the supported Quickshell/Qt runtime, including partial frames,
+heartbeats, rotation, disconnect backoff, recovery, and compatibility errors.
 
 For a live runtime check, install this repository at
 `~/.config/omarchy/plugins/io.github.egge21m.omarchy-cashu`, rescan and enable
@@ -114,6 +124,6 @@ omarchy plugin enable io.github.egge21m.omarchy-cashu --section right
 ```
 
 The live smoke check does not alter configuration or Wallet State after
-installation: it validates the loaded manifest, compares the service and panel
-fixture revisions, and opens then closes the panel through the shell's toggle
-contract.
+installation. With the mock running, it validates the loaded manifest and live
+adapter state, then enters through the bar WidgetButton handler to open and
+close the panel with the initiating-screen payload.

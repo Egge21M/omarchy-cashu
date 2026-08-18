@@ -7,9 +7,11 @@ plugin_id=io.github.egge21m.omarchy-cashu
 state_target="$plugin_id.state"
 
 "$project_dir/scripts/check.sh"
+"$project_dir/tests/contract.sh"
+"$project_dir/tests/runtime.sh"
 
 if [[ ${1:-} != "--live" ]]; then
-  echo "smoke: static checks passed (use --live after installing and enabling the plugin)"
+  echo "smoke: contract and supported-runtime checks passed (use --live after installing and enabling the plugin)"
   exit 0
 fi
 
@@ -31,26 +33,27 @@ wait_for() {
 }
 
 wait_for_panel_snapshot() {
-  local expected_fixture_id=$1
+  local expected_revision=$1
   local expected_screen_name=$2
   local value=""
   for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     value=$(omarchy-shell shell call "$plugin_id" smokeSnapshot '' 2>/dev/null || true)
-    if jq -e --arg fixture_id "$expected_fixture_id" --arg screen_name "$expected_screen_name" '
+    if jq -e --argjson revision "$expected_revision" --arg screen_name "$expected_screen_name" '
       .opened == true
       and .anchored == true
       and .requestedScreenName == $screen_name
       and .anchorScreenName == $screen_name
-      and .fixtureId == $fixture_id
-      and .revision == 1
+      and .revision == $revision
       and .walletState == "unlocked"
+      and .connectionState == "connected"
+      and .compatibilityState == "compatible"
     ' <<<"$value" >/dev/null 2>&1; then
       printf '%s\n' "$value"
       return 0
     fi
     sleep 0.1
   done
-  fail "panel did not reach its expected anchored fixture state; last response: ${value:-<empty>}"
+  fail "panel did not reach its expected anchored live state; last response: ${value:-<empty>}"
 }
 
 omarchy-shell shell ping | rg -qx 'ok' || fail "omarchy-shell is not healthy"
@@ -63,28 +66,33 @@ jq -e '.enabled == true and ((.kinds | sort) == (["bar-widget", "panel", "servic
 
 service_snapshot=$(omarchy-shell "$state_target" snapshot)
 jq -e '
-  .fixtureId == "slice-1-wallet-state"
-  and .revision == 1
-  and .fixtureBacked == true
+  .apiVersion == "1"
+  and .revision >= 1
+  and .fixtureBacked == false
   and .walletState == "unlocked"
-' <<<"$service_snapshot" >/dev/null || fail "shared fixture Wallet State is unavailable"
+  and .connectionState == "connected"
+  and .compatibilityState == "compatible"
+' <<<"$service_snapshot" >/dev/null || fail "shared live Wallet State is unavailable; is mock cocod running on 127.0.0.1:38421?"
 
 target_screen=$(hyprctl -j monitors | jq -er '.[0].name') \
   || fail "no active monitor is available for the panel anchor check"
-panel_payload=$(jq -cn --arg screenName "$target_screen" '{screenName: $screenName}')
 
-# The bar's left-click handler calls this exact shell toggle path.
 omarchy-shell shell hide "$plugin_id"
 wait_for false omarchy-shell "$state_target" panelOpen
 trap 'omarchy-shell -q shell hide "$plugin_id"' EXIT
-omarchy-shell shell toggle "$plugin_id" "$panel_payload"
+
+# Enter through WidgetButton.triggerPress so the bar handler creates and sends
+# the real initiating-screen payload.
+clicked_screen=$(omarchy-shell "$state_target" clickBar "$target_screen")
+[[ $clicked_screen == "$target_screen" ]] \
+  || fail "bar click did not target the initiating screen: ${clicked_screen:-<empty>}"
 wait_for true omarchy-shell "$state_target" panelOpen
 
 panel_snapshot=$(wait_for_panel_snapshot \
-  "$(jq -r .fixtureId <<<"$service_snapshot")" "$target_screen")
+  "$(jq -r .revision <<<"$service_snapshot")" "$target_screen")
 
-omarchy-shell shell toggle "$plugin_id" '{}'
+omarchy-shell "$state_target" clickBar "$target_screen" >/dev/null
 wait_for false omarchy-shell "$state_target" panelOpen
 trap - EXIT
 
-echo "smoke: plugin loaded, shared state matched, and bar toggle contract opened and closed the panel"
+echo "smoke: plugin loaded, live shared state matched, and the bar handler opened and closed the anchored panel"

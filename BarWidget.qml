@@ -13,9 +13,9 @@ BarWidget {
   readonly property var stateOwner: bar && bar.shell
     ? bar.shell.serviceFor(root.moduleName) : null
   readonly property string stateLabel: stateOwner
-    ? stateOwner.walletStateLabel : "Unavailable"
+    ? stateOwner.barStateLabel : "Unavailable"
   readonly property string stateGlyph: stateOwner
-    ? stateOwner.walletStateGlyph : "󰅙"
+    ? stateOwner.barStateGlyph : "󰅙"
 
   readonly property bool opened: bar && bar.shell
     ? bar.shell.isPluginOpen(root.moduleName) : false
@@ -42,6 +42,12 @@ BarWidget {
     if (bar && bar.shell) bar.shell.toggle(root.moduleName, panelPayload())
   }
 
+  // Repeatable live smoke coverage enters through WidgetButton's public press
+  // path, so it exercises this handler and the initiating-screen payload.
+  function smokeLeftClick() {
+    button.triggerPress(Qt.LeftButton)
+  }
+
   function closeForPopoutSwitch() {
     popoutSwitchClosing = true
     close()
@@ -57,9 +63,10 @@ BarWidget {
     bar: root.bar
     text: root.vertical ? root.stateGlyph : root.stateGlyph + "  " + root.stateLabel
     fontSize: Style.font.body
-    active: root.stateOwner && root.stateOwner.walletState === "error"
+    active: root.stateOwner
+      && (root.stateOwner.barAttention || root.stateOwner.barActive)
     tooltipText: "Cashu Wallet — " + root.stateLabel
-      + (root.stateOwner && root.stateOwner.fixtureBacked ? " (fixture)" : "")
+      + (root.stateOwner && root.stateOwner.barActive ? " · Active Transfer" : "")
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.togglePanel()

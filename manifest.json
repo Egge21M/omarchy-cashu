@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "io.github.egge21m.omarchy-cashu",
   "name": "Cashu Wallet",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Egge21M",
-  "description": "An Omarchy-native shell for a Cashu Wallet.",
+  "description": "An Omarchy-native Wallet Client with live cocod state.",
   "kinds": [
     "bar-widget",
     "panel",

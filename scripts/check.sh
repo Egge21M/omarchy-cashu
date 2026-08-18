@@ -22,7 +22,7 @@ jq -e --arg id "$plugin_id" '
   and .entryPoints.barWidget == "BarWidget.qml"
   and .entryPoints.panel == "Panel.qml"
   and .entryPoints.service == "Service.qml"
-' "$manifest" >/dev/null || fail "manifest contract does not match Slice 1"
+' "$manifest" >/dev/null || fail "manifest contract does not match the Wallet Client"
 
 if rg -n 'spendableBalance|reservedBalance' "$project_dir/BarWidget.qml"; then
   fail "the bar must not expose balances"
@@ -30,7 +30,28 @@ fi
 
 if rg -n '(^|[^A-Za-z])(Process|FileView|Socket|WebSocket|NetworkAccessManager)[[:space:]]*\{' \
   "$project_dir"/*.qml; then
-  fail "Slice 1 must not execute processes or perform network/filesystem IO"
+  fail "the Wallet Client must not execute processes or own filesystem/socket primitives"
+fi
+
+if rg -n 'daemonBaseUrl|XMLHttpRequest|text/event-stream|Last-Event-ID|reconnectTimer' \
+  "$project_dir/BarWidget.qml" "$project_dir/Panel.qml"; then
+  fail "transport details escaped the Shell Adapter"
+fi
+
+rg -q 'new XMLHttpRequest' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not own HTTP/SSE transport"
+rg -q 'Last-Event-ID' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not resume from a revision"
+rg -q 'safeLifecycleMetadata' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not validate lifecycle metadata"
+rg -q 'isLoopbackBaseUrl' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not restrict cocod transport to loopback"
+rg -q 'barStateLabel' "$project_dir/BarWidget.qml" \
+  || fail "bar does not separate setup status from Wallet State"
+rg -q 'balancesAvailable' "$project_dir/Panel.qml" \
+  || fail "panel does not distinguish unavailable balances"
+if rg -n --glob '!scripts/check.sh' 'QML_XHR_DUMP' "$project_dir"; then
+  fail "QML_XHR_DUMP can expose Wallet material"
 fi
 
 rg -q 'serviceFor\(root\.moduleName\)' "$project_dir/BarWidget.qml" \
@@ -45,6 +66,11 @@ rg -q 'screenName: screenName' "$project_dir/BarWidget.qml" \
   || fail "bar toggle does not preserve the initiating screen"
 rg -q 'moduleWidgets\(pluginId\)' "$project_dir/Panel.qml" \
   || fail "panel does not resolve its initiating bar widget"
+rg -q 'button\.triggerPress\(Qt\.LeftButton\)' "$project_dir/BarWidget.qml" \
+  || fail "bar smoke path does not exercise the WidgetButton press handler"
+
+python3 "$project_dir/scripts/mock-cocod.py" --help >/dev/null \
+  || fail "mock cocod is not executable Python"
 
 for qml_file in "$project_dir"/*.qml; do
   qmlformat -n "$qml_file" >/dev/null \
@@ -53,4 +79,4 @@ for qml_file in "$project_dir"/*.qml; do
     || fail "QML lint rejected ${qml_file##*/}"
 done
 
-echo "check: manifest, architecture guardrails, and QML syntax passed"
+echo "check: manifest, adapter seam, security guardrails, and QML syntax passed"

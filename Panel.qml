@@ -88,15 +88,25 @@ Item {
       + (stateOwner ? stateOwner.unit : "sat")
   }
 
-  function smokeSnapshot(arg) {
+  function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
       anchored: !!anchorItem,
       requestedScreenName: requestedScreenName,
       anchorScreenName: widgetScreenName(hostWidget),
-      fixtureId: stateOwner ? stateOwner.fixtureId : "",
       revision: stateOwner ? stateOwner.revision : 0,
-      walletState: stateOwner ? stateOwner.walletState : "unavailable"
+      walletState: stateOwner ? stateOwner.walletState : "unavailable",
+      connectionState: stateOwner ? stateOwner.connectionState : "missing",
+      compatibilityState: stateOwner ? stateOwner.compatibilityState : "unknown",
+      balancesAvailable: stateOwner ? stateOwner.balancesAvailable : false,
+      spendableBalance: stateOwner ? stateOwner.spendableBalance : 0,
+      reservedBalance: stateOwner ? stateOwner.reservedBalance : 0,
+      spendableText: spendableValue.text,
+      reservedText: reservedValue.text,
+      retryVisible: retryConnectionButton.visible,
+      retryLabel: retryConnectionButton.text,
+      activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
+      setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
 
@@ -145,7 +155,8 @@ Item {
             meta: root.stateOwner
               ? root.stateOwner.walletStateDetail + " · " + root.stateOwner.walletStateLabel
               : "Wallet State unavailable"
-            detail: root.stateOwner && root.stateOwner.fixtureBacked ? "FIXTURE" : ""
+            detail: root.stateOwner
+              ? root.stateOwner.connectionState.toUpperCase() : "MISSING"
             foreground: root.foreground
             fontFamily: root.fontFamily
 
@@ -178,7 +189,8 @@ Item {
               spacing: Style.spacing.rowGap
 
               Text {
-                text: "󰄬"
+                text: root.stateOwner && root.stateOwner.connectionState === "connected"
+                  ? "󰄬" : "󰋗"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.iconLarge
@@ -191,7 +203,8 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: "Native shell ready"
+                  text: root.stateOwner
+                    ? root.stateOwner.setupTitle : "cocod is not available"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -200,13 +213,29 @@ Item {
 
                 Text {
                   width: parent.width
-                  text: "Fixture data only · cocod is not connected"
+                  text: root.stateOwner
+                    ? root.stateOwner.setupDetail
+                    : "Start cocod, then retry the connection."
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   wrapMode: Text.WordWrap
                 }
               }
+            }
+
+            Button {
+              id: retryConnectionButton
+              visible: root.stateOwner
+                && root.stateOwner.connectionState !== "connected"
+              text: root.stateOwner
+                && root.stateOwner.compatibilityState === "incompatible"
+                ? "Check again" : "Retry connection"
+              iconText: "󰑐"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.stateOwner.retryConnection()
             }
           }
 
@@ -241,8 +270,9 @@ Item {
                 }
 
                 Text {
-                  text: root.amountText(root.stateOwner
-                    ? root.stateOwner.spendableBalance : 0)
+                  id: spendableValue
+                  text: root.stateOwner && root.stateOwner.balancesAvailable
+                    ? root.amountText(root.stateOwner.spendableBalance) : "Unavailable"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
@@ -263,8 +293,9 @@ Item {
                 }
 
                 Text {
-                  text: root.amountText(root.stateOwner
-                    ? root.stateOwner.reservedBalance : 0)
+                  id: reservedValue
+                  text: root.stateOwner && root.stateOwner.balancesAvailable
+                    ? root.amountText(root.stateOwner.reservedBalance) : "Unavailable"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
@@ -317,7 +348,7 @@ Item {
 
             Text {
               width: parent.width
-              text: "Receive and Send are placeholders in this fixture-backed slice."
+              text: "Receive and Send remain unavailable in this live-state slice."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -370,7 +401,7 @@ Item {
                 Text {
                   width: parent.width
                   text: root.activeTransfer
-                    ? root.activeTransfer.detail + " · Fixture" : ""
+                    ? root.activeTransfer.detail : ""
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
