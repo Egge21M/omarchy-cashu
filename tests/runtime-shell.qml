@@ -21,5 +21,38 @@ ShellRoot {
     function panelSnapshot(): string {
       return walletPanel.smokeSnapshot()
     }
+
+    function openPanel(): string {
+      walletPanel.open("{}")
+      return "ok"
+    }
+
+    function closePanel(): string {
+      walletPanel.close()
+      return "ok"
+    }
+
+    function createWallet(): string {
+      return walletPanel.smokeCreateWallet()
+    }
+
+    function createWalletFromAdapter(): string {
+      return adapter.createWallet() ? "ok" : "disabled"
+    }
+
+    function openRecoveryPhrase(): string {
+      walletPanel.open("{}")
+      return walletPanel.smokeOpenRecoveryPhrase()
+    }
+
+    function confirmRecoveryPhrase(): string {
+      walletPanel.open("{}")
+      return walletPanel.smokeConfirmRecoveryPhrase()
+    }
+
+    function leaveRecoveryPhrase(): string {
+      walletPanel.open("{}")
+      return walletPanel.smokeLeaveRecoveryPhrase()
+    }
   }
 }

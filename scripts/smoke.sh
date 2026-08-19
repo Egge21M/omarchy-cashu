@@ -44,7 +44,7 @@ wait_for_panel_snapshot() {
       and .requestedScreenName == $screen_name
       and .anchorScreenName == $screen_name
       and .revision == $revision
-      and .walletState == "unlocked"
+      and .walletState == "uninitialized"
       and .connectionState == "connected"
       and .compatibilityState == "compatible"
     ' <<<"$value" >/dev/null 2>&1; then
@@ -67,9 +67,9 @@ jq -e '.enabled == true and ((.kinds | sort) == (["bar-widget", "panel", "servic
 service_snapshot=$(omarchy-shell "$state_target" snapshot)
 jq -e '
   .apiVersion == "1"
-  and .revision >= 1
+  and .revision == 1
   and .fixtureBacked == false
-  and .walletState == "unlocked"
+  and .walletState == "uninitialized"
   and .connectionState == "connected"
   and .compatibilityState == "compatible"
 ' <<<"$service_snapshot" >/dev/null || fail "shared live Wallet State is unavailable; is mock cocod running on 127.0.0.1:38421?"

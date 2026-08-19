@@ -21,6 +21,9 @@ Item {
     && typeof shell.serviceFor === "function" ? shell.serviceFor(pluginId) : null)
   property string requestedScreenName: ""
   property var hostWidget: null
+  property string recoveryViewState: "closed"
+  property string recoveryPhrase: ""
+  property string recoveryError: ""
   readonly property Item anchorItem: hostWidget && hostWidget.anchorItem
     ? hostWidget.anchorItem : null
   readonly property var activeTransfer: stateOwner
@@ -73,10 +76,12 @@ Item {
   }
 
   function close() {
+    clearRecoveryPhrase()
     opened = false
   }
 
   function dismiss() {
+    clearRecoveryPhrase()
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else close()
   }
@@ -86,6 +91,66 @@ Item {
     if (!isFinite(amount)) amount = 0
     return amount.toLocaleString(Qt.locale(), "f", 0) + " "
       + (stateOwner ? stateOwner.unit : "sat")
+  }
+
+  function smokeCreateWallet() {
+    if (!createWalletButton.visible || !createWalletButton.enabled) return "disabled"
+    createWalletButton.clicked()
+    return "ok"
+  }
+
+  function openRecoveryPhrase() {
+    if (!viewRecoveryPhraseButton.visible || recoveryViewState !== "closed") return false
+    recoveryPhrase = ""
+    recoveryError = ""
+    recoveryViewState = "warning"
+    return true
+  }
+
+  function confirmRecoveryPhrase() {
+    if (recoveryViewState !== "warning" || !stateOwner) return false
+    recoveryPhrase = ""
+    recoveryError = ""
+    recoveryViewState = "requesting"
+    if (!stateOwner.revealRecoveryPhrase()) {
+      recoveryViewState = "warning"
+      recoveryError = "Recovery Phrase could not be revealed"
+      return false
+    }
+    return true
+  }
+
+  function clearRecoveryPhrase() {
+    recoveryPhrase = ""
+    recoveryError = ""
+    recoveryViewState = "closed"
+    if (stateOwner && typeof stateOwner.cancelRecoveryPhraseReveal === "function")
+      stateOwner.cancelRecoveryPhraseReveal()
+  }
+
+  function smokeOpenRecoveryPhrase() {
+    if (!viewRecoveryPhraseButton.visible) return "disabled"
+    viewRecoveryPhraseButton.clicked()
+    return "ok"
+  }
+
+  function smokeConfirmRecoveryPhrase() {
+    if (!confirmRecoveryPhraseButton.visible || !confirmRecoveryPhraseButton.enabled)
+      return "disabled"
+    confirmRecoveryPhraseButton.clicked()
+    return "ok"
+  }
+
+  function smokeLeaveRecoveryPhrase() {
+    if (recoveryViewState === "warning" || recoveryViewState === "requesting") {
+      cancelRecoveryPhraseButton.clicked()
+      return "ok"
+    }
+    if (recoveryViewState === "revealed") {
+      backRecoveryPhraseButton.clicked()
+      return "ok"
+    }
+    return "disabled"
   }
 
   function smokeSnapshot() {
@@ -105,9 +170,46 @@ Item {
       reservedText: reservedValue.text,
       retryVisible: retryConnectionButton.visible,
       retryLabel: retryConnectionButton.text,
+      createVisible: createWalletButton.visible,
+      createEnabled: createWalletButton.enabled,
+      createLabel: createWalletButton.text,
+      recoveryEntryVisible: viewRecoveryPhraseButton.visible,
+      recoveryViewState: recoveryViewState,
+      recoveryWarningVisible: recoveryWarning.visible,
+      recoveryConfirmVisible: confirmRecoveryPhraseButton.visible,
+      recoveryPhraseVisible: recoveryPhraseText.visible,
       activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
+  }
+
+  onOpenedChanged: {
+    if (!opened) clearRecoveryPhrase()
+  }
+
+  Component.onDestruction: clearRecoveryPhrase()
+
+  Connections {
+    target: root.stateOwner
+    ignoreUnknownSignals: true
+
+    function onRecoveryPhraseRevealed(phrase) {
+      if (!root.opened || root.recoveryViewState !== "requesting") return
+      root.recoveryPhrase = phrase
+      root.recoveryViewState = "revealed"
+    }
+
+    function onRecoveryPhraseRevealFailed(detail) {
+      if (root.recoveryViewState !== "requesting") return
+      root.recoveryPhrase = ""
+      root.recoveryError = detail
+      root.recoveryViewState = "warning"
+    }
+
+    function onWalletStateChanged() {
+      if (!root.stateOwner || root.stateOwner.walletState !== "unlocked")
+        root.clearRecoveryPhrase()
+    }
   }
 
   Timer {
@@ -175,6 +277,125 @@ Item {
           }
 
           Column {
+            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "RECOVERY PHRASE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: root.recoveryViewState === "closed"
+              width: parent.width
+              text: "Reveal the Recovery Phrase only when you are ready to store it privately."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              id: viewRecoveryPhraseButton
+              visible: root.stateOwner
+                && root.stateOwner.walletState === "unlocked"
+                && root.recoveryViewState === "closed"
+              text: "View Recovery Phrase"
+              iconText: "󰌆"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.openRecoveryPhrase()
+            }
+
+            Text {
+              id: recoveryWarning
+              visible: root.recoveryViewState === "warning"
+                || root.recoveryViewState === "requesting"
+              width: parent.width
+              text: "Anyone with your Recovery Phrase can take your ecash. Make sure nobody can see your screen and store the words somewhere private."
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              visible: recoveryWarning.visible && root.recoveryError !== ""
+              width: parent.width
+              text: root.recoveryError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              visible: recoveryWarning.visible
+              width: parent.width
+              spacing: Style.spacing.controlGap
+
+              Button {
+                id: confirmRecoveryPhraseButton
+                width: (parent.width - parent.spacing) / 2
+                visible: recoveryWarning.visible
+                enabled: root.recoveryViewState === "warning"
+                text: root.recoveryViewState === "requesting"
+                  ? "Revealing…" : "I understand, reveal"
+                iconText: "󰄬"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                onClicked: root.confirmRecoveryPhrase()
+              }
+
+              Button {
+                id: cancelRecoveryPhraseButton
+                width: (parent.width - parent.spacing) / 2
+                text: "Cancel"
+                iconText: "󰅖"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                onClicked: root.clearRecoveryPhrase()
+              }
+            }
+
+            Text {
+              id: recoveryPhraseText
+              visible: root.recoveryViewState === "revealed"
+                && root.recoveryPhrase !== ""
+              width: parent.width
+              text: visible ? root.recoveryPhrase : ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Button {
+              id: backRecoveryPhraseButton
+              visible: root.recoveryViewState === "revealed"
+              text: "Back"
+              iconText: "󰁍"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.clearRecoveryPhrase()
+            }
+          }
+
+          PanelSeparator {
+            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            foreground: root.foreground
+          }
+
+          Column {
             width: parent.width
             spacing: Style.spacing.labelGap
 
@@ -236,6 +457,32 @@ Item {
               fontFamily: root.fontFamily
               bordered: true
               onClicked: root.stateOwner.retryConnection()
+            }
+            Button {
+              id: createWalletButton
+              visible: root.stateOwner
+                && root.stateOwner.connectionState === "connected"
+                && root.stateOwner.compatibilityState === "compatible"
+                && root.stateOwner.walletState === "uninitialized"
+              enabled: visible && !root.stateOwner.creating
+              text: root.stateOwner && root.stateOwner.creating
+                ? "Creating Wallet…" : "Create Wallet"
+              iconText: "󰆦"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.stateOwner.createWallet()
+            }
+
+            Text {
+              visible: createWalletButton.visible && root.stateOwner
+                && root.stateOwner.createError !== ""
+              width: parent.width
+              text: root.stateOwner ? root.stateOwner.createError : ""
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
             }
           }
 

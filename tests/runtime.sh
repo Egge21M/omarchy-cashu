@@ -47,6 +47,11 @@ panel_call() {
     io.github.egge21m.omarchy-cashu.runtime-test panelSnapshot 2>/dev/null
 }
 
+panel_action() {
+  quickshell ipc --any-display -p "$shell_qml" call \
+    io.github.egge21m.omarchy-cashu.runtime-test "$@" 2>/dev/null
+}
+
 wait_snapshot() {
   local expression=$1
   local value=""
@@ -110,29 +115,240 @@ wait_snapshot '
   .revision == 1
   and .connectionState == "connected"
   and .compatibilityState == "compatible"
-  and .walletState == "unlocked"
-  and .spendableBalance == 42000
-  and .reservedBalance == 7000
-  and .barAttention == false
-  and .barActive == true
+  and .walletState == "uninitialized"
+  and .spendableBalance == 0
+  and .reservedBalance == 0
+  and .trustedMintCount == 0
+  and .creating == false
+  and .barAttention == true
+  and .barActive == false
   and .setupTitle == "Connected to cocod"
 ' >/dev/null
-wait_panel_snapshot '
+panel_snapshot=$(wait_panel_snapshot '
   .revision == 1
-  and .walletState == "unlocked"
+  and .walletState == "uninitialized"
   and .balancesAvailable == true
-  and .spendableBalance == 42000
-  and .reservedBalance == 7000
+  and .spendableBalance == 0
+  and .reservedBalance == 0
   and .retryVisible == false
+  and .createVisible == true
+  and .createEnabled == true
+  and .createLabel == "Create Wallet"
+  and .recoveryEntryVisible == false
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+')
+if rg -qi 'abandon|recoveryPhrase[^VR]' <<<"$panel_snapshot"; then
+  fail "ordinary pre-confirmation panel diagnostics exposed Recovery Phrase material"
+fi
+wait_mock_status '
+  .createRequests == 0
+  and .recoveryPhraseRevealRequests == 0
 ' >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"snapshot":"ok","createDelayMs":300}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action createWallet) == "ok" ]] \
+  || fail "explicit Create Wallet action was unavailable"
+wait_snapshot '.creating == true and .walletState == "uninitialized"' >/dev/null
+wait_panel_snapshot '
+  .createVisible == true
+  and .createEnabled == false
+  and .createLabel == "Creating Wallet…"
+  and .recoveryEntryVisible == false
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.createRequests == 1' >/dev/null
+[[ $(panel_action createWallet) == "disabled" ]] \
+  || fail "duplicate Create Wallet action remained available in flight"
+wait_mock_status '.createRequests == 1' >/dev/null
+
+wait_snapshot '
+  .revision == 2
+  and .observedRevision == 2
+  and .walletState == "unlocked"
+  and .creating == false
+  and .spendableBalance == 0
+  and .reservedBalance == 0
+  and .activeTransfers == []
+  and .trustedMintCount == 0
+' >/dev/null
+wait_panel_snapshot '
+  .revision == 2
+  and .walletState == "unlocked"
+  and .createVisible == false
+  and .recoveryEntryVisible == true
+' >/dev/null
+
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+OMARCHY_CASHU_DAEMON_URL="$base_url" quickshell --no-color -p "$shell_qml" \
+  >"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '
+  .revision == 2
+  and .walletState == "unlocked"
+  and .creating == false
+  and .spendableBalance == 0
+' >/dev/null
+wait_mock_status '.createRequests == 1' >/dev/null
+
+echo "runtime: explicit creation and shell-only restart passed"
+
+panel_action openPanel >/dev/null
+panel_snapshot=$(wait_panel_snapshot '
+  .opened == true
+  and .recoveryEntryVisible == true
+  and .recoveryViewState == "closed"
+  and .recoveryWarningVisible == false
+  and .recoveryConfirmVisible == false
+  and .recoveryPhraseVisible == false
+')
+if rg -q 'abandon' <<<"$(adapter_call snapshot)$panel_snapshot"; then
+  fail "Recovery Phrase appeared in diagnostics before confirmation"
+fi
+[[ $(panel_action confirmRecoveryPhrase) == "disabled" ]] \
+  || fail "Recovery Phrase could be requested without opening its warning"
+wait_mock_status '.recoveryPhraseRevealRequests == 0' >/dev/null
+
+[[ $(panel_action openRecoveryPhrase) == "ok" ]] \
+  || fail "View Recovery Phrase entry point was unavailable"
+wait_panel_snapshot '
+  .recoveryEntryVisible == false
+  and .recoveryViewState == "warning"
+  and .recoveryWarningVisible == true
+  and .recoveryConfirmVisible == true
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 0' >/dev/null
+
+[[ $(panel_action leaveRecoveryPhrase) == "ok" ]] \
+  || fail "Recovery Phrase warning could not be cancelled"
+wait_panel_snapshot '
+  .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 0' >/dev/null
+panel_action openRecoveryPhrase >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "warning"
+  and .recoveryConfirmVisible == true
+' >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"snapshot":"ok","revealDelayMs":300}' "$base_url/__test__/mode" >/dev/null
+panel_action confirmRecoveryPhrase >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "requesting"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 1' >/dev/null
+panel_action closePanel >/dev/null
+wait_panel_snapshot '
+  .opened == false
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealResponses == 1' >/dev/null
+wait_panel_snapshot '
+  .opened == false
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+panel_action openPanel >/dev/null
+wait_panel_snapshot '
+  .opened == true
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"snapshot":"ok","revealDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+panel_action openRecoveryPhrase >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "warning"
+  and .recoveryConfirmVisible == true
+' >/dev/null
+
+[[ $(panel_action confirmRecoveryPhrase) == "ok" ]] \
+  || fail "Recovery Phrase confirmation was unavailable after the warning"
+wait_mock_status '.recoveryPhraseRevealRequests == 2' >/dev/null
+panel_snapshot=$(wait_panel_snapshot '
+  .recoveryViewState == "revealed"
+  and .recoveryWarningVisible == false
+  and .recoveryConfirmVisible == false
+  and .recoveryPhraseVisible == true
+')
+if rg -q 'abandon' <<<"$(adapter_call snapshot)$panel_snapshot"; then
+  fail "Recovery Phrase escaped through adapter or panel diagnostics"
+fi
+
+[[ $(panel_action leaveRecoveryPhrase) == "ok" ]] \
+  || fail "Recovery Phrase view could not be left"
+wait_panel_snapshot '
+  .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+
+panel_action openRecoveryPhrase >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "warning"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 2' >/dev/null
+panel_action confirmRecoveryPhrase >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 3' >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "revealed"
+  and .recoveryPhraseVisible == true
+' >/dev/null
+panel_action closePanel >/dev/null
+wait_panel_snapshot '
+  .opened == false
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+panel_action openPanel >/dev/null
+wait_panel_snapshot '
+  .opened == true
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 3' >/dev/null
+
+panel_action openRecoveryPhrase >/dev/null
+panel_action confirmRecoveryPhrase >/dev/null
+wait_mock_status '.recoveryPhraseRevealRequests == 4' >/dev/null
+wait_panel_snapshot '
+  .recoveryViewState == "revealed"
+  and .recoveryPhraseVisible == true
+' >/dev/null
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+OMARCHY_CASHU_DAEMON_URL="$base_url" quickshell --no-color -p "$shell_qml" \
+  >"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '.revision == 2 and .walletState == "unlocked"' >/dev/null
+wait_panel_snapshot '
+  .opened == false
+  and .recoveryViewState == "closed"
+  and .recoveryPhraseVisible == false
+' >/dev/null
+wait_mock_status '
+  .createRequests == 1
+  and .recoveryPhraseRevealRequests == 4
+' >/dev/null
+
+echo "runtime: confirmed transient Recovery Phrase reveal passed"
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"wallet":{"balances":{"spendable":50000,"reserved":0,"unit":"sat"},"activeTransfers":[]},"delivery":"partial"}' \
   "$base_url/__test__/snapshot" >/dev/null
 
 wait_snapshot '
-  .revision == 2
-  and .observedRevision == 2
+  .revision == 3
+  and .observedRevision == 3
   and .spendableBalance == 50000
   and .reservedBalance == 0
   and .activeTransfers == []
@@ -140,7 +356,7 @@ wait_snapshot '
   and .heartbeatCount > 0
 ' >/dev/null
 wait_panel_snapshot '
-  .revision == 2
+  .revision == 3
   and .balancesAvailable == true
   and .spendableBalance == 50000
   and .reservedBalance == 0
@@ -158,24 +374,24 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"ok","delayMs":0}' "$base_url/__test__/mode" >/dev/null
 wait_snapshot '
   .connectionState == "connected"
-  and .revision == 3
+  and .revision == 4
   and .rotationCount == 1
   and .reconnectCount >= 1
 ' >/dev/null
 
-wait_mock_status '.streamConnections >= 1 and .lastEventId == "3"' >/dev/null
+wait_mock_status '.streamConnections >= 1 and .lastEventId == "4"' >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"wallet":{"balances":{"spendable":52000,"reserved":0,"unit":"sat"}},"delivery":"whole"}' \
   "$base_url/__test__/snapshot" >/dev/null
 wait_snapshot '
   .connectionState == "connected"
-  and .revision == 4
-  and .observedRevision == 4
+  and .revision == 5
+  and .observedRevision == 5
   and .spendableBalance == 52000
 ' >/dev/null
 wait_panel_snapshot '
-  .revision == 4
+  .revision == 5
   and .balancesAvailable == true
   and .spendableBalance == 52000
 ' >/dev/null
@@ -206,7 +422,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"ok"}' "$base_url/__test__/mode" >/dev/null
 wait_snapshot '
   .connectionState == "connected"
-  and .revision == 4
+  and .revision == 5
   and .retryAttempt == 0
   and .retryDelayMs == 0
 ' >/dev/null
@@ -224,21 +440,22 @@ wait_snapshot '
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"ok"}' "$base_url/__test__/mode" >/dev/null
-wait_snapshot '.connectionState == "connected" and .revision == 4' >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected" and .revision == 5' >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"stale"}' "$base_url/__test__/mode" >/dev/null
 adapter_call reconnect >/dev/null
 wait_snapshot '
-  .revision == 4
-  and .observedRevision == 4
+  .revision == 5
+  and .observedRevision == 5
   and .connectionState == "error"
   and .connectionDetail == "cocod returned a stale snapshot revision"
 ' >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"ok"}' "$base_url/__test__/mode" >/dev/null
-wait_snapshot '.connectionState == "connected" and .revision == 4' >/dev/null
+wait_snapshot '.connectionState == "connected" and .revision == 5' >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"snapshot":"incompatible"}' "$base_url/__test__/mode" >/dev/null
@@ -257,6 +474,43 @@ wait_panel_snapshot '
   and .retryLabel == "Check again"
   and .setupTitle == "Incompatible cocod contract"
 ' >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"snapshot":"ok"}' "$base_url/__test__/mode" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"wallet":{"state":"uninitialized","detail":"Create a Wallet Instance to get started","balances":{"spendable":0,"reserved":0,"unit":"sat"},"activeTransfers":[],"trustedMints":[]},"delivery":"whole"}' \
+  "$base_url/__test__/snapshot" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.revision == 6 and .walletState == "uninitialized"' >/dev/null
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+OMARCHY_CASHU_DAEMON_URL="$base_url" quickshell --no-color -p "$shell_qml" \
+  >"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '.revision == 6 and .walletState == "uninitialized"' >/dev/null
+wait_mock_status '.streamConnections == 1' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"snapshot":"ok","delayMs":300,"createEventDelivery":"none","createDelayMs":0}' \
+  "$base_url/__test__/mode" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"wallet":{"state":"uninitialized","detail":"Create a Wallet Instance to get started","balances":{"spendable":0,"reserved":0,"unit":"sat"},"activeTransfers":[],"trustedMints":[]},"delivery":"whole"}' \
+  "$base_url/__test__/snapshot" >/dev/null
+wait_mock_status '.snapshotRequestsActive == 1 and .revision == 7' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/wallet/create" >/dev/null
+wait_snapshot '.revision == 6 and .walletState == "uninitialized"' >/dev/null
+[[ $(panel_action createWalletFromAdapter) == "ok" ]] \
+  || fail "stale adapter could not submit the Create Wallet command"
+wait_mock_status '.createRequests == 3 and .revision == 8' >/dev/null
+wait_snapshot '
+  .revision == 8
+  and .walletState == "unlocked"
+  and .creating == false
+  and .createError == ""
+' >/dev/null
+
+echo "runtime: create conflict reconciled authoritative Wallet State"
 
 kill "$shell_pid"
 wait "$shell_pid" 2>/dev/null || true

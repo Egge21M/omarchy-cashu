@@ -54,6 +54,11 @@ if rg -n --glob '!scripts/check.sh' 'QML_XHR_DUMP' "$project_dir"; then
   fail "QML_XHR_DUMP can expose Wallet material"
 fi
 
+if rg -n -i '\b(restore|passphrase|unlock|reset|delete|clipboard|copy)\b' \
+  "$project_dir/Panel.qml"; then
+  fail "panel exposes a deferred, destructive, or Recovery Phrase clipboard control"
+fi
+
 rg -q 'serviceFor\(root\.moduleName\)' "$project_dir/BarWidget.qml" \
   || fail "bar widget does not read the shared service"
 rg -q 'property var service: null' "$project_dir/Panel.qml" \

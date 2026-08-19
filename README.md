@@ -89,13 +89,25 @@ The MVP fulfills its purpose when this journey is reliable, private by default, 
 
 Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable architecture decisions live in [`docs/adr/`](./docs/adr/).
 
-## Slice 2 development
+## Slice 3 development
 
-Slice 2 connects the Omarchy 4 shell to a deterministic loopback mock of the
-provisional cocod v1 contract. The headless Shell Adapter owns HTTP snapshots,
-incremental SSE parsing, revision reconciliation, bounded stream rotation, and
-reconnect backoff. The bar and panel consume only its domain state. Receive and
-Send remain placeholders; this slice performs no wallet lifecycle operations.
+Slice 3 adds explicit, create-only onboarding to the deterministic loopback mock
+and a separately confirmed Recovery Phrase reveal. The headless Shell Adapter
+continues to own all HTTP and SSE transport. It exposes transient command state
+to the panel, passes a revealed phrase directly to the requesting view, and does
+not include the phrase in its snapshot diagnostics or durable state.
+
+The provisional mock endpoints introduced by this slice are:
+
+- `POST /v1/wallet/create` — creates the one empty Wallet Instance and returns a
+  minimal `202` acknowledgement. SSE invalidation followed by a fresh snapshot
+  establishes the new Wallet State.
+- `POST /v1/wallet/recovery-phrase/reveal` — returns the deterministic mock
+  Recovery Phrase only on demand with `Cache-Control: no-store`.
+
+The mock starts `uninitialized`. It never creates a Wallet Instance on startup,
+reconnection, shell reload, or panel open. Receive and Send remain disabled
+placeholders.
 
 Start the mock on its default loopback address:
 

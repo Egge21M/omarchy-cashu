@@ -8,6 +8,9 @@ import Quickshell.Io
 Item {
   id: root
 
+  signal recoveryPhraseRevealed(string phrase)
+  signal recoveryPhraseRevealFailed(string detail)
+
   property var shell: null
   property var manifest: null
 
@@ -31,7 +34,8 @@ Item {
       state: "unavailable",
       detail: "Waiting for cocod",
       balances: { spendable: 0, reserved: 0, unit: "sat" },
-      activeTransfers: []
+      activeTransfers: [],
+      trustedMints: []
     }
   })
   property string connectionState: "connecting"
@@ -49,6 +53,10 @@ Item {
   property var streamRequest: null
   property int streamOffset: 0
   property string streamBuffer: ""
+  property var createRequest: null
+  property bool creating: false
+  property string createError: ""
+  property var recoveryRevealRequest: null
 
   readonly property int revision: Number(walletSnapshot.revision || 0)
   readonly property bool fixtureBacked: false
@@ -86,6 +94,8 @@ Item {
   readonly property string unit: String(balances.unit || "sat")
   readonly property var activeTransfers: Array.isArray(daemonWallet.activeTransfers)
     ? daemonWallet.activeTransfers : []
+  readonly property var trustedMints: Array.isArray(daemonWallet.trustedMints)
+    ? daemonWallet.trustedMints : []
   readonly property bool hasActiveTransfers: activeTransfers.length > 0
   readonly property bool needsAttention: compatibilityState === "incompatible"
     || connectionState !== "connected"
@@ -132,7 +142,7 @@ Item {
     }
     if (connectionState === "missing") return {
       title: "cocod is not available",
-      detail: "Start the Slice 2 mock cocod on 127.0.0.1:38421."
+      detail: "Start the Slice 3 mock cocod on 127.0.0.1:38421."
     }
     if (connectionState === "unavailable") return {
       title: "cocod is temporarily unavailable",
@@ -168,6 +178,9 @@ Item {
       reservedBalance: reservedBalance,
       unit: unit,
       activeTransfers: activeTransfers,
+      trustedMintCount: trustedMints.length,
+      creating: creating,
+      createError: createError,
       connectionState: connectionState,
       compatibilityState: compatibilityState,
       connectionDetail: connectionDetail,
@@ -258,6 +271,10 @@ Item {
       }
       root.compatibilityState = "compatible"
       root.walletSnapshot = value
+      if (String(value.wallet.state) !== "uninitialized") {
+        root.creating = false
+        root.createError = ""
+      }
       root.observedRevision = Math.max(root.observedRevision, Number(value.revision))
       root.connectionState = "connected"
       root.connectionDetail = "Connected to cocod"
@@ -279,6 +296,77 @@ Item {
       && isFinite(Number(balance.spendable)) && isFinite(Number(balance.reserved))
       && String(balance.unit || "") === "sat"
       && Array.isArray(wallet.activeTransfers)
+      && Array.isArray(wallet.trustedMints)
+  }
+
+  function createWallet() {
+    if (creating || createRequest || connectionState !== "connected"
+        || compatibilityState !== "compatible" || walletState !== "uninitialized") return false
+    createError = ""
+    creating = true
+    var request = new XMLHttpRequest()
+    createRequest = request
+    request.onreadystatechange = function() {
+      if (request.readyState !== XMLHttpRequest.DONE || request !== root.createRequest) return
+      root.createRequest = null
+      if (request.status === 202) return
+      root.creating = false
+      if (request.status === 409) {
+        root.createError = "A Wallet Instance already exists"
+        var staleSnapshot = root.snapshotRequest
+        root.snapshotRequest = null
+        if (staleSnapshot) staleSnapshot.abort()
+        root.fetchSnapshot(false)
+      } else {
+        root.createError = "Wallet creation failed"
+      }
+    }
+    request.open("POST", daemonBaseUrl + "/v1/wallet/create", true)
+    request.setRequestHeader("Accept", "application/json")
+    request.setRequestHeader("Content-Type", "application/json")
+    request.send("{}")
+    return true
+  }
+
+  function revealRecoveryPhrase() {
+    if (recoveryRevealRequest || connectionState !== "connected"
+        || compatibilityState !== "compatible" || walletState !== "unlocked") return false
+    var request = new XMLHttpRequest()
+    recoveryRevealRequest = request
+    request.onreadystatechange = function() {
+      if (request.readyState !== XMLHttpRequest.DONE
+          || request !== root.recoveryRevealRequest) return
+      root.recoveryRevealRequest = null
+      if (request.status !== 200) {
+        root.recoveryPhraseRevealFailed("Recovery Phrase could not be revealed")
+        return
+      }
+      var value
+      try {
+        value = JSON.parse(request.responseText)
+      } catch (error) {
+        root.recoveryPhraseRevealFailed("cocod returned an invalid reveal response")
+        return
+      }
+      if (!value || typeof value.recoveryPhrase !== "string"
+          || value.recoveryPhrase.length === 0) {
+        root.recoveryPhraseRevealFailed("cocod returned an invalid reveal response")
+        return
+      }
+      root.recoveryPhraseRevealed(value.recoveryPhrase)
+      value.recoveryPhrase = ""
+    }
+    request.open("POST", daemonBaseUrl + "/v1/wallet/recovery-phrase/reveal", true)
+    request.setRequestHeader("Accept", "application/json")
+    request.setRequestHeader("Content-Type", "application/json")
+    request.send("{}")
+    return true
+  }
+
+  function cancelRecoveryPhraseReveal() {
+    var request = recoveryRevealRequest
+    recoveryRevealRequest = null
+    if (request) request.abort()
   }
 
   function handleSnapshotFailure(status) {
@@ -472,6 +560,11 @@ Item {
     snapshotRequest = null
     connectStreamAfterSnapshot = false
     if (request) request.abort()
+    var command = createRequest
+    createRequest = null
+    creating = false
+    if (command) command.abort()
+    cancelRecoveryPhraseReveal()
     stopStream()
   }
 
