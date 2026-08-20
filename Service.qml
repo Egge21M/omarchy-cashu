@@ -69,6 +69,8 @@ Item {
   property int reconnectCount: 0
 
   property int fullFetchToken: 0
+  property bool fullFetchInProgress: false
+  property var queuedReceiveInvalidations: ({})
   property var canonicalRequests: []
   property var balanceRequest: null
   property var mintRequest: null
@@ -84,10 +86,20 @@ Item {
   property var receiveRequest: null
   property var receiveReconcileRequests: []
   property int receiveReconcileToken: 0
+  property int receiveResourceGeneration: 0
+  property var receiveLookupTokens: ({})
   property string receiveState: "idle"
   property var receivePreview: null
   property string receiveError: ""
   property string receiveOperationId: ""
+  property var receiveRecoveries: ({})
+  property string receiveRecoveryFocusId: ""
+  readonly property var receiveRecovery: receiveRecoveryProjection(
+    receiveRecoveryFocusId)
+  readonly property string receiveRecoveryState: String(receiveRecovery.state || "idle")
+  readonly property string receiveRecoveryOperationId: String(
+    receiveRecovery.operationId || "")
+  readonly property string receiveRecoveryError: String(receiveRecovery.error || "")
 
   readonly property bool fixtureBacked: false
   readonly property string walletState: connectionState === "connected"
@@ -122,7 +134,7 @@ Item {
     ? balanceProjection.reserved : "0"
   readonly property string unit: "sat"
   readonly property var activeTransfers: composeActiveTransfers(
-    receiveOperations, sendOperations)
+    receiveOperations, sendOperations, receiveRecoveries)
   readonly property var trustedMints: trustedKnownMints(mintsResource)
   readonly property bool hasActiveTransfers: activeTransfers.length > 0
   readonly property bool needsAttention: compatibilityState === "incompatible"
@@ -219,6 +231,11 @@ Item {
       trustedMintCount: trustedMints.length,
       receiveState: receiveState,
       receiveError: receiveError,
+      receiveRecoveryState: receiveRecoveryState,
+      receiveRecoveryOperationId: receiveRecoveryOperationId,
+      receiveRecoveryError: receiveRecoveryError,
+      receiveRecoveryMessage: receiveRecoveryMessage(),
+      receiveRecoveries: receiveRecoveries,
       creating: creating,
       createError: createError,
       connectionState: connectionState,
@@ -296,7 +313,60 @@ Item {
     return labels[String(operation.state || "")] || "Active Transfer"
   }
 
-  function composeActiveTransfers(receives, sends) {
+  function receiveRecoveryMessage() {
+    return String(receiveRecovery.message || "")
+  }
+
+  function receiveRecoveryProjection(operationId) {
+    var id = String(operationId || "")
+    if (id && receiveRecoveries[id]) return receiveRecoveries[id]
+    return {
+      operationId: "",
+      state: "idle",
+      error: "",
+      message: "",
+      stateLabel: "",
+      detail: "",
+      severity: "none"
+    }
+  }
+
+  function buildReceiveRecoveryProjection(operationId, state, error) {
+    var messages = {
+      recovering: "Recovering interrupted Receive",
+      finalized: "Interrupted Receive completed",
+      rolled_back: "Interrupted Receive was rolled back",
+      unavailable: "Interrupted Receive is temporarily unavailable",
+      failed: "Interrupted Receive needs attention"
+    }
+    var labels = {
+      recovering: "Recovering Receive",
+      unavailable: "Receive temporarily unavailable",
+      failed: "Receive needs attention"
+    }
+    return {
+      operationId: String(operationId || ""),
+      state: String(state || "idle"),
+      error: String(error || ""),
+      message: messages[state] || "",
+      stateLabel: labels[state] || "",
+      detail: String(error || ""),
+      severity: ["rolled_back", "failed"].indexOf(state) !== -1
+        ? "error" : state === "unavailable" ? "warning" : "normal"
+    }
+  }
+
+  function updateReceiveRecovery(operationId, state, error) {
+    var id = String(operationId || "")
+    if (!id) return
+    var recoveries = ({})
+    for (var key in receiveRecoveries) recoveries[key] = receiveRecoveries[key]
+    recoveries[id] = buildReceiveRecoveryProjection(id, state, error)
+    receiveRecoveries = recoveries
+    receiveRecoveryFocusId = id
+  }
+
+  function composeActiveTransfers(receives, sends, recoveries) {
     var result = []
     var seen = ({})
     var values = (Array.isArray(receives) ? receives : [])
@@ -306,12 +376,18 @@ Item {
       var id = String(operation.id || "")
       if (!id || seen[id]) continue
       seen[id] = true
+      var recovery = operation.type === "receive" && recoveries
+        ? recoveries[id] : null
+      var recovering = recovery
+        && ["recovering", "unavailable", "failed"].indexOf(recovery.state) !== -1
       result.push({
         id: id,
         type: String(operation.type || ""),
         state: String(operation.state || ""),
-        stateLabel: operationStateLabel(operation),
-        detail: String(operation.mintUrl || ""),
+        stateLabel: recovering ? String(recovery.stateLabel)
+          : operationStateLabel(operation),
+        detail: recovering && recovery.detail
+          ? String(recovery.detail) : String(operation.mintUrl || ""),
         amount: String(operation.amount || "0"),
         unit: String(operation.unit || "sat")
       })
@@ -509,6 +585,8 @@ Item {
     if (reason === "startup") {
       connectionState = "connecting"
       connectionDetail = "Connecting to cocod on loopback"
+    } else if (reason === "panel" && preserveHealthyStream) {
+      connectionDetail = "Refreshing canonical Wallet resources"
     } else {
       reconnectCount++
       connectionState = "reconnecting"
@@ -520,6 +598,9 @@ Item {
 
   function fetchAllCanonicalResources(connectAfterward) {
     abortCanonicalRequests()
+    receiveResourceGeneration++
+    receiveLookupTokens = ({})
+    fullFetchInProgress = true
     var token = ++fullFetchToken
     var capabilityRequest = sendRequest("GET", "/v1/capabilities", undefined,
       function(result) {
@@ -530,6 +611,8 @@ Item {
         }
         if (!root.isCapabilitiesShape(result.value)
             || String(result.value.interfaceVersion || "") !== "1") {
+          root.fullFetchInProgress = false
+          root.queuedReceiveInvalidations = ({})
           root.compatibilityState = "incompatible"
           root.connectionState = "error"
           root.connectionDetail = "Required cocod v1 capabilities are unavailable"
@@ -604,10 +687,38 @@ Item {
           values[specification.key] = result.value
           pending--
           if (pending === 0) {
-            var receives = values.receivePrepared.items.concat(values.receiveInFlight.items)
+            var receiveSummaries = values.receivePrepared.items.concat(
+              values.receiveInFlight.items)
             var sends = values.sendPrepared.items.concat(values.sendInFlight.items)
-            root.finishFullFetch(capabilities, status, values.balances, values.mints,
-              receives, sends, connectAfterward)
+            root.inspectReceivesForFullFetch(token, receiveSummaries,
+              function(receives, needsFreshBalances) {
+                if (token !== root.fullFetchToken) return
+                if (!needsFreshBalances) {
+                  root.finishFullFetch(capabilities, status, values.balances,
+                    values.mints, receives, sends, connectAfterward)
+                  return
+                }
+                var balanceRequest = root.sendRequest("GET", "/v1/balances", undefined,
+                  function(balanceResult) {
+                    if (token !== root.fullFetchToken) return
+                    if (!balanceResult.ok) {
+                      root.handleFetchFailure(balanceResult)
+                      return
+                    }
+                    if (!root.isBalanceCollection(balanceResult.value)) {
+                      root.handleContractFailure("invalid_balances",
+                        "cocod returned invalid balances")
+                      return
+                    }
+                    root.finishFullFetch(capabilities, status, balanceResult.value,
+                      values.mints, receives, sends, connectAfterward)
+                  })
+                if (!balanceRequest) {
+                  root.handleCredentialUnavailable()
+                  return
+                }
+                root.canonicalRequests.push(balanceRequest)
+              })
           }
         })
         if (!request) {
@@ -620,8 +731,187 @@ Item {
     }
   }
 
+  function setReceiveRecoveryFromOperation(operation) {
+    var state = String(operation.state || "")
+    var id = String(operation.id || "")
+    if (["init", "executing"].indexOf(state) !== -1) {
+      updateReceiveRecovery(id, "recovering", "")
+      return true
+    }
+    if (state === "finalized") {
+      updateReceiveRecovery(id, "finalized", "")
+      return false
+    }
+    if (state === "rolled_back") {
+      updateReceiveRecovery(id, "rolled_back",
+        receiveErrorMessage("operation_conflict"))
+      return false
+    }
+    return state === "prepared"
+  }
+
+  function setReceiveRecoveryFailure(operationId, error) {
+    updateReceiveRecovery(operationId,
+      error && error.retryable ? "unavailable" : "failed",
+      receiveErrorMessage(error ? error.code : "invalid_response"))
+  }
+
+  function reconcileCanonicalReceive(options, callback) {
+    var id = String(options.operationId || "")
+    var generation = options.generation
+    var sequence = nextReceiveLookupToken(id)
+    var fallback = options.fallback || null
+    var trackRecovery = options.trackRecovery !== false
+    var fullFetch = options.fullFetch === true
+    function current() {
+      return root.receiveLookupIsCurrent(id, sequence, generation)
+    }
+    function track(request) {
+      if (fullFetch) root.canonicalRequests.push(request)
+    }
+    function complete(operation, needsFreshBalances, error, contractError,
+        credentialUnavailable) {
+      if (!current()) return
+      callback({
+        operation: operation,
+        needsFreshBalances: needsFreshBalances,
+        error: error || null,
+        contractError: contractError || "",
+        credentialUnavailable: credentialUnavailable === true
+      })
+    }
+    function project(operation) {
+      var state = String(operation.state || "")
+      if (["init", "executing"].indexOf(state) === -1) {
+        var active = trackRecovery
+          ? root.setReceiveRecoveryFromOperation(operation)
+          : state === "prepared"
+        complete(active ? operation : null,
+          ["finalized", "rolled_back"].indexOf(state) !== -1)
+        return
+      }
+      if (trackRecovery) root.setReceiveRecoveryFromOperation(operation)
+      var refreshRequest = root.sendRequest("POST", "/v1/operations/receive/"
+        + encodeURIComponent(id) + "/refresh", {}, function(result) {
+          if (!current()) return
+          if (!result.ok) {
+            if (trackRecovery) root.setReceiveRecoveryFailure(id, result.error)
+            complete(result.error.code === "operation_not_found" ? null : operation,
+              true, result.error)
+            return
+          }
+          if (result.status !== 200 || !root.isReceiveOperation(result.value)) {
+            var invalid = { code: "invalid_response", retryable: false }
+            if (trackRecovery) root.setReceiveRecoveryFailure(id, invalid)
+            complete(operation, true, null, "invalid_receive_operation")
+            return
+          }
+          var active = trackRecovery
+            ? root.setReceiveRecoveryFromOperation(result.value)
+            : ["init", "prepared", "executing"].indexOf(
+              String(result.value.state || "")) !== -1
+          complete(active ? result.value : null, true)
+        })
+      if (!refreshRequest) {
+        var credentialError = { code: "credential_unavailable", retryable: false }
+        if (trackRecovery) root.setReceiveRecoveryFailure(id, credentialError)
+        complete(operation, true, credentialError, "", true)
+        return
+      }
+      track(refreshRequest)
+    }
+    if (!id) {
+      complete(null, false, null, "invalid_receive_operation")
+      return
+    }
+    var lookupRequest = sendRequest("GET", "/v1/operations/receive/"
+      + encodeURIComponent(id), undefined, function(result) {
+        if (!current()) return
+        if (!result.ok) {
+          if (trackRecovery) root.setReceiveRecoveryFailure(id, result.error)
+          complete(result.error.code === "operation_not_found" ? null : fallback,
+            true, result.error)
+          return
+        }
+        if (result.status !== 200 || !root.isReceiveOperation(result.value)) {
+          var invalid = { code: "invalid_response", retryable: false }
+          if (trackRecovery) root.setReceiveRecoveryFailure(id, invalid)
+          complete(null, true, null, "invalid_receive_operation")
+          return
+        }
+        project(result.value)
+      })
+    if (!lookupRequest) {
+      var credentialError = { code: "credential_unavailable", retryable: false }
+      if (trackRecovery) root.setReceiveRecoveryFailure(id, credentialError)
+      complete(fallback, true, credentialError, "", true)
+      return
+    }
+    track(lookupRequest)
+  }
+
+  function inspectReceivesForFullFetch(token, summaries, callback) {
+    var unique = []
+    var seen = ({})
+    var source = Array.isArray(summaries) ? summaries : []
+    for (var i = 0; i < source.length; i++) {
+      var id = String(source[i].id || "")
+      if (!id || seen[id]) continue
+      seen[id] = true
+      unique.push(source[i])
+    }
+    if (unique.length === 0) {
+      callback([], false)
+      return
+    }
+    var values = []
+    var pending = unique.length
+    var failed = false
+    var needsFreshBalances = false
+    for (var index = 0; index < unique.length; index++) {
+      (function(summary) {
+        root.reconcileCanonicalReceive({
+          operationId: summary.id,
+          generation: root.receiveResourceGeneration,
+          fallback: summary,
+          trackRecovery: true,
+          fullFetch: true
+        }, function(result) {
+          if (failed || token !== root.fullFetchToken) return
+          if (result.credentialUnavailable) {
+            failed = true
+            root.handleCredentialUnavailable()
+            return
+          }
+          if (result.contractError) {
+            failed = true
+            root.handleContractFailure(result.contractError,
+              "cocod returned an invalid Receive Operation")
+            return
+          }
+          if (result.error && !result.error.retryable
+              && result.error.code !== "operation_not_found") {
+            failed = true
+            root.handleFetchFailure({
+              status: 409,
+              error: result.error
+            })
+            return
+          }
+          if (result.operation) values.push(result.operation)
+          needsFreshBalances = needsFreshBalances || result.needsFreshBalances
+          pending--
+          if (pending === 0) callback(values, needsFreshBalances)
+        })
+      })(unique[index])
+    }
+  }
+
   function finishFullFetch(capabilities, status, balances, mints, receives, sends,
       connectAfterward) {
+    var queuedInvalidations = queuedReceiveInvalidations
+    queuedReceiveInvalidations = ({})
+    fullFetchInProgress = false
     canonicalRequests = []
     capabilitiesResource = capabilities
     statusResource = status
@@ -643,9 +933,13 @@ Item {
     if (connectAfterward && walletState === "unlocked") startStream()
     if (receiveState === "reconciling" && receiveOperationId)
       reconcileReceiveOperation(receiveOperationId)
+    for (var operationId in queuedInvalidations)
+      refetchReceiveOperation(operationId)
   }
 
   function handleCredentialUnavailable() {
+    fullFetchInProgress = false
+    queuedReceiveInvalidations = ({})
     connectionState = "error"
     compatibilityState = "unknown"
     connectionDetail = "The cocod Client Credential is unavailable"
@@ -655,6 +949,8 @@ Item {
   }
 
   function handleFetchFailure(result) {
+    fullFetchInProgress = false
+    queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
     lastErrorCode = result.error.code
@@ -673,6 +969,8 @@ Item {
   }
 
   function handleContractFailure(code, detail) {
+    fullFetchInProgress = false
+    queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
     connectionState = "error"
@@ -1142,6 +1440,53 @@ Item {
     else sendRequests = requests
   }
 
+  function withoutReceiveOperation(operationId) {
+    var result = []
+    for (var i = 0; i < receiveOperations.length; i++)
+      if (String(receiveOperations[i].id || "") !== String(operationId || ""))
+        result.push(receiveOperations[i])
+    return result
+  }
+
+  function nextReceiveLookupToken(operationId) {
+    var tokens = ({})
+    for (var key in receiveLookupTokens) tokens[key] = receiveLookupTokens[key]
+    var token = Number(tokens[operationId] || 0) + 1
+    tokens[operationId] = token
+    receiveLookupTokens = tokens
+    return token
+  }
+
+  function receiveLookupIsCurrent(operationId, token, generation) {
+    return generation === receiveResourceGeneration
+      && Number(receiveLookupTokens[operationId] || 0) === token
+  }
+
+  function refetchReceiveOperation(operationId) {
+    var id = String(operationId || "")
+    if (!id) return
+    var localCommand = id === receiveOperationId
+      && ["preparing", "executing", "reconciling"].indexOf(receiveState) !== -1
+    var existingOperation = null
+    for (var existingIndex = 0; existingIndex < receiveOperations.length;
+        existingIndex++)
+      if (String(receiveOperations[existingIndex].id || "") === id)
+        existingOperation = receiveOperations[existingIndex]
+    reconcileCanonicalReceive({
+      operationId: id,
+      generation: receiveResourceGeneration,
+      fallback: existingOperation,
+      trackRecovery: !localCommand,
+      fullFetch: false
+    }, function(result) {
+      if (result.operation) root.receiveOperations = root.withReceiveOperation(
+        root.receiveOperations, result.operation)
+      else root.receiveOperations = root.withoutReceiveOperation(id)
+      root.fetchBalances()
+      root.refreshCount++
+    })
+  }
+
   function stopStream() {
     var request = streamRequest
     streamRequest = null
@@ -1238,7 +1583,16 @@ Item {
     else if (event.type === "mint.updated") fetchMints()
     else if (event.type === "operation.updated") {
       var operationType = String(event.data.operationType || "")
-      fetchOperationGroup(operationType)
+      if (operationType === "receive") {
+        var operationId = String(event.data.operationId || "")
+        if (fullFetchInProgress) {
+          var queued = ({})
+          for (var queuedId in queuedReceiveInvalidations)
+            queued[queuedId] = true
+          if (operationId) queued[operationId] = true
+          queuedReceiveInvalidations = queued
+        } else refetchReceiveOperation(operationId)
+      } else fetchOperationGroup(operationType)
       if (operationType === "receive" && receiveState === "reconciling"
           && String(event.data.operationId || "") === receiveOperationId)
         reconcileReceiveOperation(receiveOperationId)
@@ -1288,6 +1642,11 @@ Item {
     retryAttempt = 0
     retryDelayMs = 0
     beginReconcile("manual")
+  }
+
+  function refreshCanonicalResources(reason) {
+    beginReconcile(String(reason || "manual"))
+    return true
   }
 
   function retryConnection() {

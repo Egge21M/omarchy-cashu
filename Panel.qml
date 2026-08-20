@@ -61,6 +61,7 @@ Item {
   }
 
   function open(payloadJson) {
+    var wasOpened = opened
     requestedScreenName = ""
     try {
       var payload = JSON.parse(payloadJson || "{}")
@@ -70,6 +71,9 @@ Item {
     }
     hostWidget = resolveHostWidget()
     opened = true
+    if (!wasOpened && stateOwner
+        && typeof stateOwner.refreshCanonicalResources === "function")
+      stateOwner.refreshCanonicalResources("panel")
     Qt.callLater(function() {
       if (root.opened) keyCatcher.forceActiveFocus()
     })
@@ -232,8 +236,12 @@ Item {
       receiveMintApproved: receiveFlow.mintApproved,
       receiveConfirmEnabled: receiveFlow.confirmEnabled,
       receiveError: receiveFlow.error,
+      receiveRecoveryState: stateOwner ? stateOwner.receiveRecoveryState : "idle",
+      receiveRecoveryMessage: stateOwner ? stateOwner.receiveRecoveryMessage() : "",
       keyCatcherBlocked: keyCatcher.blocked,
       activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
+      activeTransferStateLabel: activeTransfer ? activeTransfer.stateLabel : "",
+      activeTransferDetail: activeTransfer ? activeTransfer.detail : "",
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
@@ -749,7 +757,23 @@ Item {
             }
 
             Text {
-              visible: !root.activeTransfer
+              visible: !root.activeTransfer && root.stateOwner
+                && root.stateOwner.receiveRecovery.message !== ""
+              width: parent.width
+              text: root.stateOwner ? root.stateOwner.receiveRecoveryMessage() : ""
+              color: root.stateOwner
+                && root.stateOwner.receiveRecovery.severity === "error"
+                ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              horizontalAlignment: Text.AlignHCenter
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              visible: !root.activeTransfer && (!root.stateOwner
+                || root.stateOwner.receiveRecovery.message === "")
               width: parent.width
               text: "No Active Transfers"
               color: root.dim

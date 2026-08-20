@@ -157,6 +157,14 @@ preview_clipboard_receive() {
   require_receive_action previewReceive "Receive preview"
 }
 
+prepare_receive_fixture() {
+  local token=$1
+  jq -Rn '{token: input}' <<<"$token" \
+    | curl -fsS -H "Authorization: Bearer $credential" -X POST \
+        -H 'Content-Type: application/json' --data-binary @- \
+        "$base_url/v1/operations/receive"
+}
+
 mkdir -p "$state_dir/credentials/generation-1"
 printf '%s\n' "$credential" >"$state_dir/credentials/generation-1/client"
 chmod 700 "$state_dir" "$state_dir/credentials" "$state_dir/credentials/generation-1"
@@ -280,6 +288,10 @@ panel_action leaveRecoveryPhrase >/dev/null
 wait_panel_snapshot '.recoveryViewState == "closed" and .recoveryPhraseVisible == false' >/dev/null
 
 receive_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ'
+recovery_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jYW5jZWwifQ'
+pending_recovery_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNi1wZW5kaW5nIn0'
+rotation_recovery_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNi1yb3RhdGlvbiJ9'
+concurrent_recovery_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNi1jb25jdXJyZW50In0'
 invalid_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1pbnZhbGlkIn0'
 unsupported_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11c2QifQ'
 unavailable_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1taW50LWRvd24ifQ'
@@ -476,6 +488,326 @@ fi
 
 echo "runtime: Receive input, preview, approval, cancellation, execution, and errors passed"
 
+# Reconcile interruptions on both sides of the Wallet commit point through the
+# public HTTP/SSE and diagnostics seams. The token is streamed on stdin and is
+# never passed through IPC, process arguments, or projected adapter state.
+before_recovery_status=$(curl -fsS "$base_url/__test__/status")
+before_recovery_refreshes=$(jq -r '.receiveRefreshRequests' <<<"$before_recovery_status")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"before_commit","receiveRefreshError":"mint_unavailable","receiveDelayMs":300}' \
+  "$base_url/__test__/mode" >/dev/null
+before_recovery=$(prepare_receive_fixture "$recovery_token") \
+  || fail "pre-commit recovery fixture preparation failed"
+before_recovery_id=$(jq -er '.id' <<<"$before_recovery")
+if curl -fsS -H "Authorization: Bearer $credential" -X POST \
+    -H 'Content-Type: application/json' --data '{}' \
+    "$base_url/v1/operations/receive/$before_recovery_id/execute" >/dev/null 2>&1; then
+  fail "pre-commit interruption reported optimistic success"
+fi
+wait_snapshot ".receiveRecoveryState == \"recovering\"
+  and .receiveRecoveryOperationId == \"$before_recovery_id\"
+  and (.activeTransfers | length) == 1
+  and .activeTransfers[0].stateLabel == \"Recovering Receive\"" >/dev/null
+wait_snapshot ".receiveRecoveryState == \"unavailable\"
+  and .receiveRecoveryOperationId == \"$before_recovery_id\"
+  and .spendableBalance == \"1198\"
+  and (.activeTransfers | length) == 1
+  and .activeTransfers[0].id == \"$before_recovery_id\"
+  and .activeTransfers[0].stateLabel == \"Receive temporarily unavailable\"
+  and .activeTransfers[0].detail == \"The mint is unavailable. Try again later.\"" >/dev/null
+wait_panel_snapshot '
+  .receiveRecoveryState == "unavailable"
+  and .receiveRecoveryMessage == "Interrupted Receive is temporarily unavailable"
+  and .activeTransferStateLabel == "Receive temporarily unavailable"
+  and .activeTransferDetail == "The mint is unavailable. Try again later."
+' >/dev/null
+wait_mock_status ".receiveRefreshRequests > $before_recovery_refreshes" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$before_recovery_id" '{
+    receiveRefreshError: "",
+    receiveDelayMs: 0,
+    event: {
+      type: "operation.updated",
+      timestamp: "2026-08-20T12:04:00Z",
+      data: {
+        operationType: "receive",
+        operationId: $id,
+        mintUrl: "https://mint.slice4.test"
+      }
+    }
+  }')" "$base_url/__test__/mode" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$before_recovery_id" '{
+    event: {
+      type: "operation.updated",
+      timestamp: "2026-08-20T12:04:00Z",
+      data: {
+        operationType: "receive",
+        operationId: $id,
+        mintUrl: "https://mint.slice4.test"
+      }
+    }
+  }')" "$base_url/__test__/resources" >/dev/null
+wait_snapshot ".receiveRecoveryState == \"rolled_back\"
+  and .receiveRecoveryOperationId == \"$before_recovery_id\"
+  and .spendableBalance == \"1198\"
+  and .activeTransfers == []" >/dev/null
+wait_mock_status ".receiveRefreshRequests > $((before_recovery_refreshes + 1))" >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"after_commit"}' \
+  "$base_url/__test__/mode" >/dev/null
+after_recovery=$(prepare_receive_fixture "$recovery_token") \
+  || fail "post-commit recovery fixture preparation failed"
+after_recovery_id=$(jq -er '.id' <<<"$after_recovery")
+
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+if curl -fsS -H "Authorization: Bearer $credential" -X POST \
+    -H 'Content-Type: application/json' --data '{}' \
+    "$base_url/v1/operations/receive/$after_recovery_id/execute" >/dev/null 2>&1; then
+  fail "post-commit interruption reported optimistic success"
+fi
+kill "$mock_pid"
+wait "$mock_pid" 2>/dev/null || true
+mock_pid=""
+
+COCOD_STATE_DIR="$state_dir" python3 "$project_dir/scripts/mock-cocod.py" \
+  --port "$port" >>"$mock_log" 2>&1 &
+mock_pid=$!
+for _attempt in {1..40}; do
+  curl -fsS "$base_url/__test__/status" >/dev/null 2>&1 && break
+  sleep 0.05
+done
+COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
+  quickshell --no-color -p "$shell_qml" >>"$shell_log" 2>&1 &
+shell_pid=$!
+
+adapter_snapshot=$(wait_snapshot ".connectionState == \"connected\"
+  and .receiveRecoveryState == \"finalized\"
+  and .receiveRecoveryOperationId == \"$after_recovery_id\"
+  and .spendableBalance == \"1597\"
+  and .activeTransfers == []")
+restarted_status=$(wait_mock_status '
+  .receiveCreateRequests == 0
+  and .receiveExecuteRequests == 0
+  and .receiveRefreshRequests == 1
+  and .receiveLookupRequests == 1
+  and .resourceRequests.receivePrepared == 1
+  and .resourceRequests.receiveInFlight == 1
+  and .resourceRequests.balances == 2
+')
+panel_action openPanel >/dev/null
+panel_snapshot=$(wait_panel_snapshot '
+  .receiveRecoveryState == "finalized"
+  and .receiveRecoveryMessage == "Interrupted Receive completed"
+  and .spendableBalance == "1597"
+  and .activeTransferCount == 0
+')
+if rg -Fq "$recovery_token" <<<"$adapter_snapshot$panel_snapshot$restarted_status" \
+    || rg -Fq "$recovery_token" "$shell_log" "$mock_log"; then
+  fail "recovered Receive exposed bearer-token text"
+fi
+
+panel_action closePanel >/dev/null
+wait_panel_snapshot '.opened == false' >/dev/null
+before_panel_reopen=$(curl -fsS "$base_url/__test__/status")
+before_panel_prepared=$(jq -r '.resourceRequests.receivePrepared' <<<"$before_panel_reopen")
+before_panel_in_flight=$(jq -r '.resourceRequests.receiveInFlight' <<<"$before_panel_reopen")
+before_panel_refresh=$(adapter_call snapshot | jq -r '.refreshCount')
+panel_action openPanel >/dev/null
+wait_mock_status ".resourceRequests.receivePrepared > $before_panel_prepared
+  and .resourceRequests.receiveInFlight > $before_panel_in_flight" >/dev/null
+wait_snapshot ".refreshCount > $before_panel_refresh
+  and .connectionDetail == \"Connected to cocod\"" >/dev/null
+
+echo "runtime: interrupted Receive recovery, restart, and terminal cleanup passed"
+
+before_named_events=$(curl -fsS "$base_url/__test__/status")
+before_named_lookups=$(jq -r '.receiveLookupRequests' <<<"$before_named_events")
+before_named_balances=$(jq -r '.resourceRequests.balances' <<<"$before_named_events")
+before_named_creates=$(jq -r '.receiveCreateRequests' <<<"$before_named_events")
+before_named_executes=$(jq -r '.receiveExecuteRequests' <<<"$before_named_events")
+before_named_refreshes=$(jq -r '.receiveRefreshRequests' <<<"$before_named_events")
+pending_recovery=$(prepare_receive_fixture "$pending_recovery_token") \
+  || fail "named-invalidation Receive preparation failed"
+pending_recovery_id=$(jq -er '.id' <<<"$pending_recovery")
+wait_snapshot ".activeTransfers == [{
+  \"id\": \"$pending_recovery_id\",
+  \"type\": \"receive\",
+  \"state\": \"prepared\",
+  \"stateLabel\": \"Receive ready\",
+  \"detail\": \"https://mint.slice4.test\",
+  \"amount\": \"250\",
+  \"unit\": \"sat\"
+}]" >/dev/null
+
+for timestamp in 2026-08-20T12:05:02Z 2026-08-20T12:05:01Z; do
+  curl -fsS -X POST -H 'Content-Type: application/json' \
+    --data "$(jq -cn --arg id "$pending_recovery_id" --arg timestamp "$timestamp" '{
+      event: {
+        type: "operation.updated",
+        timestamp: $timestamp,
+        data: {
+          operationType: "receive",
+          operationId: $id,
+          mintUrl: "https://mint.slice4.test"
+        }
+      }
+    }')" "$base_url/__test__/resources" >/dev/null
+done
+wait_mock_status ".receiveLookupRequests >= $((before_named_lookups + 3))
+  and .resourceRequests.balances > $before_named_balances
+  and .receiveCreateRequests == $((before_named_creates + 1))
+  and .receiveExecuteRequests == $before_named_executes
+  and .receiveRefreshRequests == $before_named_refreshes" >/dev/null
+wait_snapshot "(.activeTransfers | length) == 1
+  and .activeTransfers[0].id == \"$pending_recovery_id\"
+  and .activeTransfers[0].amount == \"250\"" >/dev/null
+
+panel_action closePanel >/dev/null
+wait_panel_snapshot '.opened == false' >/dev/null
+before_active_panel=$(curl -fsS "$base_url/__test__/status")
+before_active_panel_prepared=$(jq -r '.resourceRequests.receivePrepared' \
+  <<<"$before_active_panel")
+before_active_panel_in_flight=$(jq -r '.resourceRequests.receiveInFlight' \
+  <<<"$before_active_panel")
+before_active_panel_lookups=$(jq -r '.receiveLookupRequests' \
+  <<<"$before_active_panel")
+panel_action openPanel >/dev/null
+wait_mock_status ".resourceRequests.receivePrepared > $before_active_panel_prepared
+  and .resourceRequests.receiveInFlight > $before_active_panel_in_flight
+  and .receiveLookupRequests > $before_active_panel_lookups" >/dev/null
+wait_snapshot ".connectionDetail == \"Connected to cocod\"
+  and (.activeTransfers | any(.id == \"$pending_recovery_id\"))" >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "event": {
+      "type":"operation.updated",
+      "timestamp":"2026-08-20T12:05:00Z",
+      "data": {
+        "operationType":"receive",
+        "operationId":"missing-receive",
+        "mintUrl":"https://mint.slice4.test"
+      }
+    }
+  }' "$base_url/__test__/resources" >/dev/null
+wait_snapshot '.receiveRecoveryState == "failed"
+  and .receiveRecoveryOperationId == "missing-receive"
+  and .receiveRecoveryError == "This Receive is no longer available. Start again."
+  and (.activeTransfers | length) == 1' >/dev/null
+
+before_stale_lookup=$(curl -fsS "$base_url/__test__/status")
+before_stale_requests=$(jq -r '.receiveLookupRequests' <<<"$before_stale_lookup")
+before_stale_responses=$(jq -r '.receiveLookupResponses' <<<"$before_stale_lookup")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveLookupDelayMs":2500}' "$base_url/__test__/mode" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$pending_recovery_id" '{
+    event: {
+      type: "operation.updated",
+      timestamp: "2026-08-20T12:05:03Z",
+      data: {
+        operationType: "receive",
+        operationId: $id,
+        mintUrl: "https://mint.slice4.test"
+      }
+    }
+  }')" "$base_url/__test__/resources" >/dev/null
+wait_mock_status ".receiveLookupRequests > $before_stale_requests
+  and .receiveLookupRequestsActive == 1" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/__test__/disconnect" >/dev/null
+wait_snapshot '.connectionState == "unavailable"' >/dev/null
+wait_mock_status '.streamConnections == 0' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveLookupDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/receive/$pending_recovery_id/cancel" >/dev/null \
+  || fail "stale-lookup Receive cleanup failed"
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected" and .activeTransfers == []' >/dev/null
+wait_mock_status ".receiveLookupResponses > $before_stale_responses
+  and .receiveLookupRequestsActive == 0" >/dev/null
+wait_snapshot '.activeTransfers == []' >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$pending_recovery_id" '{
+    event: {
+      type: "operation.updated",
+      timestamp: "2026-08-20T12:05:04Z",
+      data: {
+        operationType: "receive",
+        operationId: $id,
+        mintUrl: "https://mint.slice4.test"
+      }
+    }
+  }')" "$base_url/__test__/resources" >/dev/null
+wait_snapshot ".receiveRecoveryState == \"rolled_back\"
+  and .receiveRecoveryOperationId == \"$pending_recovery_id\"
+  and .activeTransfers == []" >/dev/null
+named_event_status=$(curl -fsS "$base_url/__test__/status")
+if rg -Fq "$pending_recovery_token" <<<"$(adapter_call snapshot)$named_event_status" \
+    || rg -Fq "$pending_recovery_token" "$shell_log" "$mock_log"; then
+  fail "named Operation invalidation exposed bearer-token text"
+fi
+
+echo "runtime: named, duplicate, missing, and reordered Receive invalidations passed"
+
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"before_commit","receiveRefreshError":"mint_unavailable"}' \
+  "$base_url/__test__/mode" >/dev/null
+first_concurrent=$(prepare_receive_fixture "$pending_recovery_token") \
+  || fail "first concurrent recovery fixture preparation failed"
+second_concurrent=$(prepare_receive_fixture "$concurrent_recovery_token") \
+  || fail "second concurrent recovery fixture preparation failed"
+first_concurrent_id=$(jq -er '.id' <<<"$first_concurrent")
+second_concurrent_id=$(jq -er '.id' <<<"$second_concurrent")
+for concurrent_id in "$first_concurrent_id" "$second_concurrent_id"; do
+  if curl -fsS -H "Authorization: Bearer $credential" -X POST \
+      -H 'Content-Type: application/json' --data '{}' \
+      "$base_url/v1/operations/receive/$concurrent_id/execute" >/dev/null 2>&1; then
+    fail "concurrent recovery fixture reported optimistic success"
+  fi
+done
+COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
+  quickshell --no-color -p "$shell_qml" >>"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot ".connectionState == \"connected\"
+  and (.activeTransfers | length) == 2
+  and (.activeTransfers | all(.stateLabel == \"Receive temporarily unavailable\"))
+  and (.activeTransfers | any(.id == \"$first_concurrent_id\"))
+  and (.activeTransfers | any(.id == \"$second_concurrent_id\"))" >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"none","receiveRefreshError":""}' \
+  "$base_url/__test__/mode" >/dev/null
+for concurrent_id in "$first_concurrent_id" "$second_concurrent_id"; do
+  curl -fsS -X POST -H 'Content-Type: application/json' \
+    --data "$(jq -cn --arg id "$concurrent_id" '{
+      event: {
+        type: "operation.updated",
+        timestamp: "2026-08-20T12:05:05Z",
+        data: {
+          operationType: "receive",
+          operationId: $id,
+          mintUrl: "https://mint.slice4.test"
+        }
+      }
+    }')" "$base_url/__test__/resources" >/dev/null
+done
+wait_snapshot ".activeTransfers == []
+  and .receiveRecoveries[\"$first_concurrent_id\"].state == \"rolled_back\"
+  and .receiveRecoveries[\"$second_concurrent_id\"].state == \"rolled_back\"" >/dev/null
+
+echo "runtime: concurrent Receive recovery projections passed"
+
 before_balance=$(curl -fsS "$base_url/__test__/status")
 before_status_requests=$(jq -r '.resourceRequests.status' <<<"$before_balance")
 before_balance_requests=$(jq -r '.resourceRequests.balances' <<<"$before_balance")
@@ -562,20 +894,39 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 adapter_call reconnect >/dev/null
 wait_snapshot '.walletState == "unlocked" and .connectionState == "connected"' >/dev/null
 
+rotation_receive=$(prepare_receive_fixture "$rotation_recovery_token") \
+  || fail "rotation recovery fixture preparation failed"
+rotation_receive_id=$(jq -er '.id' <<<"$rotation_receive")
+wait_snapshot ".activeTransfers | any(.id == \"$rotation_receive_id\")" >/dev/null
 before_rotation=$(curl -fsS "$base_url/__test__/status")
 before_rotation_status=$(jq -r '.resourceRequests.status' <<<"$before_rotation")
 before_rotation_balances=$(jq -r '.resourceRequests.balances' <<<"$before_rotation")
+before_rotation_receive_prepared=$(jq -r '.resourceRequests.receivePrepared' <<<"$before_rotation")
+before_rotation_receive_in_flight=$(jq -r '.resourceRequests.receiveInFlight' <<<"$before_rotation")
+before_rotation_receive_lookups=$(jq -r '.receiveLookupRequests' <<<"$before_rotation")
+before_rotation_receive_creates=$(jq -r '.receiveCreateRequests' <<<"$before_rotation")
+before_rotation_receive_executes=$(jq -r '.receiveExecuteRequests' <<<"$before_rotation")
 adapter_call rotate >/dev/null
 wait_snapshot '.connectionState == "connected" and .rotationCount == 1' >/dev/null
 wait_mock_status \
   ".resourceRequests.status > $before_rotation_status
    and .resourceRequests.balances > $before_rotation_balances
+   and .resourceRequests.receivePrepared > $before_rotation_receive_prepared
+   and .resourceRequests.receiveInFlight > $before_rotation_receive_in_flight
+   and .receiveLookupRequests > $before_rotation_receive_lookups
+   and .receiveCreateRequests == $before_rotation_receive_creates
+   and .receiveExecuteRequests == $before_rotation_receive_executes
    and .streamConnections >= 1
   " >/dev/null
 
 before_reconnect=$(curl -fsS "$base_url/__test__/status")
 before_reconnect_status=$(jq -r '.resourceRequests.status' <<<"$before_reconnect")
 before_reconnect_balances=$(jq -r '.resourceRequests.balances' <<<"$before_reconnect")
+before_reconnect_receive_prepared=$(jq -r '.resourceRequests.receivePrepared' <<<"$before_reconnect")
+before_reconnect_receive_in_flight=$(jq -r '.resourceRequests.receiveInFlight' <<<"$before_reconnect")
+before_reconnect_receive_lookups=$(jq -r '.receiveLookupRequests' <<<"$before_reconnect")
+before_reconnect_receive_creates=$(jq -r '.receiveCreateRequests' <<<"$before_reconnect")
+before_reconnect_receive_executes=$(jq -r '.receiveExecuteRequests' <<<"$before_reconnect")
 curl -fsS -X POST -H 'Content-Type: application/json' --data '{}' \
   "$base_url/__test__/disconnect" >/dev/null
 wait_snapshot '.connectionState == "unavailable" and .retryAttempt >= 1' >/dev/null
@@ -583,8 +934,19 @@ wait_snapshot '.connectionState == "connected" and .reconnectCount >= 1' >/dev/n
 wait_mock_status \
   ".resourceRequests.status > $before_reconnect_status
    and .resourceRequests.balances > $before_reconnect_balances
+   and .resourceRequests.receivePrepared > $before_reconnect_receive_prepared
+   and .resourceRequests.receiveInFlight > $before_reconnect_receive_in_flight
+   and .receiveLookupRequests > $before_reconnect_receive_lookups
+   and .receiveCreateRequests == $before_reconnect_receive_creates
+   and .receiveExecuteRequests == $before_reconnect_receive_executes
    and .streamConnections >= 1
   " >/dev/null
+
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/receive/$rotation_receive_id/cancel" >/dev/null \
+  || fail "rotation recovery fixture cleanup failed"
+wait_snapshot ".activeTransfers | all(.id != \"$rotation_receive_id\")" >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"resources":"unavailable"}' "$base_url/__test__/mode" >/dev/null

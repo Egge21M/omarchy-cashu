@@ -5,9 +5,13 @@ set -euo pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 port=${OMARCHY_CASHU_TEST_PORT:-38431}
 base_url="http://127.0.0.1:$port"
+recovery_port=$((port + 1))
+recovery_base_url="http://127.0.0.1:$recovery_port"
 credential=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 state_dir=$(mktemp -d)
+recovery_state_dir=$(mktemp -d)
 daemon_log=$(mktemp)
+recovery_daemon_log=$(mktemp)
 stream_output=$(mktemp)
 stream_headers=$(mktemp)
 initialize_headers=$(mktemp)
@@ -17,6 +21,7 @@ operation_headers=$(mktemp)
 mint_headers=$(mktemp)
 command_headers=$(mktemp)
 daemon_pid=""
+recovery_daemon_pid=""
 stream_pid=""
 
 cleanup() {
@@ -24,14 +29,18 @@ cleanup() {
     kill "$daemon_pid" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
   fi
+  if [[ -n $recovery_daemon_pid ]]; then
+    kill "$recovery_daemon_pid" 2>/dev/null || true
+    wait "$recovery_daemon_pid" 2>/dev/null || true
+  fi
   if [[ -n $stream_pid ]]; then
     kill "$stream_pid" 2>/dev/null || true
     wait "$stream_pid" 2>/dev/null || true
   fi
-  rm -f "$daemon_log" "$stream_output" "$stream_headers" \
+  rm -f "$daemon_log" "$recovery_daemon_log" "$stream_output" "$stream_headers" \
     "$initialize_headers" "$recovery_headers" "$preview_headers" \
     "$operation_headers" "$mint_headers" "$command_headers"
-  rm -rf "$state_dir"
+  rm -rf "$state_dir" "$recovery_state_dir"
 }
 trap cleanup EXIT
 
@@ -449,6 +458,130 @@ if rg -Fq "$credential" "$daemon_log" \
     || rg -Fq "$generated_mnemonic" <<<"$status$balances$mints$receive_prepared$receive_in_flight$send_prepared$send_in_flight$mock_status" \
     || rg -Fq "$generated_mnemonic" "$daemon_log" "$stream_output"; then
   fail "a Client Credential or Recovery Phrase escaped its narrow sensitive response"
+fi
+
+# A second deterministic fixture proves that durable safe Receive state survives
+# process replacement on both sides of the Wallet commit point. The dropped
+# execute responses model the client losing contact after execution begins.
+mkdir -p "$recovery_state_dir/credentials/generation-1"
+printf '%s\n' "$credential" >"$recovery_state_dir/credentials/generation-1/client"
+chmod 700 "$recovery_state_dir" "$recovery_state_dir/credentials" \
+  "$recovery_state_dir/credentials/generation-1"
+chmod 600 "$recovery_state_dir/credentials/generation-1/client"
+ln -s generation-1 "$recovery_state_dir/credentials/current"
+
+COCOD_STATE_DIR="$recovery_state_dir" python3 "$project_dir/scripts/mock-cocod.py" \
+  --port "$recovery_port" >"$recovery_daemon_log" 2>&1 &
+recovery_daemon_pid=$!
+for _attempt in {1..40}; do
+  curl -fsS "$recovery_base_url/__test__/status" >/dev/null 2>&1 && break
+  sleep 0.05
+done
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$recovery_base_url/v1/admin/wallet/initialize" >/dev/null \
+  || fail "recovery fixture Wallet initialization failed"
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg mint "$receive_mint" '{mintUrl: $mint}')" \
+  "$recovery_base_url/v1/mints" >/dev/null \
+  || fail "recovery fixture Mint registration failed"
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg mint "$receive_mint" '{mintUrl: $mint}')" \
+  "$recovery_base_url/v1/mints/trust" >/dev/null \
+  || fail "recovery fixture Mint trust failed"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"before_commit"}' \
+  "$recovery_base_url/__test__/mode" >/dev/null
+before_interrupt=$(jq -Rn '{token: input}' <<<"$cancel_token" \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$recovery_base_url/v1/operations/receive") \
+  || fail "before-commit Receive preparation failed"
+before_interrupt_id=$(jq -er '.id' <<<"$before_interrupt")
+if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+    "$recovery_base_url/v1/operations/receive/$before_interrupt_id/execute" >/dev/null 2>&1; then
+  fail "before-commit interruption returned an optimistic execute success"
+fi
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveInterruption":"after_commit"}' \
+  "$recovery_base_url/__test__/mode" >/dev/null
+after_interrupt=$(jq -Rn '{token: input}' <<<"$receive_token" \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$recovery_base_url/v1/operations/receive") \
+  || fail "after-commit Receive preparation failed"
+after_interrupt_id=$(jq -er '.id' <<<"$after_interrupt")
+if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+    "$recovery_base_url/v1/operations/receive/$after_interrupt_id/execute" >/dev/null 2>&1; then
+  fail "after-commit interruption returned an optimistic execute success"
+fi
+
+kill "$recovery_daemon_pid"
+wait "$recovery_daemon_pid" 2>/dev/null || true
+recovery_daemon_pid=""
+COCOD_STATE_DIR="$recovery_state_dir" python3 "$project_dir/scripts/mock-cocod.py" \
+  --port "$recovery_port" >>"$recovery_daemon_log" 2>&1 &
+recovery_daemon_pid=$!
+for _attempt in {1..40}; do
+  curl -fsS "$recovery_base_url/__test__/status" >/dev/null 2>&1 && break
+  sleep 0.05
+done
+
+recovered_in_flight=$(curl -fsS "${auth[@]}" \
+  "$recovery_base_url/v1/operations/receive/in-flight") \
+  || fail "interrupted Receives were not discoverable after restart"
+jq -e --arg before "$before_interrupt_id" --arg after "$after_interrupt_id" '
+  (.items | length) == 2
+  and (.items | any(.id == $before and .state == "executing"
+    and .amount == "400" and (.amount | type == "string")))
+  and (.items | any(.id == $after and .state == "executing"
+    and .amount == "1200" and (.netAmount | type == "string")))
+' <<<"$recovered_in_flight" >/dev/null \
+  || fail "restart did not rehydrate the same safe executing Operations"
+
+before_refreshed=$(curl -fsS "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$recovery_base_url/v1/operations/receive/$before_interrupt_id/refresh") \
+  || fail "before-commit Receive refresh failed"
+after_refreshed=$(curl -fsS "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$recovery_base_url/v1/operations/receive/$after_interrupt_id/refresh") \
+  || fail "after-commit Receive refresh failed"
+jq -e --arg id "$before_interrupt_id" \
+  '.id == $id and .state == "rolled_back"' <<<"$before_refreshed" >/dev/null \
+  || fail "pre-commit interruption did not reconcile to rolled_back"
+jq -e --arg id "$after_interrupt_id" \
+  '.id == $id and .state == "finalized"' <<<"$after_refreshed" >/dev/null \
+  || fail "post-commit interruption did not reconcile to finalized"
+recovered_balances=$(curl -fsS "${auth[@]}" "$recovery_base_url/v1/balances")
+jq -e --arg mint "$receive_mint" '
+  .items | any(.mintUrl == $mint and .unit == "sat"
+    and .spendable == "1198" and .reserved == "0" and .total == "1198")
+' <<<"$recovered_balances" >/dev/null \
+  || fail "refresh duplicated or lost the committed Receive balance"
+recovery_replay=$(jq -Rn '{token: input}' <<<"$receive_token" \
+  | curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$recovery_base_url/v1/operations/receive")
+[[ ${recovery_replay##*$'\n'} == 409 ]] \
+  || fail "recovered token replay created a second Receive"
+jq -e '.error.code == "token_already_spent"' \
+  <<<"${recovery_replay%$'\n'*}" >/dev/null \
+  || fail "recovered token replay did not remain actionable"
+[[ $(curl -fsS "${auth[@]}" "$recovery_base_url/v1/balances") \
+    == "$recovered_balances" ]] \
+  || fail "recovered token replay credited Spendable Balance twice"
+recovery_status=$(curl -fsS "$recovery_base_url/__test__/status")
+jq -e '
+  .receiveCreateRequests == 1
+  and .receiveExecuteRequests == 0
+  and .receiveRefreshRequests == 2
+  and .receiveOperationCount == 2
+' <<<"$recovery_status" >/dev/null \
+  || fail "restart replay created or re-executed a Receive"
+if rg -Fq "$receive_token" "$recovery_state_dir/mock-runtime-state.json" \
+    || rg -Fq "$cancel_token" "$recovery_state_dir/mock-runtime-state.json" \
+    || rg -qi 'proof|credential|mnemonic' "$recovery_state_dir/mock-runtime-state.json"; then
+  fail "durable recovery fixture persisted sensitive Wallet material"
 fi
 
 echo "contract: cocod v1 auth, lifecycle, resources, decimal strings, errors, SSE, and redaction passed"

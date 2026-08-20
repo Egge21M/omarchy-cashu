@@ -60,6 +60,27 @@ RECEIVE_TOKENS: dict[str, dict[str, str]] = {
         "fee": "1",
         "netAmount": "399",
     },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1wZW5kaW5nIn0": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "250",
+        "fee": "1",
+        "netAmount": "249",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1yb3RhdGlvbiJ9": {
+        "mintUrl": "https://mint.one",
+        "unit": "sat",
+        "amount": "80",
+        "fee": "1",
+        "netAmount": "79",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1jb25jdXJyZW50In0": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "350",
+        "fee": "1",
+        "netAmount": "349",
+    },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC11c2QifQ": {
         "mintUrl": RECEIVE_MINT,
         "unit": "usd",
@@ -158,12 +179,87 @@ class MockState:
         self.receive_create_requests = 0
         self.receive_execute_requests = 0
         self.receive_cancel_requests = 0
+        self.receive_refresh_requests = 0
+        self.receive_lookup_requests = 0
+        self.receive_lookup_responses = 0
+        self.receive_lookup_requests_active = 0
+        self.receive_lookup_delay_ms = 0
         self.receive_operation_sequence = 0
         self.receive_operations: dict[str, dict[str, Any]] = {}
         self.receive_token_keys: dict[str, str] = {}
         self.receive_command_errors: dict[str, str] = {}
+        self.receive_recovery_outcomes: dict[str, str] = {}
+        self.receive_interruption = "none"
+        self.receive_refresh_error = ""
         self.spent_receive_token_keys: set[str] = set()
         self.subscribers: list[queue.Queue[object]] = []
+        self._load_persisted_state()
+
+    @property
+    def persisted_state_path(self) -> Path:
+        return self.state_root / "mock-runtime-state.json"
+
+    def _load_persisted_state(self) -> None:
+        try:
+            value = json.loads(self.persisted_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(value, dict):
+            return
+        self.wallet_configured = value.get("walletConfigured") is True
+        resources = value.get("resources")
+        if isinstance(resources, dict):
+            for key in self.resources:
+                if isinstance(resources.get(key), dict):
+                    self.resources[key] = copy.deepcopy(resources[key])
+        operations = value.get("receiveOperations")
+        if isinstance(operations, dict):
+            self.receive_operations = copy.deepcopy(operations)
+        input_digests = value.get("receiveInputDigests")
+        if isinstance(input_digests, dict):
+            self.receive_token_keys = {
+                str(operation_id): str(digest)
+                for operation_id, digest in input_digests.items()
+                if re.fullmatch(r"[0-9a-f]{64}", str(digest))
+            }
+        spent_digests = value.get("spentReceiveInputDigests")
+        if isinstance(spent_digests, list):
+            self.spent_receive_token_keys = {
+                str(digest)
+                for digest in spent_digests
+                if re.fullmatch(r"[0-9a-f]{64}", str(digest))
+            }
+        outcomes = value.get("receiveRecoveryOutcomes")
+        if isinstance(outcomes, dict):
+            self.receive_recovery_outcomes = {
+                str(key): str(state) for key, state in outcomes.items()
+                if state in ("finalized", "rolled_back")
+            }
+        sequence = value.get("receiveOperationSequence")
+        if isinstance(sequence, int) and sequence >= 0:
+            self.receive_operation_sequence = sequence
+        self.status = self._status_document()
+
+    def _persist_locked(self) -> None:
+        self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        value = {
+            "walletConfigured": self.wallet_configured,
+            "resources": self.resources,
+            "receiveOperations": self.receive_operations,
+            "receiveOperationSequence": self.receive_operation_sequence,
+            "receiveRecoveryOutcomes": self.receive_recovery_outcomes,
+            # One-way fixture digests preserve replay behavior without retaining
+            # encoded Cashu token material.
+            "receiveInputDigests": self.receive_token_keys,
+            "spentReceiveInputDigests": sorted(self.spent_receive_token_keys),
+        }
+        temporary = self.persisted_state_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        temporary.replace(self.persisted_state_path)
 
     def _status_document(self) -> dict[str, Any]:
         if not self.wallet_configured:
@@ -238,6 +334,7 @@ class MockState:
                 return False
             self.wallet_configured = True
             self.status = self._status_document()
+            self._persist_locked()
         return True
 
     def recovery_material(self) -> str | None:
@@ -273,6 +370,7 @@ class MockState:
             if "status" in value:
                 self.status = copy.deepcopy(value["status"])
                 self.wallet_configured = self.status.get("wallet") is not None
+            self._persist_locked()
             subscribers = list(self.subscribers)
         raw_event = value.get("rawEvent")
         event = value.get("event")
@@ -358,6 +456,7 @@ class MockState:
                 "updatedAt": FIXED_TIME,
             }
             items.append(mint)
+            self._persist_locked()
         event = self.safe_event("mint.updated", {"mintUrl": mint_url})
         return 201, copy.deepcopy(mint), [event]
 
@@ -382,6 +481,7 @@ class MockState:
                 result = copy.deepcopy(mint)
                 if mint_url == TRUST_RACE_MINT:
                     mint["trusted"] = False
+                self._persist_locked()
                 break
             else:
                 return 409, error_document("mint_not_registered", "The Mint is not registered"), []
@@ -390,8 +490,17 @@ class MockState:
 
     def receive_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.lock:
+            self.receive_lookup_requests += 1
+            self.receive_lookup_requests_active += 1
+            delay_ms = self.receive_lookup_delay_ms
             operation = self.receive_operations.get(operation_id)
-            return copy.deepcopy(operation) if operation else None
+            result = copy.deepcopy(operation) if operation else None
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+        with self.lock:
+            self.receive_lookup_requests_active -= 1
+            self.receive_lookup_responses += 1
+        return result
 
     def create_receive(
         self, value: object
@@ -443,6 +552,7 @@ class MockState:
             if "executeError" in details:
                 self.receive_command_errors[operation_id] = details["executeError"]
             self.resources["receivePrepared"]["items"].append(copy.deepcopy(operation))
+            self._persist_locked()
         event = self.safe_event(
             "operation.updated",
             {"operationType": "receive", "operationId": operation_id, "mintUrl": details["mintUrl"]},
@@ -472,7 +582,43 @@ class MockState:
                 del self.receive_operations[operation_id]
                 self.receive_token_keys.pop(operation_id, None)
                 self.receive_command_errors.pop(operation_id, None)
+                self._persist_locked()
                 return 404, error_document(command_error, "The Receive does not exist"), []
+            if command == "execute" and self.receive_interruption in (
+                "before_commit",
+                "after_commit",
+            ):
+                operation["state"] = "executing"
+                operation["updatedAt"] = FIXED_TIME
+                self.resources["receivePrepared"]["items"] = [
+                    item
+                    for item in self.resources["receivePrepared"]["items"]
+                    if item.get("id") != operation_id
+                ]
+                self.resources["receiveInFlight"]["items"].append(
+                    copy.deepcopy(operation)
+                )
+                outcome = (
+                    "finalized"
+                    if self.receive_interruption == "after_commit"
+                    else "rolled_back"
+                )
+                self.receive_recovery_outcomes[operation_id] = outcome
+                if self.receive_interruption == "after_commit":
+                    self.spent_receive_token_keys.add(
+                        self.receive_token_keys[operation_id]
+                    )
+                    self._credit_receive_locked(operation)
+                self._persist_locked()
+                event = self.safe_event(
+                    "operation.updated",
+                    {
+                        "operationType": "receive",
+                        "operationId": operation_id,
+                        "mintUrl": operation["mintUrl"],
+                    },
+                )
+                return 0, {}, [event]
             operation["state"] = "rolled_back" if command == "cancel" else "finalized"
             operation["updatedAt"] = FIXED_TIME
             self.resources["receivePrepared"]["items"] = [
@@ -493,34 +639,78 @@ class MockState:
             if command == "execute":
                 token_key = self.receive_token_keys[operation_id]
                 self.spent_receive_token_keys.add(token_key)
-                balances = self.resources["balances"]["items"]
-                balance = next(
-                    (
-                        item
-                        for item in balances
-                        if item.get("mintUrl") == operation["mintUrl"]
-                        and item.get("unit") == operation["unit"]
-                    ),
-                    None,
-                )
-                if balance is None:
-                    balance = {
-                        "mintUrl": operation["mintUrl"],
-                        "unit": operation["unit"],
-                        "spendable": "0",
-                        "reserved": "0",
-                        "total": "0",
-                    }
-                    balances.append(balance)
-                balance["spendable"] = str(
-                    int(balance["spendable"]) + int(operation["netAmount"])
-                )
-                balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
+                self._credit_receive_locked(operation)
                 events.append(
                     self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]})
                 )
             result = copy.deepcopy(operation)
+            self._persist_locked()
         return 200, result, events
+
+    def _credit_receive_locked(self, operation: dict[str, Any]) -> None:
+        balances = self.resources["balances"]["items"]
+        balance = next(
+            (
+                item
+                for item in balances
+                if item.get("mintUrl") == operation["mintUrl"]
+                and item.get("unit") == operation["unit"]
+            ),
+            None,
+        )
+        if balance is None:
+            balance = {
+                "mintUrl": operation["mintUrl"],
+                "unit": operation["unit"],
+                "spendable": "0",
+                "reserved": "0",
+                "total": "0",
+            }
+            balances.append(balance)
+        balance["spendable"] = str(
+            int(balance["spendable"]) + int(operation["netAmount"])
+        )
+        balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
+
+    def refresh_receive(
+        self, operation_id: str
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        with self.lock:
+            self.receive_refresh_requests += 1
+            operation = self.receive_operations.get(operation_id)
+            if operation is None:
+                return 404, error_document(
+                    "operation_not_found", "The Receive does not exist"
+                ), []
+            if self.receive_refresh_error:
+                code = self.receive_refresh_error
+                status = 503 if code == "mint_unavailable" else 409
+                return status, error_document(
+                    code,
+                    "The Receive could not be refreshed",
+                    code == "mint_unavailable",
+                ), []
+            outcome = self.receive_recovery_outcomes.get(operation_id)
+            if operation["state"] == "executing" and outcome:
+                operation["state"] = outcome
+                operation["updatedAt"] = FIXED_TIME
+                self.resources["receiveInFlight"]["items"] = [
+                    item
+                    for item in self.resources["receiveInFlight"]["items"]
+                    if item.get("id") != operation_id
+                ]
+                self.receive_recovery_outcomes.pop(operation_id, None)
+                self._persist_locked()
+            result = copy.deepcopy(operation)
+        event = self.safe_event(
+            "operation.updated",
+            {
+                "operationType": "receive",
+                "operationId": operation_id,
+                "mintUrl": result["mintUrl"],
+            },
+        )
+        return 200, result, [event]
 
     def diagnostics(self) -> dict[str, Any]:
         with self.lock:
@@ -544,6 +734,11 @@ class MockState:
                 "receiveCreateRequests": self.receive_create_requests,
                 "receiveExecuteRequests": self.receive_execute_requests,
                 "receiveCancelRequests": self.receive_cancel_requests,
+                "receiveRefreshRequests": self.receive_refresh_requests,
+                "receiveLookupRequests": self.receive_lookup_requests,
+                "receiveLookupResponses": self.receive_lookup_responses,
+                "receiveLookupRequestsActive": self.receive_lookup_requests_active,
+                "receiveLookupDelayMs": self.receive_lookup_delay_ms,
                 "receiveOperationCount": len(self.receive_operations),
             }
 
@@ -776,6 +971,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.recovery_delay_ms = max(0, min(5000, int(value["recoveryDelayMs"])))
                 if "receiveDelayMs" in value:
                     self.state.receive_delay_ms = max(0, min(5000, int(value["receiveDelayMs"])))
+                if "receiveLookupDelayMs" in value:
+                    self.state.receive_lookup_delay_ms = max(
+                        0, min(5000, int(value["receiveLookupDelayMs"]))
+                    )
+                if "receiveInterruption" in value:
+                    interruption = str(value["receiveInterruption"])
+                    if interruption not in ("none", "before_commit", "after_commit"):
+                        self.send_json(
+                            400,
+                            error_document("invalid_request", "Invalid Receive interruption"),
+                        )
+                        return
+                    self.state.receive_interruption = interruption
+                if "receiveRefreshError" in value:
+                    refresh_error = str(value["receiveRefreshError"])
+                    if refresh_error not in (
+                        "",
+                        "mint_unavailable",
+                        "operation_conflict",
+                        "operation_not_found",
+                    ):
+                        self.send_json(
+                            400,
+                            error_document("invalid_request", "Invalid Receive refresh error"),
+                        )
+                        return
+                    self.state.receive_refresh_error = refresh_error
             self.send_json(200, self.state.diagnostics())
             return
         if self.path == "/__test__/disconnect":
@@ -857,17 +1079,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             command = match.group(2)
             if command == "refresh":
-                operation = self.state.receive_operation(match.group(1))
-                if operation is None:
-                    self.send_json(
-                        404,
-                        error_document("operation_not_found", "The Receive does not exist"),
-                    )
-                else:
-                    self.send_json(200, operation)
+                self.state.wait_for_receive_transition()
+                status, response, events = self.state.refresh_receive(match.group(1))
+                self.send_json(status, response)
+                self.state.publish_events(events)
                 return
             self.state.wait_for_receive_transition()
             status, response, events = self.state.command_receive(match.group(1), command)
+            if status == 0:
+                self.close_connection = True
+                self.state.publish_events(events)
+                return
             self.send_json(status, response)
             self.state.publish_events(events)
             return
