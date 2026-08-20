@@ -1,5 +1,9 @@
 # Cocod Network Interface v1
 
+> Imported from
+> [`packages/cocod/docs/network-interface-v1.md`](https://github.com/cashubtc/coco/blob/eac486e5fcfbce6d123fd4e1210246df0b9e3200/packages/cocod/docs/network-interface-v1.md)
+> at upstream revision `eac486e5fcfbce6d123fd4e1210246df0b9e3200`, captured on 2026-08-20.
+
 Status: accepted and implemented for the authenticated TCP transport, compatibility discovery,
 Wallet and Coco Session lifecycle, Wallet Recovery Material, Cocod Process shutdown, balances,
 Known Mints, non-mutating token previews, Receive and Send Operations, Send Max, SSE invalidations,
@@ -9,8 +13,9 @@ implementations land.
 
 The implemented transfer and discovery slice is the code revision
 `17b1f695546e3a305bac35a4d1c202d11b1d9ea3`. The generated
-[runtime interface description](lifecycle-api-v1.json) is the exact callable schema surface at that
-revision; this document remains the normative behavioral contract.
+[runtime interface description](https://github.com/cashubtc/coco/blob/17b1f695546e3a305bac35a4d1c202d11b1d9ea3/packages/cocod/docs/lifecycle-api-v1.json)
+is the exact callable schema surface at that revision; this document remains the normative
+behavioral contract.
 
 This document specifies cocod's machine-oriented network interface. It distinguishes implemented
 resources from the accepted target surface so resources can land incrementally without inventing
@@ -46,9 +51,12 @@ Normative requirements use **MUST**, **MUST NOT**, **SHOULD**, and **MAY**.
 
 ## Domain language
 
-The interface uses the [Coco Cashu](../../core/CONTEXT.md) and
-[Cocod Host](../CONTEXT.md) glossaries routed by the repository's
-[context map](../../../CONTEXT-MAP.md).
+The interface uses the
+[Coco Cashu](https://github.com/cashubtc/coco/blob/eac486e5fcfbce6d123fd4e1210246df0b9e3200/packages/core/CONTEXT.md)
+and
+[Cocod Host](https://github.com/cashubtc/coco/blob/eac486e5fcfbce6d123fd4e1210246df0b9e3200/packages/cocod/CONTEXT.md)
+glossaries routed by the upstream repository's
+[context map](https://github.com/cashubtc/coco/blob/eac486e5fcfbce6d123fd4e1210246df0b9e3200/CONTEXT-MAP.md).
 
 **Wallet** is the durable, seed-rooted Cashu holding context. A Wallet continues to exist when cocod
 is stopped or its seed is locked.

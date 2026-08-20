@@ -20,7 +20,8 @@ Cashu users should be able to use a clean wallet as part of their operating syst
 - Prepare and confirm a Send before creating its encoded Cashu token.
 - Copy outgoing Cashu tokens explicitly without automatically reading or writing the clipboard.
 - Recover Active Transfers and allow a Pending Send to be reopened or reclaimed.
-- Synchronize authoritative snapshots and safe lifecycle events from `cocod`.
+- Compose the current Wallet view from canonical `cocod` resources and refresh it from safe
+  invalidation events.
 - Keep balances out of the bar; clicking its state indicator opens the panel.
 - Preserve the Wallet Instance and its data if the Quickshell plugin is removed.
 
@@ -38,7 +39,14 @@ The plugin has three Quickshell entry points:
 - A `panel` containing setup, wallet state, balances, Receive, Send, recovery material, and Active Transfers.
 - A headless `service` acting as the Shell Adapter shared by the bar widget and panel.
 
-The Shell Adapter uses versioned HTTP/JSON over loopback TCP for commands and snapshots, plus Server-Sent Events for state and operation changes. SSE payloads are non-authoritative invalidation hints with safe resource identifiers only; v1 has no event IDs, revision-gap protocol, or replay. Secrets, proofs, encoded tokens, and balances are never broadcast through the event stream. The adapter takes fresh authoritative snapshots on startup and reconnect, handles partial frames and backoff, and accepts server rotation to bound Qt's cumulative response buffer.
+The Shell Adapter uses versioned HTTP/JSON over loopback TCP for commands and canonical resource
+fetches, plus Server-Sent Events for invalidation. It composes the Wallet Client's view from the
+separate status, balance, mint, and operation resources. SSE payloads are non-authoritative hints
+with safe resource identifiers only; they cause the relevant resources to be fetched again. V1 has
+no event IDs, revision-gap protocol, or replay, so the adapter refetches every relevant resource on
+startup and reconnect. Secrets, proofs, encoded tokens, and balances are never broadcast through
+the event stream. The adapter handles partial frames and backoff and accepts server rotation to
+bound Qt's cumulative response buffer.
 
 ## Security boundary
 
@@ -93,10 +101,10 @@ Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable arc
 
 The implemented and proposed cocod TCP resource surface is captured in the
 [`Cocod Network Interface v1`](./docs/reference/cocod-network-interface-v1.md)
-reference. Its status section distinguishes implemented resources from the
-accepted target design. The transfer, preview, compatibility, credential, and
-SSE contracts used by Handoffs 03–05 are implemented by upstream coco commit
-`17b1f695546e3a305bac35a4d1c202d11b1d9ea3`.
+reference. Its provenance note pins the upstream source and capture date, while
+its status section distinguishes implemented resources from the accepted target
+design. Transfer, preview, compatibility, credential, and SSE contracts are
+implemented by the cited upstream revision.
 
 ## Slice 3 development
 
@@ -104,13 +112,13 @@ Slice 3 adds explicit, create-only onboarding to the deterministic loopback mock
 and a separately confirmed Recovery Phrase reveal. The headless Shell Adapter
 continues to own all HTTP and SSE transport. It exposes transient command state
 to the panel, passes a revealed phrase directly to the requesting view, and does
-not include the phrase in its snapshot diagnostics or durable state.
+not include the phrase in its adapter diagnostics or durable state.
 
 The provisional mock endpoints introduced by this slice are:
 
 - `POST /v1/wallet/create` — creates the one empty Wallet Instance and returns a
-  minimal `202` acknowledgement. SSE invalidation followed by a fresh snapshot
-  establishes the new Wallet State.
+  minimal `202` acknowledgement. SSE invalidation followed by a fresh resource
+  fetch establishes the new Wallet State.
 - `POST /v1/wallet/recovery-phrase/reveal` — returns the deterministic mock
   Recovery Phrase only on demand with `Cache-Control: no-store`.
 

@@ -12,8 +12,16 @@ A single wallet identity and its state, owned by one cocod process and presented
 _Avoid_: Account, profile
 
 **Wallet State**:
-The current condition of a Wallet Instance as reported by cocod, determining which wallet actions are available. A Wallet may be unavailable, uninitialized, locked, unlocked, or in an error state.
-_Avoid_: UI state, connection status
+The user-facing condition of a Wallet Instance, projected from whether the Wallet exists, its Wallet Seed Access, and its Coco Session. It determines which wallet actions are available without flattening those facts into one cocod lifecycle state.
+_Avoid_: Snapshot, UI state, connection status
+
+**Wallet Seed Access**:
+Whether cocod can currently derive the Wallet's secrets. It is locked or available and is separate from both Wallet existence and Client Credential authentication.
+_Avoid_: Wallet State, client session, login
+
+**Coco Session**:
+A running Coco instance through which cocod uses the Wallet. Its lifecycle is separate from Wallet existence and Wallet Seed Access.
+_Avoid_: cocod session, client session
 
 **Spendable Balance**:
 The amount of ecash that cocod currently reports as available for a Send.
@@ -28,7 +36,7 @@ The secret words controlled by the Cashu User for recovering a Wallet Instance. 
 _Avoid_: Mnemonic, seed phrase, password
 
 **Wallet Client**:
-The user-facing part of the Wallet embedded in Omarchy. It presents wallet state and requests operations from cocod without owning authoritative wallet state or retaining wallet secrets.
+The user-facing part of the Wallet embedded in Omarchy. It presents a projection of cocod's Wallet lifecycle, balances, Known Mints, and Operations without owning those resources or retaining wallet secrets.
 _Avoid_: Plugin, frontend
 
 **cocod**:
@@ -39,9 +47,17 @@ _Avoid_: Wallet UI, plugin
 An Omarchy user who uses Cashu and wants a clean wallet experience integrated into their operating system.
 _Avoid_: Customer, account
 
+**Known Mint**:
+A Cashu mint that the Wallet knows about. Being known does not authorize Wallet operations through that mint.
+_Avoid_: Trusted Mint, default mint
+
 **Trusted Mint**:
-A Cashu mint that the Cashu User has explicitly approved for wallet operations.
-_Avoid_: Known mint, default mint
+A Known Mint that the Cashu User has explicitly approved for Wallet operations.
+_Avoid_: Default mint, automatically trusted mint
+
+**Operation**:
+A durable Receive or Send lifecycle owned by cocod and identified independently of the Wallet Client view that presents it.
+_Avoid_: UI action, snapshot, history entry
 
 **Ecash Transfer**:
 The movement of ecash into or out of a Wallet Instance using an encoded Cashu token.
