@@ -51,13 +51,14 @@ Item {
   }
 
   function close() {
+    if (service && !service.resetReceive()) return false
     clearInput()
-    if (service) service.resetReceive()
     opened = false
+    return true
   }
 
   function panelClosed() {
-    close()
+    return close()
   }
 
   function paste() {
@@ -93,6 +94,13 @@ Item {
     return true
   }
 
+  function continueAfterMintApproval() {
+    if (!confirmationPending || receiveState !== "preview" || !preview
+        || !preview.trusted || !service) return
+    confirmationPending = false
+    if (service.confirmReceive(tokenInput.text)) clearInput()
+  }
+
   function backToEntry() {
     if (!service || !service.resetReceive()) return false
     clearInput()
@@ -114,10 +122,9 @@ Item {
   onReceiveStateChanged: {
     if (receiveState === "error") clearInput()
     else if (receiveState === "preview") {
-      if (confirmationPending && preview && preview.trusted) {
-        confirmationPending = false
-        if (service.confirmReceive(tokenInput.text)) clearInput()
-      } else mintApproved = false
+      if (confirmationPending && preview && preview.trusted)
+        Qt.callLater(root.continueAfterMintApproval)
+      else mintApproved = false
     }
   }
 

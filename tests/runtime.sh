@@ -98,12 +98,63 @@ wait_mock_status() {
 
 set_sensitive_clipboard() {
   local value=$1
+  wl-copy --clear 2>/dev/null || true
+  wait_clipboard_owner empty
   printf '%s' "$value" | wl-copy --sensitive
+  wait_clipboard_owner ready
+  panel_call >/dev/null || true
+}
+
+wait_clipboard_owner() {
+  local expected=$1
+  for _attempt in {1..200}; do
+    if wl-paste --list-types 2>/dev/null | rg -q '.'; then
+      [[ $expected == "ready" ]] && return 0
+    else
+      [[ $expected == "empty" ]] && return 0
+    fi
+    sleep 0.05
+  done
+  fail "Wayland clipboard ownership did not become $expected"
 }
 
 open_receive_panel() {
-  panel_action openPanel >/dev/null
-  panel_action openReceive
+  [[ $(panel_action openPanel) == "ok" ]] \
+    || fail "panel could not be opened for Receive"
+  [[ $(panel_action openReceive) == "ok" ]] \
+    || fail "Receive entry point was unavailable"
+  wait_panel_snapshot '
+    .receiveViewState == "entry"
+    and .receiveInputVisible == true
+  ' >/dev/null
+  printf '%s\n' "ok"
+}
+
+require_receive_action() {
+  local action=$1
+  local description=$2
+  local result
+  result=$(panel_action "$action" || true)
+  [[ $result == "ok" ]] \
+    || fail "$description was rejected; $action returned ${result:-<empty>}"
+}
+
+close_receive_panel() {
+  local scenario=$1
+  require_receive_action cancelReceive "Receive cancellation after $scenario"
+  wait_panel_snapshot '
+    .receiveViewState == "closed"
+    and .receiveTextPresent == false
+  ' >/dev/null
+}
+
+preview_clipboard_receive() {
+  local token=$1
+  set_sensitive_clipboard "$token"
+  open_receive_panel >/dev/null
+  require_receive_action pasteReceive "Receive Paste action"
+  wait_panel_snapshot '.receiveTextPresent == true' >/dev/null
+  require_receive_action previewReceive "Receive preview"
 }
 
 mkdir -p "$state_dir/credentials/generation-1"
@@ -243,6 +294,7 @@ set_sensitive_clipboard "$receive_token"
 panel_snapshot=$(wait_panel_snapshot '
   .receiveViewState == "entry"
   and .receiveInputVisible == true
+  and .receiveInputFocused == true
   and .receiveTextPresent == false
   and .receivePasteVisible == true
   and .receiveClipboardReads == 0
@@ -264,23 +316,16 @@ wait_panel_snapshot '
   and .receiveTextPresent == true
   and .receiveClipboardReads == 0
 ' >/dev/null
-[[ $(panel_action cancelReceive) == "ok" ]] \
-  || fail "manual Receive entry could not be cancelled"
-wait_panel_snapshot '
-  .receiveViewState == "closed"
-  and .receiveTextPresent == false
-' >/dev/null
+close_receive_panel "manual entry"
 
 open_receive_panel >/dev/null
-[[ $(panel_action pasteReceive) == "ok" ]] \
-  || fail "explicit Receive Paste action was unavailable"
+require_receive_action pasteReceive "explicit Receive Paste action"
 wait_panel_snapshot '
   .receiveViewState == "entry"
   and .receiveTextPresent == true
   and .receiveClipboardReads == 1
 ' >/dev/null
-[[ $(panel_action previewReceive) == "ok" ]] \
-  || fail "pasted Cashu token could not be previewed"
+require_receive_action previewReceive "pasted Cashu token preview"
 panel_snapshot=$(wait_panel_snapshot '
   .receiveViewState == "preview"
   and .receivePreviewAmount == "1200"
@@ -294,17 +339,15 @@ panel_snapshot=$(wait_panel_snapshot '
   and .receiveConfirmEnabled == false
 ')
 [[ $(panel_action confirmReceive) == "disabled" ]] \
-  || fail "an unknown mint could be received without approval"
-[[ $(panel_action approveReceiveMint) == "ok" ]] \
-  || fail "unknown-mint approval could not be selected"
+  || fail "a mint could be received before explicit trust approval"
+require_receive_action approveReceiveMint "Trusted Mint approval selection"
 wait_panel_snapshot '
   .receiveViewState == "preview"
   and .receiveMintApproved == true
   and .receiveMintTrusted == false
   and .receiveConfirmEnabled == true
 ' >/dev/null
-[[ $(panel_action cancelReceive) == "ok" ]] \
-  || fail "approved but unconfirmed Receive could not be cancelled"
+close_receive_panel "local Mint approval"
 wait_mock_status '
   .tokenPreviewRequests == 1
   and .mintRegistrationRequests == 0
@@ -327,36 +370,44 @@ for preview_error in \
   "$unavailable_token|The mint is unavailable. Try again later."; do
   token=${preview_error%%|*}
   expected_message=${preview_error#*|}
-  set_sensitive_clipboard "$token"
-  open_receive_panel >/dev/null
-  panel_action pasteReceive >/dev/null
-  panel_action previewReceive >/dev/null
+  preview_clipboard_receive "$token"
   panel_snapshot=$(wait_panel_snapshot \
     ".receiveViewState == \"error\" and .receiveError == \"$expected_message\" and .receiveTextPresent == false")
   if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
       || rg -Fq "$token" "$shell_log" "$mock_log"; then
     fail "Receive preview error exposed bearer-token text"
   fi
-  panel_action cancelReceive >/dev/null
+  close_receive_panel "preview error"
 done
 
-set_sensitive_clipboard "$receive_token"
-open_receive_panel >/dev/null
-panel_action pasteReceive >/dev/null
-panel_action previewReceive >/dev/null
+preview_clipboard_receive "$receive_token"
 wait_panel_snapshot '
   .receiveViewState == "preview"
   and .receiveApprovalVisible == true
   and .receiveConfirmEnabled == false
 ' >/dev/null
-[[ $(panel_action approveReceiveMint) == "ok" ]] \
-  || fail "unknown-mint approval was unavailable"
+require_receive_action approveReceiveMint "Trusted Mint approval selection"
 wait_panel_snapshot '
   .receiveMintApproved == true
   and .receiveConfirmEnabled == true
 ' >/dev/null
-[[ $(panel_action confirmReceive) == "ok" ]] \
-  || fail "approved Receive confirmation was unavailable"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"resources":"ok","delayMs":150,"receiveDelayMs":150}' \
+  "$base_url/__test__/mode" >/dev/null
+require_receive_action confirmReceive "approved Receive confirmation"
+wait_panel_snapshot '
+  .receiveViewState == "approving"
+  and .receiveTextPresent == true
+' >/dev/null
+[[ $(panel_action cancelReceive) == "disabled" ]] \
+  || fail "Receive cancellation did not report a rejected approving transition"
+wait_panel_snapshot '
+  .receiveViewState == "approving"
+  and .receiveTextPresent == true
+' >/dev/null
+wait_panel_snapshot '.receiveViewState == "preparing"' >/dev/null
+wait_panel_snapshot '.receiveViewState == "executing"' >/dev/null
+wait_panel_snapshot '.receiveViewState == "reconciling"' >/dev/null
 adapter_snapshot=$(wait_snapshot '
   .receiveState == "success"
   and .spendableBalance == "1198"
@@ -379,7 +430,10 @@ if rg -Fq "$receive_token" <<<"$adapter_snapshot$panel_snapshot$status" \
     || rg -Fq "$receive_token" "$shell_log" "$mock_log"; then
   fail "successful Receive retained bearer-token text"
 fi
-panel_action cancelReceive >/dev/null
+close_receive_panel "successful execution"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"resources":"ok","delayMs":0,"receiveDelayMs":0}' \
+  "$base_url/__test__/mode" >/dev/null
 
 for receive_error in \
   "$receive_token|trusted|This Cashu token has already been spent." \
@@ -391,17 +445,14 @@ for receive_error in \
   remainder=${receive_error#*|}
   receive_mode=${remainder%%|*}
   expected_message=${remainder#*|}
-  set_sensitive_clipboard "$token"
-  open_receive_panel >/dev/null
-  panel_action pasteReceive >/dev/null
-  panel_action previewReceive >/dev/null
+  preview_clipboard_receive "$token"
   if [[ $receive_mode == approve ]]; then
     wait_panel_snapshot '
       .receiveViewState == "preview"
       and .receiveMintTrusted == false
       and .receiveConfirmEnabled == false
     ' >/dev/null
-    panel_action approveReceiveMint >/dev/null
+    require_receive_action approveReceiveMint "Trusted Mint approval selection"
     wait_panel_snapshot '
       .receiveMintApproved == true
       and .receiveConfirmEnabled == true
@@ -409,15 +460,19 @@ for receive_error in \
   else
     wait_panel_snapshot '.receiveViewState == "preview" and .receiveMintTrusted == true' >/dev/null
   fi
-  panel_action confirmReceive >/dev/null
+  require_receive_action confirmReceive "Receive confirmation"
   panel_snapshot=$(wait_panel_snapshot \
     ".receiveViewState == \"error\" and .receiveError == \"$expected_message\"")
   if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
       || rg -Fq "$token" "$shell_log" "$mock_log"; then
     fail "Receive execution error exposed bearer-token text"
   fi
-  panel_action cancelReceive >/dev/null
+  close_receive_panel "structured execution error"
 done
+
+if rg -Fq 'Binding loop detected for property "receiveState"' "$shell_log"; then
+  fail "Receive transitions triggered a receiveState binding loop"
+fi
 
 echo "runtime: Receive input, preview, approval, cancellation, execution, and errors passed"
 

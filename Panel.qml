@@ -162,8 +162,12 @@ Item {
 
   function smokeOpenReceive() {
     if (!receiveButton.visible || !receiveButton.enabled) return "disabled"
-    receiveButton.clicked()
-    return "ok"
+    return openReceive() ? "ok" : "disabled"
+  }
+
+  function openReceive() {
+    clearRecoveryPhrase()
+    return receiveFlow.open()
   }
 
   function smokePasteReceive() {
@@ -184,8 +188,7 @@ Item {
 
   function smokeCancelReceive() {
     if (receiveFlow.viewState === "closed") return "disabled"
-    receiveFlow.close()
-    return "ok"
+    return receiveFlow.close() ? "ok" : "disabled"
   }
 
   function smokeSnapshot() {
@@ -215,6 +218,7 @@ Item {
       recoveryPhraseVisible: recoveryPhraseText.visible,
       receiveViewState: receiveFlow.viewState,
       receiveInputVisible: receiveFlow.inputVisible,
+      receiveInputFocused: receiveFlow.inputFocused,
       receiveTextPresent: receiveFlow.textPresent,
       receivePasteVisible: receiveFlow.pasteVisible,
       receiveClipboardReads: receiveFlow.clipboardReads,
@@ -643,10 +647,7 @@ Item {
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
                 opacity: enabled ? 1 : 0.5
-                onClicked: {
-                  root.clearRecoveryPhrase()
-                  receiveFlow.open()
-                }
+                onClicked: root.openReceive()
               }
 
               Button {

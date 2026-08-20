@@ -154,6 +154,7 @@ class MockState:
         self.token_preview_requests = 0
         self.mint_registration_requests = 0
         self.mint_trust_requests = 0
+        self.receive_delay_ms = 0
         self.receive_create_requests = 0
         self.receive_execute_requests = 0
         self.receive_cancel_requests = 0
@@ -301,6 +302,12 @@ class MockState:
 
     def safe_event(self, event_type: str, data: dict[str, str]) -> dict[str, Any]:
         return {"type": event_type, "timestamp": FIXED_TIME, "data": data}
+
+    def wait_for_receive_transition(self) -> None:
+        with self.lock:
+            delay_ms = self.receive_delay_ms
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
 
     def token_preview(self, value: object) -> tuple[int, dict[str, Any]]:
         token = value.get("token") if isinstance(value, dict) else None
@@ -533,6 +540,7 @@ class MockState:
                 "tokenPreviewRequests": self.token_preview_requests,
                 "mintRegistrationRequests": self.mint_registration_requests,
                 "mintTrustRequests": self.mint_trust_requests,
+                "receiveDelayMs": self.receive_delay_ms,
                 "receiveCreateRequests": self.receive_create_requests,
                 "receiveExecuteRequests": self.receive_execute_requests,
                 "receiveCancelRequests": self.receive_cancel_requests,
@@ -766,6 +774,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.create_delay_ms = max(0, min(5000, int(value["createDelayMs"])))
                 if "recoveryDelayMs" in value:
                     self.state.recovery_delay_ms = max(0, min(5000, int(value["recoveryDelayMs"])))
+                if "receiveDelayMs" in value:
+                    self.state.receive_delay_ms = max(0, min(5000, int(value["receiveDelayMs"])))
             self.send_json(200, self.state.diagnostics())
             return
         if self.path == "/__test__/disconnect":
@@ -809,6 +819,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/mints":
             if not self.wallet_required():
                 return
+            self.state.wait_for_receive_transition()
             status, response, events = self.state.register_mint(value)
             headers = None
             if status == 201:
@@ -822,6 +833,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/mints/trust":
             if not self.wallet_required():
                 return
+            self.state.wait_for_receive_transition()
             status, response, events = self.state.trust_mint(value)
             self.send_json(status, response)
             self.state.publish_events(events)
@@ -829,6 +841,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/operations/receive":
             if not self.wallet_required():
                 return
+            self.state.wait_for_receive_transition()
             status, response, events = self.state.create_receive(value)
             headers = None
             if status == 201:
@@ -853,6 +866,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_json(200, operation)
                 return
+            self.state.wait_for_receive_transition()
             status, response, events = self.state.command_receive(match.group(1), command)
             self.send_json(status, response)
             self.state.publish_events(events)

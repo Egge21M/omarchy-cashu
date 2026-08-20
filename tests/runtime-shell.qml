@@ -1,7 +1,60 @@
+import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 
 ShellRoot {
+  PanelWindow {
+    id: testBarWindow
+    visible: true
+    implicitHeight: 1
+    color: "transparent"
+    exclusionMode: ExclusionMode.Ignore
+    anchors {
+      top: true
+      left: true
+      right: true
+    }
+
+    Item {
+      id: testAnchor
+      width: 1
+      height: 1
+    }
+  }
+
+  QtObject {
+    id: testHostWidget
+    property var anchorItem: testAnchor
+    property bool popoutSwitchClosing: false
+    // Keep incidental desktop pointer activity from dismissing the runtime fixture.
+    function close() {}
+  }
+
+  QtObject {
+    id: testBar
+    property string position: "top"
+    property int barSize: 1
+    property color foreground: "white"
+    property color urgent: "red"
+    property string fontFamily: "sans-serif"
+    property var activePopout: null
+
+    function findPanelWidget(pluginId) { return testHostWidget }
+    function moduleWidgets(pluginId) { return [testHostWidget] }
+    function targetWindow(widget) { return testBarWindow }
+    function requestPopout(owner) { activePopout = owner }
+    function releasePopout(owner) {
+      if (activePopout === owner) activePopout = null
+    }
+  }
+
+  QtObject {
+    id: testShell
+    property var bar: testBar
+    function hide(pluginId) { walletPanel.close() }
+  }
+
   Service {
     id: adapter
     reconnectBaseMs: 120
@@ -13,6 +66,7 @@ ShellRoot {
   Panel {
     id: walletPanel
     service: adapter
+    shell: testShell
   }
 
   IpcHandler {
