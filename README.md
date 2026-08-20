@@ -38,7 +38,7 @@ The plugin has three Quickshell entry points:
 - A `panel` containing setup, wallet state, balances, Receive, Send, recovery material, and Active Transfers.
 - A headless `service` acting as the Shell Adapter shared by the bar widget and panel.
 
-The Shell Adapter uses versioned HTTP/JSON over loopback TCP for commands and snapshots, plus Server-Sent Events for state and operation changes. SSE payloads contain revisions and safe lifecycle metadata only; secrets, proofs, encoded tokens, and balances are never broadcast through the event stream. The adapter takes a fresh snapshot on startup and reconnect, handles partial frames and backoff, and rotates the stream to bound Qt's cumulative response buffer.
+The Shell Adapter uses versioned HTTP/JSON over loopback TCP for commands and snapshots, plus Server-Sent Events for state and operation changes. SSE payloads are non-authoritative invalidation hints with safe resource identifiers only; v1 has no event IDs, revision-gap protocol, or replay. Secrets, proofs, encoded tokens, and balances are never broadcast through the event stream. The adapter takes fresh authoritative snapshots on startup and reconnect, handles partial frames and backoff, and accepts server rotation to bound Qt's cumulative response buffer.
 
 ## Security boundary
 
@@ -88,6 +88,15 @@ The MVP fulfills its purpose when this journey is reliable, private by default, 
 ## Domain language and decisions
 
 Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable architecture decisions live in [`docs/adr/`](./docs/adr/).
+
+## Upstream references
+
+The implemented and proposed cocod TCP resource surface is captured in the
+[`Cocod Network Interface v1`](./docs/reference/cocod-network-interface-v1.md)
+reference. Its status section distinguishes implemented resources from the
+accepted target design. The transfer, preview, compatibility, credential, and
+SSE contracts used by Handoffs 03–05 are implemented by upstream coco commit
+`17b1f695546e3a305bac35a4d1c202d11b1d9ea3`.
 
 ## Slice 3 development
 
