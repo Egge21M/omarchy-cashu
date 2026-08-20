@@ -98,27 +98,28 @@ Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable arc
 
 ## Upstream references
 
-The implemented and proposed cocod TCP resource surface is captured in the
+The candidate and proposed cocod TCP resource surface is captured in the
 [`Cocod Network Interface v1`](./docs/reference/cocod-network-interface-v1.md)
-reference. Its provenance note pins the upstream source and capture date, while
-its status section distinguishes implemented resources from the accepted target
-design. Transfer, preview, compatibility, credential, and SSE contracts are
-implemented by the cited upstream revision.
+reference. Its provenance note pins the local candidate revisions and capture
+date, while its status section distinguishes candidate implementations from the
+accepted target design. The cited revisions are not yet published in
+`cashubtc/coco`; release and package publication remain tracked by #14.
 
 ## Cocod v1 development
 
 The post-alignment roadmap is deliberately sequenced through cocod's durable Operation resources.
 Only the first issue without an open native dependency enters Wallet Client implementation:
 
-1. [#6](https://github.com/Egge21M/omarchy-cashu/issues/6) — recover an interrupted Receive and establish reusable Operation discovery, lookup, refresh, and reconnect behavior.
-2. [#5](https://github.com/Egge21M/omarchy-cashu/issues/5) — prepare, confirm, and explicitly copy a Send using daemon-calculated Send Max.
-3. [#7](https://github.com/Egge21M/omarchy-cashu/issues/7) — recover a Pending Send, retrieve its durable result, observe redemption, and attempt Reclaim.
-4. [#14](https://github.com/Egge21M/omarchy-cashu/issues/14) — publish the compatible cocod release, standalone package, and user-service template. This external gate can progress in parallel with issues #6–#7 but must land before real-daemon integration.
-5. [#8](https://github.com/Egge21M/omarchy-cashu/issues/8) — connect the complete mock-backed client contract to the packaged TCP Wallet Instance.
-6. [#9](https://github.com/Egge21M/omarchy-cashu/issues/9) — prove real Wallet creation and Recovery Phrase access separately from transfers.
-7. [#10](https://github.com/Egge21M/omarchy-cashu/issues/10) — prove the real Receive and interruption-recovery lifecycle.
-8. [#11](https://github.com/Egge21M/omarchy-cashu/issues/11) — prove the real Send, result-recovery, redemption, and Reclaim lifecycle.
-9. [#12](https://github.com/Egge21M/omarchy-cashu/issues/12) — run the complete installable MVP acceptance journey.
+1. [#15](https://github.com/Egge21M/omarchy-cashu/issues/15) — restore a deterministic, binding-loop-free Receive runtime baseline.
+2. [#6](https://github.com/Egge21M/omarchy-cashu/issues/6) — recover an interrupted Receive and establish reusable Operation discovery, lookup, refresh, and reconnect behavior.
+3. [#5](https://github.com/Egge21M/omarchy-cashu/issues/5) — prepare, confirm, and explicitly copy a Send using daemon-calculated Send Max.
+4. [#7](https://github.com/Egge21M/omarchy-cashu/issues/7) — recover a Pending Send, retrieve its durable result, observe redemption, and attempt Reclaim.
+5. [#14](https://github.com/Egge21M/omarchy-cashu/issues/14) — publish the compatible cocod release, standalone package, and user-service template. This external gate can progress in parallel with issues #15–#7 but must land before real-daemon integration.
+6. [#8](https://github.com/Egge21M/omarchy-cashu/issues/8) — connect the complete mock-backed client contract to the packaged TCP Wallet Instance.
+7. [#9](https://github.com/Egge21M/omarchy-cashu/issues/9) — prove real Wallet creation and Recovery Phrase access separately from transfers.
+8. [#10](https://github.com/Egge21M/omarchy-cashu/issues/10) — prove the real Receive and interruption-recovery lifecycle.
+9. [#11](https://github.com/Egge21M/omarchy-cashu/issues/11) — prove the real Send, result-recovery, redemption, and Reclaim lifecycle.
+10. [#12](https://github.com/Egge21M/omarchy-cashu/issues/12) — run the complete installable MVP acceptance journey.
 
 Generated OpenAPI, Quote, Mint/Melt Operation, Payment Request, and history resources remain
 proposed upstream and are not dependencies of this MVP sequence. GitHub's native issue dependencies
