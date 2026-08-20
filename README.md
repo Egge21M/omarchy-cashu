@@ -50,9 +50,9 @@ bound Qt's cumulative response buffer.
 
 ## Security boundary
 
-The MVP does not include wallet passphrase protection. `cocod` must therefore enforce a private state directory with mode `0700` and sensitive files with mode `0600`. The Wallet Client never persists the Recovery Phrase, Cashu tokens, proofs, or future transport credentials and never includes them in logs.
+The MVP does not include wallet passphrase protection. `cocod` must therefore enforce a private state directory with mode `0700` and sensitive files with mode `0600`. The Shell Adapter reads the administrative Client Credential only from `<state-root>/credentials/current/client` and authenticates every `/v1/*` request without exposing the credential to bar or panel code, diagnostics, URLs, arguments, or logs. The Wallet Client never persists the Recovery Phrase, Cashu tokens, proofs, or Client Credential.
 
-The daemon binds to loopback only. Transport authentication is defined by the redesigned `cocod` TCP API and must be supported before this plugin is published.
+The daemon binds to loopback only and defaults to `127.0.0.1:62626`. `/health` is public and minimal; every `/v1/*` resource is authenticated.
 
 ## Deferred
 
@@ -72,7 +72,6 @@ The daemon binds to loopback only. Transport authentication is defined by the re
 ## Publication blockers
 
 - A versioned loopback TCP API lands in `cocod`.
-- Transport authentication is defined upstream.
 - `cocod` enforces private state-directory and sensitive-file permissions.
 - The daemon exposes durable Send and Receive preparation, execution, lookup, recovery, cancellation, and reclaim semantics.
 - The daemon supports non-mutating token preview and explicit mint trust.
@@ -106,27 +105,28 @@ its status section distinguishes implemented resources from the accepted target
 design. Transfer, preview, compatibility, credential, and SSE contracts are
 implemented by the cited upstream revision.
 
-## Slice 3 development
+## Cocod v1 development
 
-Slice 3 adds explicit, create-only onboarding to the deterministic loopback mock
-and a separately confirmed Recovery Phrase reveal. The headless Shell Adapter
-continues to own all HTTP and SSE transport. It exposes transient command state
-to the panel, passes a revealed phrase directly to the requesting view, and does
-not include the phrase in its adapter diagnostics or durable state.
+The deterministic mock and Shell Adapter implement the accepted cocod v1
+resource model. Bootstrap reads compatibility and lifecycle facts, then composes
+the Wallet view from `/v1/status`, `/v1/balances`, `/v1/mints`, and the prepared
+and in-flight Receive and Send Operation collections. Amounts stay decimal
+integer strings through transport, aggregation, diagnostics, and display.
 
-The provisional mock endpoints introduced by this slice are:
+Wallet creation uses `POST /v1/admin/wallet/initialize`; separately confirmed
+Recovery Phrase access uses `POST /v1/admin/wallet/recovery-material`. Both
+sensitive responses are non-cacheable and their secret values are not retained
+in adapter state. The mock starts without a Wallet and never initializes one on
+startup, reconnect, shell reload, or panel open. Receive and Send actions remain
+disabled placeholders in this alignment slice.
 
-- `POST /v1/wallet/create` — creates the one empty Wallet Instance and returns a
-  minimal `202` acknowledgement. SSE invalidation followed by a fresh resource
-  fetch establishes the new Wallet State.
-- `POST /v1/wallet/recovery-phrase/reveal` — returns the deterministic mock
-  Recovery Phrase only on demand with `Cache-Control: no-store`.
+Authenticated `/v1/events` frames are safe invalidation hints. Balance, Known
+Mint, and Operation hints refetch their affected canonical resources. Bootstrap,
+reconnect, parse failure, and stream rotation refetch the full relevant set;
+there is no event position, revision-gap handling, or replay.
 
-The mock starts `uninitialized`. It never creates a Wallet Instance on startup,
-reconnection, shell reload, or panel open. Receive and Send remain disabled
-placeholders.
-
-Start the mock on its default loopback address:
+Start the mock on its default loopback address after cocod (or a test fixture)
+has provisioned `<state-root>/credentials/current/client`:
 
 ```bash
 python3 scripts/mock-cocod.py

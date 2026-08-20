@@ -87,10 +87,14 @@ Item {
   }
 
   function amountText(value) {
-    var amount = Number(value)
-    if (!isFinite(amount)) amount = 0
-    return amount.toLocaleString(Qt.locale(), "f", 0) + " "
-      + (stateOwner ? stateOwner.unit : "sat")
+    var digits = String(value === undefined || value === null ? "0" : value)
+    if (!/^(0|[1-9][0-9]*)$/.test(digits)) digits = "0"
+    var firstGroup = digits.length % 3
+    if (firstGroup === 0) firstGroup = 3
+    var formatted = digits.slice(0, firstGroup)
+    for (var index = firstGroup; index < digits.length; index += 3)
+      formatted += "," + digits.slice(index, index + 3)
+    return formatted + " " + (stateOwner ? stateOwner.unit : "sat")
   }
 
   function smokeCreateWallet() {
@@ -159,13 +163,13 @@ Item {
       anchored: !!anchorItem,
       requestedScreenName: requestedScreenName,
       anchorScreenName: widgetScreenName(hostWidget),
-      revision: stateOwner ? stateOwner.revision : 0,
+      refreshCount: stateOwner ? stateOwner.refreshCount : 0,
       walletState: stateOwner ? stateOwner.walletState : "unavailable",
       connectionState: stateOwner ? stateOwner.connectionState : "missing",
       compatibilityState: stateOwner ? stateOwner.compatibilityState : "unknown",
       balancesAvailable: stateOwner ? stateOwner.balancesAvailable : false,
-      spendableBalance: stateOwner ? stateOwner.spendableBalance : 0,
-      reservedBalance: stateOwner ? stateOwner.reservedBalance : 0,
+      spendableBalance: stateOwner ? stateOwner.spendableBalance : "0",
+      reservedBalance: stateOwner ? stateOwner.reservedBalance : "0",
       spendableText: spendableValue.text,
       reservedText: reservedValue.text,
       retryVisible: retryConnectionButton.visible,

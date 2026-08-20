@@ -33,17 +33,16 @@ wait_for() {
 }
 
 wait_for_panel_snapshot() {
-  local expected_revision=$1
-  local expected_screen_name=$2
+  local expected_screen_name=$1
   local value=""
   for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     value=$(omarchy-shell shell call "$plugin_id" smokeSnapshot '' 2>/dev/null || true)
-    if jq -e --argjson revision "$expected_revision" --arg screen_name "$expected_screen_name" '
+    if jq -e --arg screen_name "$expected_screen_name" '
       .opened == true
       and .anchored == true
       and .requestedScreenName == $screen_name
       and .anchorScreenName == $screen_name
-      and .revision == $revision
+      and .refreshCount > 0
       and .walletState == "uninitialized"
       and .connectionState == "connected"
       and .compatibilityState == "compatible"
@@ -67,12 +66,12 @@ jq -e '.enabled == true and ((.kinds | sort) == (["bar-widget", "panel", "servic
 service_snapshot=$(omarchy-shell "$state_target" snapshot)
 jq -e '
   .apiVersion == "1"
-  and .revision == 1
+  and .refreshCount > 0
   and .fixtureBacked == false
   and .walletState == "uninitialized"
   and .connectionState == "connected"
   and .compatibilityState == "compatible"
-' <<<"$service_snapshot" >/dev/null || fail "shared live Wallet State is unavailable; is mock cocod running on 127.0.0.1:38421?"
+' <<<"$service_snapshot" >/dev/null || fail "shared live Wallet State is unavailable; is cocod running on 127.0.0.1:62626?"
 
 target_screen=$(hyprctl -j monitors | jq -er '.[0].name') \
   || fail "no active monitor is available for the panel anchor check"
@@ -88,8 +87,7 @@ clicked_screen=$(omarchy-shell "$state_target" clickBar "$target_screen")
   || fail "bar click did not target the initiating screen: ${clicked_screen:-<empty>}"
 wait_for true omarchy-shell "$state_target" panelOpen
 
-panel_snapshot=$(wait_for_panel_snapshot \
-  "$(jq -r .revision <<<"$service_snapshot")" "$target_screen")
+panel_snapshot=$(wait_for_panel_snapshot "$target_screen")
 
 omarchy-shell "$state_target" clickBar "$target_screen" >/dev/null
 wait_for false omarchy-shell "$state_target" panelOpen
