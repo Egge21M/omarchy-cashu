@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import queue
@@ -15,6 +16,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote, urlsplit
 
 
 RECOVERY_PHRASE = (
@@ -39,6 +41,78 @@ COLLECTION_PATHS = {
     "/v1/operations/receive/in-flight": "receiveInFlight",
     "/v1/operations/send/prepared": "sendPrepared",
     "/v1/operations/send/in-flight": "sendInFlight",
+}
+RECEIVE_MINT = "https://mint.slice4.test"
+REGISTRATION_RACE_MINT = "https://registration-race.slice4.test"
+TRUST_RACE_MINT = "https://trust-race.slice4.test"
+RECEIVE_TOKENS: dict[str, dict[str, str]] = {
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "1200",
+        "fee": "2",
+        "netAmount": "1198",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jYW5jZWwifQ": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "400",
+        "fee": "1",
+        "netAmount": "399",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC11c2QifQ": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "usd",
+        "amount": "12",
+        "fee": "1",
+        "netAmount": "11",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1taW50LWRvd24ifQ": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "600",
+        "fee": "1",
+        "netAmount": "599",
+        "previewError": "mint_unavailable",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1zcGVudCJ9": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "500",
+        "fee": "1",
+        "netAmount": "499",
+        "createError": "token_already_spent",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jb25mbGljdCJ9": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "700",
+        "fee": "1",
+        "netAmount": "699",
+        "createError": "operation_conflict",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtcmVnaXN0ZXJlZCJ9": {
+        "mintUrl": REGISTRATION_RACE_MINT,
+        "unit": "sat",
+        "amount": "800",
+        "fee": "1",
+        "netAmount": "799",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtdHJ1c3RlZCJ9": {
+        "mintUrl": TRUST_RACE_MINT,
+        "unit": "sat",
+        "amount": "900",
+        "fee": "1",
+        "netAmount": "899",
+    },
+    "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtZm91bmQifQ": {
+        "mintUrl": RECEIVE_MINT,
+        "unit": "sat",
+        "amount": "1000",
+        "fee": "1",
+        "netAmount": "999",
+        "executeError": "operation_not_found",
+    },
 }
 
 
@@ -77,6 +151,17 @@ class MockState:
         self.recovery_material_requests = 0
         self.recovery_material_responses = 0
         self.recovery_delay_ms = 0
+        self.token_preview_requests = 0
+        self.mint_registration_requests = 0
+        self.mint_trust_requests = 0
+        self.receive_create_requests = 0
+        self.receive_execute_requests = 0
+        self.receive_cancel_requests = 0
+        self.receive_operation_sequence = 0
+        self.receive_operations: dict[str, dict[str, Any]] = {}
+        self.receive_token_keys: dict[str, str] = {}
+        self.receive_command_errors: dict[str, str] = {}
+        self.spent_receive_token_keys: set[str] = set()
         self.subscribers: list[queue.Queue[object]] = []
 
     def _status_document(self) -> dict[str, Any]:
@@ -206,6 +291,230 @@ class MockState:
         for subscriber in subscribers:
             subscriber.put(None)
 
+    def publish_events(self, events: list[dict[str, Any]]) -> None:
+        with self.lock:
+            subscribers = list(self.subscribers)
+        for event in events:
+            payload = ("data: " + json.dumps(event, separators=(",", ":")) + "\n\n").encode()
+            for subscriber in subscribers:
+                subscriber.put((payload, "whole"))
+
+    def safe_event(self, event_type: str, data: dict[str, str]) -> dict[str, Any]:
+        return {"type": event_type, "timestamp": FIXED_TIME, "data": data}
+
+    def token_preview(self, value: object) -> tuple[int, dict[str, Any]]:
+        token = value.get("token") if isinstance(value, dict) else None
+        accepted_units = value.get("acceptedUnits") if isinstance(value, dict) else None
+        with self.lock:
+            self.token_preview_requests += 1
+            details = copy.deepcopy(RECEIVE_TOKENS.get(token)) if isinstance(token, str) else None
+            mints = copy.deepcopy(self.resources["mints"]["items"])
+        if details is None:
+            return 422, error_document("invalid_token", "The Cashu token is invalid")
+        if details.get("previewError") == "mint_unavailable":
+            return 503, error_document("mint_unavailable", "The Mint is unavailable", True)
+        if accepted_units is not None and (
+            not isinstance(accepted_units, list)
+            or details["unit"] not in accepted_units
+        ):
+            return 422, error_document("unsupported_unit", "The token unit is not accepted")
+        if details["unit"] != "sat":
+            return 422, error_document("unsupported_unit", "The token unit is not supported")
+        trusted = any(
+            mint.get("mintUrl") == details["mintUrl"] and mint.get("trusted") is True
+            for mint in mints
+        )
+        return 200, {
+            "mintUrl": details["mintUrl"],
+            "unit": details["unit"],
+            "amount": details["amount"],
+            "fee": details["fee"],
+            "netAmount": details["netAmount"],
+            "trusted": trusted,
+        }
+
+    def register_mint(self, value: object) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        mint_url = value.get("mintUrl") if isinstance(value, dict) else None
+        if not isinstance(mint_url, str) or not re.fullmatch(r"https?://[^\s/]+(?:/[^\s]*)?", mint_url):
+            return 400, error_document("invalid_request", "A normalized Mint URL is required"), []
+        with self.lock:
+            self.mint_registration_requests += 1
+            items = self.resources["mints"]["items"]
+            for mint in items:
+                if mint.get("mintUrl") == mint_url:
+                    return 200, copy.deepcopy(mint), []
+            mint = {
+                "mintUrl": mint_url,
+                "name": "Slice 4 Mint" if mint_url == RECEIVE_MINT else "Known Mint",
+                "trusted": False,
+                "createdAt": FIXED_TIME,
+                "updatedAt": FIXED_TIME,
+            }
+            items.append(mint)
+        event = self.safe_event("mint.updated", {"mintUrl": mint_url})
+        return 201, copy.deepcopy(mint), [event]
+
+    def trust_mint(self, value: object) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        mint_url = value.get("mintUrl") if isinstance(value, dict) else None
+        if not isinstance(mint_url, str):
+            return 400, error_document("invalid_request", "A Mint URL is required"), []
+        with self.lock:
+            self.mint_trust_requests += 1
+            if mint_url == REGISTRATION_RACE_MINT:
+                self.resources["mints"]["items"] = [
+                    mint
+                    for mint in self.resources["mints"]["items"]
+                    if mint.get("mintUrl") != mint_url
+                ]
+                return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+            for mint in self.resources["mints"]["items"]:
+                if mint.get("mintUrl") != mint_url:
+                    continue
+                mint["trusted"] = True
+                mint["updatedAt"] = FIXED_TIME
+                result = copy.deepcopy(mint)
+                if mint_url == TRUST_RACE_MINT:
+                    mint["trusted"] = False
+                break
+            else:
+                return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+        event = self.safe_event("mint.updated", {"mintUrl": mint_url})
+        return 200, result, [event]
+
+    def receive_operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            operation = self.receive_operations.get(operation_id)
+            return copy.deepcopy(operation) if operation else None
+
+    def create_receive(
+        self, value: object
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        token = value.get("token") if isinstance(value, dict) else None
+        details = RECEIVE_TOKENS.get(token) if isinstance(token, str) else None
+        with self.lock:
+            self.receive_create_requests += 1
+            mints = copy.deepcopy(self.resources["mints"]["items"])
+        if details is None:
+            return 422, error_document("invalid_token", "The Cashu token is invalid"), []
+        if details["unit"] != "sat":
+            return 422, error_document("unsupported_unit", "The token unit is not supported"), []
+        known = next((mint for mint in mints if mint.get("mintUrl") == details["mintUrl"]), None)
+        if known is None:
+            return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+        if known.get("trusted") is not True:
+            return 409, error_document("mint_not_trusted", "The Mint is not trusted"), []
+        create_error = details.get("createError")
+        if create_error:
+            return 409, error_document(create_error, "The Receive cannot be prepared"), []
+        token_key = hashlib.sha256(token.encode()).hexdigest()
+        with self.lock:
+            if token_key in self.spent_receive_token_keys:
+                return 409, error_document("token_already_spent", "The token is already spent"), []
+            for operation_id, existing_key in self.receive_token_keys.items():
+                if existing_key == token_key and self.receive_operations[operation_id]["state"] in (
+                    "init",
+                    "prepared",
+                    "executing",
+                ):
+                    return 409, error_document("operation_conflict", "A Receive already exists"), []
+            self.receive_operation_sequence += 1
+            operation_id = f"receive-{self.receive_operation_sequence}"
+            operation = {
+                "id": operation_id,
+                "type": "receive",
+                "state": "prepared",
+                "mintUrl": details["mintUrl"],
+                "unit": details["unit"],
+                "amount": details["amount"],
+                "fee": details["fee"],
+                "netAmount": details["netAmount"],
+                "createdAt": FIXED_TIME,
+                "updatedAt": FIXED_TIME,
+            }
+            self.receive_operations[operation_id] = operation
+            self.receive_token_keys[operation_id] = token_key
+            if "executeError" in details:
+                self.receive_command_errors[operation_id] = details["executeError"]
+            self.resources["receivePrepared"]["items"].append(copy.deepcopy(operation))
+        event = self.safe_event(
+            "operation.updated",
+            {"operationType": "receive", "operationId": operation_id, "mintUrl": details["mintUrl"]},
+        )
+        return 201, copy.deepcopy(operation), [event]
+
+    def command_receive(
+        self, operation_id: str, command: str
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        with self.lock:
+            if command == "execute":
+                self.receive_execute_requests += 1
+            elif command == "cancel":
+                self.receive_cancel_requests += 1
+            operation = self.receive_operations.get(operation_id)
+            if operation is None:
+                return 404, error_document("operation_not_found", "The Receive does not exist"), []
+            if operation["state"] != "prepared":
+                return 409, error_document("operation_conflict", "The Receive is not prepared"), []
+            command_error = self.receive_command_errors.get(operation_id) if command == "execute" else None
+            if command_error:
+                self.resources["receivePrepared"]["items"] = [
+                    item
+                    for item in self.resources["receivePrepared"]["items"]
+                    if item.get("id") != operation_id
+                ]
+                del self.receive_operations[operation_id]
+                self.receive_token_keys.pop(operation_id, None)
+                self.receive_command_errors.pop(operation_id, None)
+                return 404, error_document(command_error, "The Receive does not exist"), []
+            operation["state"] = "rolled_back" if command == "cancel" else "finalized"
+            operation["updatedAt"] = FIXED_TIME
+            self.resources["receivePrepared"]["items"] = [
+                item
+                for item in self.resources["receivePrepared"]["items"]
+                if item.get("id") != operation_id
+            ]
+            events = [
+                self.safe_event(
+                    "operation.updated",
+                    {
+                        "operationType": "receive",
+                        "operationId": operation_id,
+                        "mintUrl": operation["mintUrl"],
+                    },
+                )
+            ]
+            if command == "execute":
+                token_key = self.receive_token_keys[operation_id]
+                self.spent_receive_token_keys.add(token_key)
+                balances = self.resources["balances"]["items"]
+                balance = next(
+                    (
+                        item
+                        for item in balances
+                        if item.get("mintUrl") == operation["mintUrl"]
+                        and item.get("unit") == operation["unit"]
+                    ),
+                    None,
+                )
+                if balance is None:
+                    balance = {
+                        "mintUrl": operation["mintUrl"],
+                        "unit": operation["unit"],
+                        "spendable": "0",
+                        "reserved": "0",
+                        "total": "0",
+                    }
+                    balances.append(balance)
+                balance["spendable"] = str(
+                    int(balance["spendable"]) + int(operation["netAmount"])
+                )
+                balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
+                events.append(
+                    self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]})
+                )
+            result = copy.deepcopy(operation)
+        return 200, result, events
+
     def diagnostics(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -221,6 +530,13 @@ class MockState:
                 "recoveryMaterialRequests": self.recovery_material_requests,
                 "recoveryMaterialResponses": self.recovery_material_responses,
                 "recoveryDelayMs": self.recovery_delay_ms,
+                "tokenPreviewRequests": self.token_preview_requests,
+                "mintRegistrationRequests": self.mint_registration_requests,
+                "mintTrustRequests": self.mint_trust_requests,
+                "receiveCreateRequests": self.receive_create_requests,
+                "receiveExecuteRequests": self.receive_execute_requests,
+                "receiveCancelRequests": self.receive_cancel_requests,
+                "receiveOperationCount": len(self.receive_operations),
             }
 
 
@@ -234,12 +550,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def send_json(self, status: int, value: object) -> None:
+    def send_json(
+        self, status: int, value: object, headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(value, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, header_value in (headers or {}).items():
+            self.send_header(name, header_value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -319,6 +639,34 @@ class Handler(BaseHTTPRequestHandler):
                 status = copy.deepcopy(self.state.status)
             self.resource_response("status", status)
             return
+        request_url = urlsplit(self.path)
+        if request_url.path == "/v1/mints/info":
+            if not self.wallet_required():
+                return
+            mint_url = parse_qs(request_url.query).get("mintUrl", [None])[0]
+            if not isinstance(mint_url, str) or not mint_url:
+                self.send_json(
+                    400,
+                    error_document("invalid_request", "A Mint URL is required"),
+                )
+                return
+            with self.state.lock:
+                mint = next(
+                    (
+                        copy.deepcopy(item)
+                        for item in self.state.resources["mints"]["items"]
+                        if item.get("mintUrl") == mint_url
+                    ),
+                    None,
+                )
+            if mint is None:
+                self.send_json(
+                    404,
+                    error_document("mint_not_registered", "The Mint is not registered"),
+                )
+                return
+            self.send_json(200, mint)
+            return
         if self.path in COLLECTION_PATHS:
             if not self.wallet_required():
                 return
@@ -326,6 +674,19 @@ class Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 value = copy.deepcopy(self.state.resources[name])
             self.resource_response(name, value)
+            return
+        match = re.fullmatch(r"/v1/operations/receive/([^/]+)", self.path)
+        if match:
+            if not self.wallet_required():
+                return
+            operation = self.state.receive_operation(match.group(1))
+            if operation is None:
+                self.send_json(
+                    404,
+                    error_document("operation_not_found", "The Receive does not exist"),
+                )
+                return
+            self.send_json(200, operation)
             return
         if self.path == "/v1/events":
             if not self.wallet_required():
@@ -438,6 +799,63 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self.send_json(200, {"mnemonic": mnemonic})
+            return
+        if self.path == "/v1/token-previews":
+            if not self.wallet_required():
+                return
+            status, response = self.state.token_preview(value)
+            self.send_json(status, response)
+            return
+        if self.path == "/v1/mints":
+            if not self.wallet_required():
+                return
+            status, response, events = self.state.register_mint(value)
+            headers = None
+            if status == 201:
+                headers = {
+                    "Location": "/v1/mints/info?mintUrl="
+                    + quote(str(response["mintUrl"]), safe="")
+                }
+            self.send_json(status, response, headers)
+            self.state.publish_events(events)
+            return
+        if self.path == "/v1/mints/trust":
+            if not self.wallet_required():
+                return
+            status, response, events = self.state.trust_mint(value)
+            self.send_json(status, response)
+            self.state.publish_events(events)
+            return
+        if self.path == "/v1/operations/receive":
+            if not self.wallet_required():
+                return
+            status, response, events = self.state.create_receive(value)
+            headers = None
+            if status == 201:
+                headers = {"Location": f"/v1/operations/receive/{response['id']}"}
+            self.send_json(status, response, headers)
+            self.state.publish_events(events)
+            return
+        match = re.fullmatch(
+            r"/v1/operations/receive/([^/]+)/(execute|cancel|refresh)", self.path
+        )
+        if match:
+            if not self.wallet_required():
+                return
+            command = match.group(2)
+            if command == "refresh":
+                operation = self.state.receive_operation(match.group(1))
+                if operation is None:
+                    self.send_json(
+                        404,
+                        error_document("operation_not_found", "The Receive does not exist"),
+                    )
+                else:
+                    self.send_json(200, operation)
+                return
+            status, response, events = self.state.command_receive(match.group(1), command)
+            self.send_json(status, response)
+            self.state.publish_events(events)
             return
         self.send_json(404, error_document("not_found", "Resource not found"))
 

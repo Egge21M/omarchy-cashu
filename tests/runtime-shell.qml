@@ -54,5 +54,29 @@ ShellRoot {
       walletPanel.open("{}")
       return walletPanel.smokeLeaveRecoveryPhrase()
     }
+
+    function openReceive(): string {
+      return walletPanel.smokeOpenReceive()
+    }
+
+    function pasteReceive(): string {
+      return walletPanel.smokePasteReceive()
+    }
+
+    function previewReceive(): string {
+      return walletPanel.smokePreviewReceive()
+    }
+
+    function approveReceiveMint(): string {
+      return walletPanel.smokeApproveReceiveMint()
+    }
+
+    function confirmReceive(): string {
+      return walletPanel.smokeConfirmReceive()
+    }
+
+    function cancelReceive(): string {
+      return walletPanel.smokeCancelReceive()
+    }
   }
 }

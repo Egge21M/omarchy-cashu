@@ -16,6 +16,7 @@ mock_pid=""
 shell_pid=""
 
 cleanup() {
+  wl-copy --clear 2>/dev/null || true
   if [[ -n $shell_pid ]]; then
     kill "$shell_pid" 2>/dev/null || true
     wait "$shell_pid" 2>/dev/null || true
@@ -95,6 +96,16 @@ wait_mock_status() {
   fail "mock did not satisfy: $expression; last status: ${value:-<empty>}"
 }
 
+set_sensitive_clipboard() {
+  local value=$1
+  printf '%s' "$value" | wl-copy --sensitive
+}
+
+open_receive_panel() {
+  panel_action openPanel >/dev/null
+  panel_action openReceive
+}
+
 mkdir -p "$state_dir/credentials/generation-1"
 printf '%s\n' "$credential" >"$state_dir/credentials/generation-1/client"
 chmod 700 "$state_dir" "$state_dir/credentials" "$state_dir/credentials/generation-1"
@@ -103,6 +114,7 @@ ln -s generation-1 "$state_dir/credentials/current"
 
 cp "$project_dir/Service.qml" "$runtime_dir/Service.qml"
 cp "$project_dir/Panel.qml" "$runtime_dir/Panel.qml"
+cp "$project_dir/ReceiveFlow.qml" "$runtime_dir/ReceiveFlow.qml"
 cp "$project_dir/tests/runtime-shell.qml" "$shell_qml"
 ln -s /usr/share/omarchy/shell/Commons "$runtime_dir/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$runtime_dir/Ui"
@@ -215,6 +227,199 @@ if rg -q 'abandon' <<<"$adapter_snapshot$panel_snapshot" \
 fi
 panel_action leaveRecoveryPhrase >/dev/null
 wait_panel_snapshot '.recoveryViewState == "closed" and .recoveryPhraseVisible == false' >/dev/null
+
+receive_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ'
+invalid_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1pbnZhbGlkIn0'
+unsupported_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11c2QifQ'
+unavailable_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1taW50LWRvd24ifQ'
+conflicting_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jb25mbGljdCJ9'
+not_registered_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtcmVnaXN0ZXJlZCJ9'
+not_trusted_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtdHJ1c3RlZCJ9'
+not_found_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtZm91bmQifQ'
+
+set_sensitive_clipboard "$receive_token"
+[[ $(open_receive_panel) == "ok" ]] \
+  || fail "Receive entry point was unavailable"
+panel_snapshot=$(wait_panel_snapshot '
+  .receiveViewState == "entry"
+  and .receiveInputVisible == true
+  and .receiveTextPresent == false
+  and .receivePasteVisible == true
+  and .receiveClipboardReads == 0
+  and .keyCatcherBlocked == true
+')
+if rg -Fq "$receive_token" <<<"$(adapter_call snapshot)$panel_snapshot"; then
+  fail "opening Receive read or exposed the clipboard token"
+fi
+wait_mock_status '
+  .tokenPreviewRequests == 0
+  and .mintRegistrationRequests == 0
+  and .mintTrustRequests == 0
+  and .receiveCreateRequests == 0
+' >/dev/null
+
+wtype 'x'
+wait_panel_snapshot '
+  .receiveViewState == "entry"
+  and .receiveTextPresent == true
+  and .receiveClipboardReads == 0
+' >/dev/null
+[[ $(panel_action cancelReceive) == "ok" ]] \
+  || fail "manual Receive entry could not be cancelled"
+wait_panel_snapshot '
+  .receiveViewState == "closed"
+  and .receiveTextPresent == false
+' >/dev/null
+
+open_receive_panel >/dev/null
+[[ $(panel_action pasteReceive) == "ok" ]] \
+  || fail "explicit Receive Paste action was unavailable"
+wait_panel_snapshot '
+  .receiveViewState == "entry"
+  and .receiveTextPresent == true
+  and .receiveClipboardReads == 1
+' >/dev/null
+[[ $(panel_action previewReceive) == "ok" ]] \
+  || fail "pasted Cashu token could not be previewed"
+panel_snapshot=$(wait_panel_snapshot '
+  .receiveViewState == "preview"
+  and .receivePreviewAmount == "1200"
+  and .receivePreviewFee == "2"
+  and .receivePreviewNetAmount == "1198"
+  and .receivePreviewUnit == "sat"
+  and .receivePreviewMint == "https://mint.slice4.test"
+  and .receiveMintTrusted == false
+  and .receiveApprovalVisible == true
+  and .receiveMintApproved == false
+  and .receiveConfirmEnabled == false
+')
+[[ $(panel_action confirmReceive) == "disabled" ]] \
+  || fail "an unknown mint could be received without approval"
+[[ $(panel_action approveReceiveMint) == "ok" ]] \
+  || fail "unknown-mint approval could not be selected"
+wait_panel_snapshot '
+  .receiveViewState == "preview"
+  and .receiveMintApproved == true
+  and .receiveMintTrusted == false
+  and .receiveConfirmEnabled == true
+' >/dev/null
+[[ $(panel_action cancelReceive) == "ok" ]] \
+  || fail "approved but unconfirmed Receive could not be cancelled"
+wait_mock_status '
+  .tokenPreviewRequests == 1
+  and .mintRegistrationRequests == 0
+  and .mintTrustRequests == 0
+  and .receiveCreateRequests == 0
+  and .receiveExecuteRequests == 0
+' >/dev/null
+after_cancel_balances=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/balances")
+after_cancel_mints=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/mints")
+jq -e '.items == []' <<<"$after_cancel_balances" >/dev/null \
+  || fail "cancelling before confirmation changed balances"
+jq -e '.items == []' <<<"$after_cancel_mints" >/dev/null \
+  || fail "cancelling after local approval trusted a mint"
+
+for preview_error in \
+  "$invalid_token|This Cashu token is invalid. Check it and try again." \
+  "$unsupported_token|Only sat-denominated Cashu tokens are supported." \
+  "$unavailable_token|The mint is unavailable. Try again later."; do
+  token=${preview_error%%|*}
+  expected_message=${preview_error#*|}
+  set_sensitive_clipboard "$token"
+  open_receive_panel >/dev/null
+  panel_action pasteReceive >/dev/null
+  panel_action previewReceive >/dev/null
+  panel_snapshot=$(wait_panel_snapshot \
+    ".receiveViewState == \"error\" and .receiveError == \"$expected_message\" and .receiveTextPresent == false")
+  if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
+      || rg -Fq "$token" "$shell_log" "$mock_log"; then
+    fail "Receive preview error exposed bearer-token text"
+  fi
+  panel_action cancelReceive >/dev/null
+done
+
+set_sensitive_clipboard "$receive_token"
+open_receive_panel >/dev/null
+panel_action pasteReceive >/dev/null
+panel_action previewReceive >/dev/null
+wait_panel_snapshot '
+  .receiveViewState == "preview"
+  and .receiveApprovalVisible == true
+  and .receiveConfirmEnabled == false
+' >/dev/null
+[[ $(panel_action approveReceiveMint) == "ok" ]] \
+  || fail "unknown-mint approval was unavailable"
+wait_panel_snapshot '
+  .receiveMintApproved == true
+  and .receiveConfirmEnabled == true
+' >/dev/null
+[[ $(panel_action confirmReceive) == "ok" ]] \
+  || fail "approved Receive confirmation was unavailable"
+adapter_snapshot=$(wait_snapshot '
+  .receiveState == "success"
+  and .spendableBalance == "1198"
+  and .trustedMintCount == 1
+  and .activeTransfers == []
+')
+panel_snapshot=$(wait_panel_snapshot '
+  .receiveViewState == "success"
+  and .receiveTextPresent == false
+  and .spendableBalance == "1198"
+')
+status=$(wait_mock_status '
+  .mintRegistrationRequests == 1
+  and .mintTrustRequests == 1
+  and .receiveCreateRequests == 1
+  and .receiveExecuteRequests == 1
+  and .receiveOperationCount == 1
+')
+if rg -Fq "$receive_token" <<<"$adapter_snapshot$panel_snapshot$status" \
+    || rg -Fq "$receive_token" "$shell_log" "$mock_log"; then
+  fail "successful Receive retained bearer-token text"
+fi
+panel_action cancelReceive >/dev/null
+
+for receive_error in \
+  "$receive_token|trusted|This Cashu token has already been spent." \
+  "$conflicting_token|trusted|This Receive conflicts with another Wallet operation. Try again." \
+  "$not_registered_token|approve|The mint could not be registered. Try again." \
+  "$not_trusted_token|approve|The mint approval was not accepted. Review it and try again." \
+  "$not_found_token|trusted|This Receive is no longer available. Start again."; do
+  token=${receive_error%%|*}
+  remainder=${receive_error#*|}
+  receive_mode=${remainder%%|*}
+  expected_message=${remainder#*|}
+  set_sensitive_clipboard "$token"
+  open_receive_panel >/dev/null
+  panel_action pasteReceive >/dev/null
+  panel_action previewReceive >/dev/null
+  if [[ $receive_mode == approve ]]; then
+    wait_panel_snapshot '
+      .receiveViewState == "preview"
+      and .receiveMintTrusted == false
+      and .receiveConfirmEnabled == false
+    ' >/dev/null
+    panel_action approveReceiveMint >/dev/null
+    wait_panel_snapshot '
+      .receiveMintApproved == true
+      and .receiveConfirmEnabled == true
+    ' >/dev/null
+  else
+    wait_panel_snapshot '.receiveViewState == "preview" and .receiveMintTrusted == true' >/dev/null
+  fi
+  panel_action confirmReceive >/dev/null
+  panel_snapshot=$(wait_panel_snapshot \
+    ".receiveViewState == \"error\" and .receiveError == \"$expected_message\"")
+  if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
+      || rg -Fq "$token" "$shell_log" "$mock_log"; then
+    fail "Receive execution error exposed bearer-token text"
+  fi
+  panel_action cancelReceive >/dev/null
+done
+
+echo "runtime: Receive input, preview, approval, cancellation, execution, and errors passed"
 
 before_balance=$(curl -fsS "$base_url/__test__/status")
 before_status_requests=$(jq -r '.resourceRequests.status' <<<"$before_balance")

@@ -31,6 +31,7 @@ Item {
     "wallet.lifecycle",
     "wallet.balances",
     "wallet.mints",
+    "wallet.receive-preview",
     "wallet.receive-operations",
     "wallet.send-operations",
     "wallet.events"
@@ -80,6 +81,13 @@ Item {
   property bool creating: false
   property string createError: ""
   property var recoveryRevealRequest: null
+  property var receiveRequest: null
+  property var receiveReconcileRequests: []
+  property int receiveReconcileToken: 0
+  property string receiveState: "idle"
+  property var receivePreview: null
+  property string receiveError: ""
+  property string receiveOperationId: ""
 
   readonly property bool fixtureBacked: false
   readonly property string walletState: connectionState === "connected"
@@ -209,6 +217,8 @@ Item {
       unit: unit,
       activeTransfers: activeTransfers,
       trustedMintCount: trustedMints.length,
+      receiveState: receiveState,
+      receiveError: receiveError,
       creating: creating,
       createError: createError,
       connectionState: connectionState,
@@ -389,6 +399,22 @@ Item {
           || typeof item.unit !== "string" || !decimalString(item.amount)) return false
     }
     return true
+  }
+
+  function isReceivePreview(value) {
+    return value && typeof value === "object" && !containsSensitiveKey(value)
+      && typeof value.mintUrl === "string" && value.mintUrl.length > 0
+      && value.unit === "sat" && decimalString(value.amount)
+      && decimalString(value.fee) && decimalString(value.netAmount)
+      && typeof value.trusted === "boolean"
+  }
+
+  function isReceiveOperation(value) {
+    if (!isOperationCollection({ items: [value] }, "receive")) return false
+    return ["init", "prepared", "executing", "finalized", "rolled_back"]
+      .indexOf(String(value.state || "")) !== -1
+      && decimalString(value.fee) && decimalString(value.netAmount)
+      && typeof value.createdAt === "string" && typeof value.updatedAt === "string"
   }
 
   function parseErrorDocument(request) {
@@ -615,6 +641,8 @@ Item {
       createError = ""
     }
     if (connectAfterward && walletState === "unlocked") startStream()
+    if (receiveState === "reconciling" && receiveOperationId)
+      reconcileReceiveOperation(receiveOperationId)
   }
 
   function handleCredentialUnavailable() {
@@ -651,6 +679,301 @@ Item {
     connectionDetail = detail
     lastErrorCode = code
     scheduleReconnect(false, false)
+  }
+
+  function resetReceive() {
+    if (["approving", "preparing", "executing", "reconciling"]
+        .indexOf(receiveState) !== -1) return false
+    var request = receiveRequest
+    receiveRequest = null
+    if (request) {
+      request.onreadystatechange = null
+      request.abort()
+    }
+    receiveReconcileToken++
+    abortRequests(receiveReconcileRequests)
+    receiveReconcileRequests = []
+    receiveState = "idle"
+    receivePreview = null
+    receiveError = ""
+    receiveOperationId = ""
+    return true
+  }
+
+  function previewReceive(token) {
+    var normalizedToken = String(token || "").trim()
+    if (!normalizedToken || receiveRequest || receiveState !== "idle"
+        || connectionState !== "connected" || compatibilityState !== "compatible"
+        || walletState !== "unlocked") return false
+    receivePreview = null
+    receiveError = ""
+    receiveState = "previewing"
+    var request = sendRequest("POST", "/v1/token-previews", {
+      token: normalizedToken,
+      acceptedUnits: ["sat"]
+    }, function(result) {
+      if (request !== root.receiveRequest) return
+      root.receiveRequest = null
+      if (!result.ok) {
+        root.failReceive(result.error.code)
+        return
+      }
+      if (result.status !== 200 || !root.isReceivePreview(result.value)) {
+        root.failReceive("invalid_response")
+        return
+      }
+      root.receivePreview = {
+        mintUrl: String(result.value.mintUrl),
+        unit: String(result.value.unit),
+        amount: String(result.value.amount),
+        fee: String(result.value.fee),
+        netAmount: String(result.value.netAmount),
+        trusted: result.value.trusted === true
+      }
+      root.receiveState = "preview"
+    })
+    normalizedToken = ""
+    if (!request) {
+      failReceive("credential_unavailable")
+      return false
+    }
+    receiveRequest = request
+    return true
+  }
+
+  function approveReceiveMint() {
+    if (receiveRequest || receiveState !== "preview" || !receivePreview
+        || receivePreview.trusted) return false
+    receiveError = ""
+    registerReceiveMint(String(receivePreview.mintUrl))
+    return true
+  }
+
+  function confirmReceive(token) {
+    var normalizedToken = String(token || "").trim()
+    if (!normalizedToken || receiveRequest || receiveState !== "preview"
+        || !receivePreview || !receivePreview.trusted) return false
+    receiveError = ""
+    createPreparedReceive(normalizedToken)
+    return true
+  }
+
+  function registerReceiveMint(mintUrl) {
+    receiveState = "approving"
+    var request = sendRequest("POST", "/v1/mints", { mintUrl: mintUrl }, function(result) {
+      if (request !== root.receiveRequest) return
+      root.receiveRequest = null
+      if (!result.ok) {
+        root.failReceive(result.error.code)
+        return
+      }
+      if ([200, 201].indexOf(result.status) === -1 || !result.value
+          || String(result.value.mintUrl || "") !== mintUrl
+          || typeof result.value.trusted !== "boolean"
+          || root.containsSensitiveKey(result.value)) {
+        root.failReceive("invalid_response")
+        return
+      }
+      root.trustReceiveMint(mintUrl)
+    })
+    if (!request) {
+      failReceive("credential_unavailable")
+      return
+    }
+    receiveRequest = request
+  }
+
+  function trustReceiveMint(mintUrl) {
+    receiveState = "approving"
+    var request = sendRequest("POST", "/v1/mints/trust", { mintUrl: mintUrl },
+      function(result) {
+        if (request !== root.receiveRequest) return
+        root.receiveRequest = null
+        if (!result.ok) {
+          root.failReceive(result.error.code)
+          return
+        }
+        if (result.status !== 200 || !result.value
+            || String(result.value.mintUrl || "") !== mintUrl
+            || result.value.trusted !== true || root.containsSensitiveKey(result.value)) {
+          root.failReceive("invalid_response")
+          return
+        }
+        root.receivePreview = {
+          mintUrl: String(root.receivePreview.mintUrl),
+          unit: String(root.receivePreview.unit),
+          amount: String(root.receivePreview.amount),
+          fee: String(root.receivePreview.fee),
+          netAmount: String(root.receivePreview.netAmount),
+          trusted: true
+        }
+        root.fetchMints()
+        root.receiveState = "preview"
+      })
+    if (!request) {
+      failReceive("credential_unavailable")
+      return
+    }
+    receiveRequest = request
+  }
+
+  function createPreparedReceive(token) {
+    receiveState = "preparing"
+    var request = sendRequest("POST", "/v1/operations/receive", { token: token },
+      function(result) {
+        if (request !== root.receiveRequest) return
+        root.receiveRequest = null
+        if (!result.ok) {
+          root.fetchOperationGroup("receive")
+          root.failReceive(result.error.code)
+          return
+        }
+        if (result.status !== 201 || !root.isReceiveOperation(result.value)
+            || String(result.value.state) !== "prepared") {
+          root.failReceive("invalid_response")
+          return
+        }
+        root.receiveOperationId = String(result.value.id)
+        root.receiveOperations = root.withReceiveOperation(
+          root.receiveOperations, result.value)
+        root.receiveState = "executing"
+        root.executePreparedReceive(root.receiveOperationId)
+      })
+    token = ""
+    if (!request) {
+      failReceive("credential_unavailable")
+      return
+    }
+    receiveRequest = request
+  }
+
+  function executePreparedReceive(operationId) {
+    var request = sendRequest("POST", "/v1/operations/receive/"
+      + encodeURIComponent(operationId) + "/execute", {}, function(result) {
+        if (request !== root.receiveRequest) return
+        root.receiveRequest = null
+        if (!result.ok) {
+          root.fetchOperationGroup("receive")
+          root.failReceive(result.error.code)
+          return
+        }
+        if (result.status !== 200 || !root.isReceiveOperation(result.value)) {
+          root.failReceive("invalid_response")
+          return
+        }
+        root.receiveState = "reconciling"
+        root.reconcileReceiveOperation(operationId)
+      })
+    if (!request) {
+      failReceive("credential_unavailable")
+      return
+    }
+    receiveRequest = request
+  }
+
+  function withReceiveOperation(values, operation) {
+    var result = []
+    var replaced = false
+    var source = Array.isArray(values) ? values : []
+    for (var i = 0; i < source.length; i++) {
+      if (String(source[i].id || "") === String(operation.id || "")) {
+        if (["finalized", "rolled_back"].indexOf(String(operation.state || "")) === -1)
+          result.push(operation)
+        replaced = true
+      } else result.push(source[i])
+    }
+    if (!replaced && ["finalized", "rolled_back"].indexOf(
+        String(operation.state || "")) === -1) result.push(operation)
+    return result
+  }
+
+  function reconcileReceiveOperation(operationId) {
+    if (!operationId || receiveState !== "reconciling") return
+    receiveReconcileToken++
+    var reconcileToken = receiveReconcileToken
+    abortRequests(receiveReconcileRequests)
+    receiveReconcileRequests = []
+    var operationValue = null
+    var balancesValue = null
+    var pending = 2
+    var requests = []
+    function accept(request, result, kind) {
+      if (reconcileToken !== root.receiveReconcileToken
+          || requests.indexOf(request) === -1) return
+      if (!result.ok) {
+        root.receiveReconcileRequests = []
+        root.abortRequests(requests)
+        root.failReceive(result.error.code)
+        return
+      }
+      if (kind === "operation") {
+        if (result.status !== 200 || !root.isReceiveOperation(result.value)) {
+          root.failReceive("invalid_response")
+          return
+        }
+        operationValue = result.value
+      } else {
+        if (result.status !== 200 || !root.isBalanceCollection(result.value)) {
+          root.failReceive("invalid_response")
+          return
+        }
+        balancesValue = result.value
+      }
+      pending--
+      if (pending !== 0) return
+      root.receiveReconcileRequests = []
+      root.receiveOperations = root.withReceiveOperation(
+        root.receiveOperations, operationValue)
+      root.balancesResource = balancesValue
+      root.refreshCount++
+      if (String(operationValue.state) === "finalized") {
+        root.receiveState = "success"
+        root.receiveError = ""
+      } else if (String(operationValue.state) === "rolled_back") {
+        root.failReceive("operation_conflict")
+      }
+    }
+    var operationRequest = sendRequest("GET", "/v1/operations/receive/"
+      + encodeURIComponent(operationId), undefined, function(result) {
+        accept(operationRequest, result, "operation")
+      })
+    var balancesRequest = sendRequest("GET", "/v1/balances", undefined,
+      function(result) { accept(balancesRequest, result, "balances") })
+    if (!operationRequest || !balancesRequest) {
+      if (operationRequest) operationRequest.abort()
+      if (balancesRequest) balancesRequest.abort()
+      failReceive("credential_unavailable")
+      return
+    }
+    requests = [operationRequest, balancesRequest]
+    receiveReconcileRequests = requests
+  }
+
+  function failReceive(code) {
+    receiveReconcileToken++
+    abortRequests(receiveReconcileRequests)
+    receiveReconcileRequests = []
+    receiveRequest = null
+    receiveState = "error"
+    receiveError = receiveErrorMessage(code)
+    receiveOperationId = ""
+  }
+
+  function receiveErrorMessage(code) {
+    var messages = {
+      invalid_token: "This Cashu token is invalid. Check it and try again.",
+      unsupported_unit: "Only sat-denominated Cashu tokens are supported.",
+      mint_unavailable: "The mint is unavailable. Try again later.",
+      mint_not_registered: "The mint could not be registered. Try again.",
+      mint_not_trusted: "The mint approval was not accepted. Review it and try again.",
+      token_already_spent: "This Cashu token has already been spent.",
+      operation_not_found: "This Receive is no longer available. Start again.",
+      operation_conflict: "This Receive conflicts with another Wallet operation. Try again.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid Receive response.",
+      transport_unavailable: "Receive could not reach cocod. Try again."
+    }
+    return messages[String(code || "")] || "Receive could not be completed. Try again."
   }
 
   function createWallet() {
@@ -913,8 +1236,13 @@ Item {
     }
     if (event.type === "balance.updated") fetchBalances()
     else if (event.type === "mint.updated") fetchMints()
-    else if (event.type === "operation.updated")
-      fetchOperationGroup(String(event.data.operationType || ""))
+    else if (event.type === "operation.updated") {
+      var operationType = String(event.data.operationType || "")
+      fetchOperationGroup(operationType)
+      if (operationType === "receive" && receiveState === "reconciling"
+          && String(event.data.operationId || "") === receiveOperationId)
+        reconcileReceiveOperation(receiveOperationId)
+    }
   }
 
   function isSafeInvalidation(event) {
@@ -1024,6 +1352,12 @@ Item {
     if (mintRequest) mintRequest.abort()
     abortRequests(receiveRequests)
     abortRequests(sendRequests)
+    receiveReconcileToken++
+    abortRequests(receiveReconcileRequests)
+    receiveReconcileRequests = []
+    var receiveCommand = receiveRequest
+    receiveRequest = null
+    if (receiveCommand) receiveCommand.abort()
     var command = createRequest
     createRequest = null
     creating = false

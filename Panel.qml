@@ -77,11 +77,13 @@ Item {
 
   function close() {
     clearRecoveryPhrase()
+    receiveFlow.panelClosed()
     opened = false
   }
 
   function dismiss() {
     clearRecoveryPhrase()
+    receiveFlow.panelClosed()
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else close()
   }
@@ -105,6 +107,7 @@ Item {
 
   function openRecoveryPhrase() {
     if (!viewRecoveryPhraseButton.visible || recoveryViewState !== "closed") return false
+    receiveFlow.close()
     recoveryPhrase = ""
     recoveryError = ""
     recoveryViewState = "warning"
@@ -157,6 +160,34 @@ Item {
     return "disabled"
   }
 
+  function smokeOpenReceive() {
+    if (!receiveButton.visible || !receiveButton.enabled) return "disabled"
+    receiveButton.clicked()
+    return "ok"
+  }
+
+  function smokePasteReceive() {
+    return receiveFlow.paste() ? "ok" : "disabled"
+  }
+
+  function smokePreviewReceive() {
+    return receiveFlow.review() ? "ok" : "disabled"
+  }
+
+  function smokeApproveReceiveMint() {
+    return receiveFlow.toggleMintApproval() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmReceive() {
+    return receiveFlow.confirm() ? "ok" : "disabled"
+  }
+
+  function smokeCancelReceive() {
+    if (receiveFlow.viewState === "closed") return "disabled"
+    receiveFlow.close()
+    return "ok"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -182,13 +213,32 @@ Item {
       recoveryWarningVisible: recoveryWarning.visible,
       recoveryConfirmVisible: confirmRecoveryPhraseButton.visible,
       recoveryPhraseVisible: recoveryPhraseText.visible,
+      receiveViewState: receiveFlow.viewState,
+      receiveInputVisible: receiveFlow.inputVisible,
+      receiveTextPresent: receiveFlow.textPresent,
+      receivePasteVisible: receiveFlow.pasteVisible,
+      receiveClipboardReads: receiveFlow.clipboardReads,
+      receivePreviewAmount: receiveFlow.preview ? receiveFlow.preview.amount : "",
+      receivePreviewFee: receiveFlow.preview ? receiveFlow.preview.fee : "",
+      receivePreviewNetAmount: receiveFlow.preview ? receiveFlow.preview.netAmount : "",
+      receivePreviewUnit: receiveFlow.preview ? receiveFlow.preview.unit : "",
+      receivePreviewMint: receiveFlow.preview ? receiveFlow.preview.mintUrl : "",
+      receiveMintTrusted: receiveFlow.preview ? receiveFlow.preview.trusted : false,
+      receiveApprovalVisible: receiveFlow.approvalVisible,
+      receiveMintApproved: receiveFlow.mintApproved,
+      receiveConfirmEnabled: receiveFlow.confirmEnabled,
+      receiveError: receiveFlow.error,
+      keyCatcherBlocked: keyCatcher.blocked,
       activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
 
   onOpenedChanged: {
-    if (!opened) clearRecoveryPhrase()
+    if (!opened) {
+      clearRecoveryPhrase()
+      receiveFlow.panelClosed()
+    }
   }
 
   Component.onDestruction: clearRecoveryPhrase()
@@ -211,8 +261,10 @@ Item {
     }
 
     function onWalletStateChanged() {
-      if (!root.stateOwner || root.stateOwner.walletState !== "unlocked")
+      if (!root.stateOwner || root.stateOwner.walletState !== "unlocked") {
         root.clearRecoveryPhrase()
+        receiveFlow.panelClosed()
+      }
     }
   }
 
@@ -237,6 +289,7 @@ Item {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: receiveFlow.inputFocused
       onCloseRequested: root.dismiss()
 
       Flickable {
@@ -282,6 +335,7 @@ Item {
 
           Column {
             visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+              && receiveFlow.viewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -396,6 +450,7 @@ Item {
 
           PanelSeparator {
             visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+              && receiveFlow.viewState === "closed"
             foreground: root.foreground
           }
 
@@ -410,6 +465,7 @@ Item {
             }
 
             Row {
+              visible: receiveFlow.viewState === "closed"
               width: parent.width
               spacing: Style.spacing.rowGap
 
@@ -575,14 +631,22 @@ Item {
               spacing: Style.spacing.controlGap
 
               Button {
+                id: receiveButton
                 width: (parent.width - parent.spacing) / 2
                 text: "Receive"
                 iconText: "󰑐"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
-                enabled: false
-                opacity: 0.5
+                enabled: root.stateOwner
+                  && root.stateOwner.walletState === "unlocked"
+                  && root.recoveryViewState === "closed"
+                  && receiveFlow.viewState === "closed"
+                opacity: enabled ? 1 : 0.5
+                onClicked: {
+                  root.clearRecoveryPhrase()
+                  receiveFlow.open()
+                }
               }
 
               Button {
@@ -598,13 +662,24 @@ Item {
             }
 
             Text {
+              visible: receiveFlow.viewState === "closed"
               width: parent.width
-              text: "Receive and Send remain unavailable in this live-state slice."
+              text: "Send remains unavailable in this slice."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               horizontalAlignment: Text.AlignHCenter
               wrapMode: Text.WordWrap
+            }
+
+            ReceiveFlow {
+              id: receiveFlow
+              width: parent.width
+              service: root.stateOwner
+              foreground: root.foreground
+              urgent: root.urgent
+              dim: root.dim
+              fontFamily: root.fontFamily
             }
           }
 

@@ -80,9 +80,15 @@ rg -q 'addDecimalStrings' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not aggregate amounts losslessly"
 
 if rg -n --glob '!scripts/check.sh' --glob '!docs/reference/**' \
-  'Last-Event-ID|/v1/wallet/snapshot|/v1/wallet/create|/v1/wallet/recovery-phrase/reveal' \
+  'Last-Event-ID|/v1/wallet/snapshot|/v1/wallet/create|/v1/wallet/recovery-phrase/reveal|/v1/receives/' \
   "$project_dir"; then
   fail "the provisional snapshot, command, or event-replay contract remains"
+fi
+
+if rg -n -- '--arg token' "$project_dir/tests/contract.sh" \
+    || rg -n 'function (setClipboardText|setReceiveText)' \
+      "$project_dir/tests/runtime-shell.qml"; then
+  fail "Receive bearer tokens must not travel through process arguments or diagnostics IPC"
 fi
 
 if rg -n 'Number\([^)]*(amount|balance|spendable|reserved)' \

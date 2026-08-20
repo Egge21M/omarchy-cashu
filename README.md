@@ -117,8 +117,18 @@ Wallet creation uses `POST /v1/admin/wallet/initialize`; separately confirmed
 Recovery Phrase access uses `POST /v1/admin/wallet/recovery-material`. Both
 sensitive responses are non-cacheable and their secret values are not retained
 in adapter state. The mock starts without a Wallet and never initializes one on
-startup, reconnect, shell reload, or panel open. Receive and Send actions remain
-disabled placeholders in this alignment slice.
+startup, reconnect, shell reload, or panel open. Send remains unavailable.
+
+Receive uses the implemented cocod transfer resources without extending the
+adapter's projected state with token material. `POST /v1/token-previews`
+validates a pasted sat token without mutation. An unknown mint is registered
+through `POST /v1/mints` and trusted only after explicit approval through
+`POST /v1/mints/trust`. Confirmation creates a Prepared Receive through
+`POST /v1/operations/receive`, executes its canonical command, and reports
+success only after refetching the finalized Operation and `/v1/balances`.
+Encoded token text remains in the focused input and immediate authenticated
+command bodies; it is excluded from diagnostics IPC, adapter snapshots, SSE,
+logs, and persisted plugin data.
 
 Authenticated `/v1/events` frames are safe invalidation hints. Balance, Known
 Mint, and Operation hints refetch their affected canonical resources. Bootstrap,
