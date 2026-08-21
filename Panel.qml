@@ -80,16 +80,18 @@ Item {
   }
 
   function close() {
+    if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
-    receiveFlow.panelClosed()
     opened = false
+    return true
   }
 
   function dismiss() {
+    if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
-    receiveFlow.panelClosed()
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
-    else close()
+    else opened = false
+    return true
   }
 
   function amountText(value) {
@@ -112,6 +114,7 @@ Item {
   function openRecoveryPhrase() {
     if (!viewRecoveryPhraseButton.visible || recoveryViewState !== "closed") return false
     receiveFlow.close()
+    sendFlow.close()
     recoveryPhrase = ""
     recoveryError = ""
     recoveryViewState = "warning"
@@ -171,7 +174,14 @@ Item {
 
   function openReceive() {
     clearRecoveryPhrase()
+    sendFlow.close()
     return receiveFlow.open()
+  }
+
+  function openSend() {
+    clearRecoveryPhrase()
+    receiveFlow.close()
+    return sendFlow.open()
   }
 
   function smokePasteReceive() {
@@ -193,6 +203,48 @@ Item {
   function smokeCancelReceive() {
     if (receiveFlow.viewState === "closed") return "disabled"
     return receiveFlow.close() ? "ok" : "disabled"
+  }
+
+  function smokeOpenSend() {
+    if (!sendButton.visible || !sendButton.enabled) return "disabled"
+    return openSend() ? "ok" : "disabled"
+  }
+
+  function smokeSetSendAmount(amount) {
+    return sendFlow.setAmount(amount) ? "ok" : "disabled"
+  }
+
+  function smokeSelectSendMint(mintUrl) {
+    return sendFlow.selectMint(mintUrl) ? "ok" : "disabled"
+  }
+
+  function smokeSendMax() {
+    return sendFlow.useMax() ? "ok" : "disabled"
+  }
+
+  function smokePrepareSend() {
+    return sendFlow.prepare() ? "ok" : "disabled"
+  }
+
+  function smokeUseRefreshedSendMax() {
+    return sendFlow.useRefreshedMax() ? "ok" : "disabled"
+  }
+
+  function smokeCancelSend() {
+    if (sendFlow.viewState === "closed") return "disabled"
+    return sendFlow.cancel() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmSend() {
+    return sendFlow.confirm() ? "ok" : "disabled"
+  }
+
+  function smokeCopySend() {
+    return sendFlow.copyToken() ? "ok" : "disabled"
+  }
+
+  function smokeDoneSend() {
+    return sendFlow.done() ? "ok" : "disabled"
   }
 
   function smokeSnapshot() {
@@ -236,6 +288,32 @@ Item {
       receiveMintApproved: receiveFlow.mintApproved,
       receiveConfirmEnabled: receiveFlow.confirmEnabled,
       receiveError: receiveFlow.error,
+      sendViewState: sendFlow.viewState,
+      sendInputVisible: sendFlow.inputVisible,
+      sendInputFocused: sendFlow.inputFocused,
+      sendAmount: sendFlow.amount,
+      sendAmountValid: sendFlow.amountValid,
+      sendMintOptionCount: sendFlow.mintOptions.length,
+      sendSelectedMint: sendFlow.selectedMintUrl,
+      sendMaxAmount: sendFlow.maxAmount,
+      sendRefreshedMaxAvailable: sendFlow.refreshedMaxAvailable,
+      sendPrepareEnabled: sendFlow.prepareEnabled,
+      sendConfirmEnabled: sendFlow.confirmEnabled,
+      sendReviewMint: sendFlow.prepared ? String(sendFlow.prepared.mintUrl || "") : "",
+      sendReviewAmount: sendFlow.prepared ? String(sendFlow.prepared.amount || "") : "",
+      sendReviewFee: sendFlow.prepared ? String(sendFlow.prepared.fee || "") : "",
+      sendReviewInputAmount: sendFlow.prepared
+        ? String(sendFlow.prepared.inputAmount || "") : "",
+      sendReviewNeedsSwap: sendFlow.prepared
+        ? sendFlow.prepared.needsSwap === true : false,
+      sendReviewSpendable: sendFlow.reviewBalance
+        ? String(sendFlow.reviewBalance.spendable || "") : "",
+      sendReviewReserved: sendFlow.reviewBalance
+        ? String(sendFlow.reviewBalance.reserved || "") : "",
+      sendCopyAvailable: sendFlow.copyAvailable,
+      sendClipboardWrites: sendFlow.clipboardWrites,
+      sendError: sendFlow.error,
+      sendErrorCode: stateOwner ? String(stateOwner.sendErrorCode || "") : "",
       receiveRecoveryState: stateOwner ? stateOwner.receiveRecoveryState : "idle",
       receiveRecoveryMessage: stateOwner ? stateOwner.receiveRecoveryMessage() : "",
       keyCatcherBlocked: keyCatcher.blocked,
@@ -250,6 +328,7 @@ Item {
     if (!opened) {
       clearRecoveryPhrase()
       receiveFlow.panelClosed()
+      sendFlow.panelClosed()
     }
   }
 
@@ -273,9 +352,17 @@ Item {
     }
 
     function onWalletStateChanged() {
-      if (!root.stateOwner || root.stateOwner.walletState !== "unlocked") {
+      if (!root.stateOwner) return
+      if (root.stateOwner.connectionState !== "connected") {
         root.clearRecoveryPhrase()
         receiveFlow.panelClosed()
+        return
+      }
+      if (root.stateOwner.walletState !== "unlocked") {
+        root.clearRecoveryPhrase()
+        receiveFlow.panelClosed()
+        if (["executing", "result"].indexOf(sendFlow.viewState) === -1)
+          sendFlow.panelClosed()
       }
     }
   }
@@ -301,7 +388,7 @@ Item {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: receiveFlow.inputFocused
+      blocked: receiveFlow.inputFocused || sendFlow.inputFocused
       onCloseRequested: root.dismiss()
 
       Flickable {
@@ -347,7 +434,7 @@ Item {
 
           Column {
             visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
-              && receiveFlow.viewState === "closed"
+              && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -462,7 +549,7 @@ Item {
 
           PanelSeparator {
             visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
-              && receiveFlow.viewState === "closed"
+              && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             foreground: root.foreground
           }
 
@@ -477,7 +564,7 @@ Item {
             }
 
             Row {
-              visible: receiveFlow.viewState === "closed"
+              visible: receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
               width: parent.width
               spacing: Style.spacing.rowGap
 
@@ -654,35 +741,41 @@ Item {
                   && root.stateOwner.walletState === "unlocked"
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
+                  && sendFlow.viewState === "closed"
                 opacity: enabled ? 1 : 0.5
                 onClicked: root.openReceive()
               }
 
               Button {
+                id: sendButton
                 width: (parent.width - parent.spacing) / 2
                 text: "Send"
                 iconText: "󰒊"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
-                enabled: false
-                opacity: 0.5
+                enabled: root.stateOwner
+                  && root.stateOwner.walletState === "unlocked"
+                  && root.recoveryViewState === "closed"
+                  && receiveFlow.viewState === "closed"
+                  && sendFlow.viewState === "closed"
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.openSend()
               }
-            }
-
-            Text {
-              visible: receiveFlow.viewState === "closed"
-              width: parent.width
-              text: "Send remains unavailable in this slice."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              horizontalAlignment: Text.AlignHCenter
-              wrapMode: Text.WordWrap
             }
 
             ReceiveFlow {
               id: receiveFlow
+              width: parent.width
+              service: root.stateOwner
+              foreground: root.foreground
+              urgent: root.urgent
+              dim: root.dim
+              fontFamily: root.fontFamily
+            }
+
+            SendFlow {
+              id: sendFlow
               width: parent.width
               service: root.stateOwner
               foreground: root.foreground

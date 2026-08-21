@@ -10,6 +10,7 @@ Item {
 
   signal recoveryPhraseRevealed(string phrase)
   signal recoveryPhraseRevealFailed(string detail)
+  signal sendExecuted(string token)
 
   property var shell: null
   property var manifest: null
@@ -33,6 +34,7 @@ Item {
     "wallet.mints",
     "wallet.receive-preview",
     "wallet.receive-operations",
+    "wallet.send-max",
     "wallet.send-operations",
     "wallet.events"
   ]
@@ -70,6 +72,9 @@ Item {
 
   property int fullFetchToken: 0
   property bool fullFetchInProgress: false
+  property string deferredReconcileReason: ""
+  property bool queuedSendInvalidation: false
+  property bool queuedBalanceInvalidation: false
   property var queuedReceiveInvalidations: ({})
   property var canonicalRequests: []
   property var balanceRequest: null
@@ -100,6 +105,24 @@ Item {
   readonly property string receiveRecoveryOperationId: String(
     receiveRecovery.operationId || "")
   readonly property string receiveRecoveryError: String(receiveRecovery.error || "")
+  property var sendCommandRequest: null
+  property var sendReconcileRequests: []
+  property string sendState: "idle"
+  property var sendMaxResource: null
+  property string sendError: ""
+  property string sendErrorCode: ""
+  property string sendOperationId: ""
+  property bool sendCancelOnPrepared: false
+  property var sendAmbiguousCreation: null
+  property bool sendResultReconciling: false
+  property bool sendDismissAfterResult: false
+  readonly property var sendPreparedOperation: canonicalPreparedSend(sendOperationId)
+  readonly property bool sendCanCancelReservation: sendOperationId !== ""
+    && ["review", "error"].indexOf(sendState) !== -1
+    && !sendCommandRequest
+  readonly property bool sendCommandsAvailable: !fullFetchInProgress
+    && connectionState === "connected" && compatibilityState === "compatible"
+    && walletState === "unlocked"
 
   readonly property bool fixtureBacked: false
   readonly property string walletState: connectionState === "connected"
@@ -236,9 +259,16 @@ Item {
       receiveRecoveryError: receiveRecoveryError,
       receiveRecoveryMessage: receiveRecoveryMessage(),
       receiveRecoveries: receiveRecoveries,
+      sendState: sendState,
+      sendError: sendError,
+      sendErrorCode: sendErrorCode,
+      sendMaxMintUrl: sendMaxResource ? String(sendMaxResource.mintUrl || "") : "",
+      sendMaxAmount: sendMaxResource ? String(sendMaxResource.maxAmount || "") : "",
+      sendPreparedOperation: sendPreparedOperation,
       creating: creating,
       createError: createError,
       connectionState: connectionState,
+      canonicalRefreshInProgress: fullFetchInProgress,
       compatibilityState: compatibilityState,
       connectionDetail: connectionDetail,
       lastErrorCode: lastErrorCode,
@@ -250,6 +280,7 @@ Item {
       retryDelayMs: retryDelayMs,
       heartbeatCount: heartbeatCount,
       rotationCount: rotationCount,
+      streamRotationScheduled: rotationTimer.running,
       reconnectCount: reconnectCount,
       streamCharacters: streamCharacters
     }
@@ -284,6 +315,15 @@ Item {
     return result.replace(/^0+(?=[0-9])/, "")
   }
 
+  function compareDecimalStrings(left, right) {
+    var a = decimalString(left)
+    var b = decimalString(right)
+    if (!a || !b) return 0
+    if (a.length !== b.length) return a.length < b.length ? -1 : 1
+    if (a === b) return 0
+    return a < b ? -1 : 1
+  }
+
   function composeSatBalances(resource) {
     var spendable = "0"
     var reserved = "0"
@@ -301,6 +341,95 @@ Item {
     var items = resource && Array.isArray(resource.items) ? resource.items : []
     for (var i = 0; i < items.length; i++) if (items[i].trusted === true) result.push(items[i])
     return result
+  }
+
+  function isTrustedSendMint(mintUrl) {
+    var selected = String(mintUrl || "")
+    var known = mintsResource && Array.isArray(mintsResource.items)
+      ? mintsResource.items : []
+    for (var index = 0; index < known.length; index++)
+      if (String(known[index].mintUrl || "") === selected)
+        return known[index].trusted === true
+    return false
+  }
+
+  function sendMintOptions(amount) {
+    var requested = String(amount === undefined || amount === null ? "" : amount)
+    var requireFunding = /^[1-9][0-9]*$/.test(requested)
+    var trusted = ({})
+    var known = mintsResource && Array.isArray(mintsResource.items)
+      ? mintsResource.items : []
+    for (var mintIndex = 0; mintIndex < known.length; mintIndex++)
+      if (known[mintIndex].trusted === true)
+        trusted[String(known[mintIndex].mintUrl || "")] = known[mintIndex]
+    var balances = balancesResource && Array.isArray(balancesResource.items)
+      ? balancesResource.items : []
+    var result = []
+    for (var balanceIndex = 0; balanceIndex < balances.length; balanceIndex++) {
+      var balance = balances[balanceIndex]
+      var mintUrl = String(balance.mintUrl || "")
+      var spendable = decimalString(balance.spendable)
+      if (String(balance.unit || "") !== "sat" || !trusted[mintUrl]
+          || !spendable || spendable === "0") continue
+      if (requireFunding && compareDecimalStrings(spendable, requested) < 0) continue
+      result.push({
+        mintUrl: mintUrl,
+        name: String(trusted[mintUrl].name || mintUrl),
+        spendable: spendable,
+        reserved: String(balance.reserved || "0"),
+        unit: "sat"
+      })
+    }
+    return result
+  }
+
+  function sendBalanceForMint(mintUrl) {
+    var selected = String(mintUrl || "")
+    var balances = balancesResource && Array.isArray(balancesResource.items)
+      ? balancesResource.items : []
+    for (var index = 0; index < balances.length; index++)
+      if (String(balances[index].mintUrl || "") === selected
+          && String(balances[index].unit || "") === "sat") return {
+        mintUrl: selected,
+        unit: "sat",
+        spendable: String(balances[index].spendable || "0"),
+        reserved: String(balances[index].reserved || "0"),
+        total: String(balances[index].total || "0")
+      }
+    return null
+  }
+
+  function canonicalSendOperation(operationId) {
+    var selected = String(operationId || "")
+    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    for (var index = 0; selected && index < operations.length; index++)
+      if (String(operations[index].id || "") === selected)
+        return operations[index]
+    return null
+  }
+
+  function canonicalPreparedSend(operationId) {
+    var operation = canonicalSendOperation(operationId)
+    return operation && String(operation.state || "") === "prepared"
+      ? operation : null
+  }
+
+  function firstCanonicalPreparedSend() {
+    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    for (var index = 0; index < operations.length; index++)
+      if (String(operations[index].state || "") === "prepared")
+        return operations[index]
+    return null
+  }
+
+  function reconcileFocusedPreparedSend() {
+    var reconcilesCommandError = sendState === "error"
+      && ["operation_not_found", "operation_conflict"].indexOf(sendErrorCode) !== -1
+    if ((sendState !== "review" && !reconcilesCommandError) || !sendOperationId) return
+    var operation = canonicalSendOperation(sendOperationId)
+    if (operation && String(operation.state || "") === "prepared") return
+    sendOperationId = ""
+    failSend(operation ? "operation_conflict" : "operation_not_found")
   }
 
   function operationStateLabel(operation) {
@@ -473,6 +602,7 @@ Item {
       if (String(item.type || "") !== type || typeof item.id !== "string"
           || typeof item.state !== "string" || typeof item.mintUrl !== "string"
           || typeof item.unit !== "string" || !decimalString(item.amount)) return false
+      if (type === "send" && !isSendOperation(item)) return false
     }
     return true
   }
@@ -491,6 +621,43 @@ Item {
       .indexOf(String(value.state || "")) !== -1
       && decimalString(value.fee) && decimalString(value.netAmount)
       && typeof value.createdAt === "string" && typeof value.updatedAt === "string"
+  }
+
+  function isSendMax(value) {
+    return value && typeof value === "object" && !containsSensitiveKey(value)
+      && typeof value.mintUrl === "string" && value.mintUrl.length > 0
+      && value.unit === "sat" && decimalString(value.spendable)
+      && decimalString(value.maxAmount) && decimalString(value.fee)
+      && typeof value.needsSwap === "boolean"
+  }
+
+  function projectSendMax(value) {
+    return {
+      mintUrl: String(value.mintUrl),
+      unit: "sat",
+      spendable: String(value.spendable),
+      maxAmount: String(value.maxAmount),
+      fee: String(value.fee),
+      needsSwap: value.needsSwap === true
+    }
+  }
+
+  function isSendOperation(value) {
+    if (!value || typeof value !== "object" || containsSensitiveKey(value)
+        || value.type !== "send" || typeof value.id !== "string"
+        || value.id.length === 0
+        || typeof value.mintUrl !== "string" || value.mintUrl.length === 0
+        || value.unit !== "sat" || !decimalString(value.amount)
+        || typeof value.createdAt !== "string" || typeof value.updatedAt !== "string")
+      return false
+    var state = String(value.state || "")
+    if (["init", "prepared", "executing", "pending", "finalized",
+        "rolling_back", "rolled_back"].indexOf(state) === -1) return false
+    if (state === "init") return (value.fee === undefined || decimalString(value.fee))
+      && (value.inputAmount === undefined || decimalString(value.inputAmount))
+      && (value.needsSwap === undefined || typeof value.needsSwap === "boolean")
+    return decimalString(value.fee) && decimalString(value.inputAmount)
+      && typeof value.needsSwap === "boolean"
   }
 
   function parseErrorDocument(request) {
@@ -548,15 +715,114 @@ Item {
     }
   }
 
+  function abortIncrementalSendFetches() {
+    abortRequests(sendRequests)
+    sendRequests = []
+    var request = balanceRequest
+    balanceRequest = null
+    if (request) {
+      request.onreadystatechange = null
+      request.abort()
+    }
+  }
+
+  function resumeQueuedSendInvalidations() {
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) return
+    var refreshSends = queuedSendInvalidation
+    var refreshBalances = queuedBalanceInvalidation
+    queuedSendInvalidation = false
+    queuedBalanceInvalidation = false
+    if (refreshSends) fetchOperationGroup("send")
+    if (refreshBalances) fetchBalances()
+  }
+
+  function collectSendResources(specifications, callback, failureCallback) {
+    abortIncrementalSendFetches()
+    abortRequests(sendReconcileRequests)
+    sendReconcileRequests = []
+    var values = ({})
+    var pending = specifications.length
+    var requests = []
+    var failed = false
+
+    function reject(code) {
+      if (failed) return
+      failed = true
+      root.abortRequests(requests)
+      root.sendReconcileRequests = []
+      if (typeof failureCallback === "function") failureCallback(code)
+      else root.failSend(code)
+    }
+
+    for (var index = 0; index < specifications.length; index++) {
+      (function(specification) {
+        var request = root.sendRequest("GET", specification.path, undefined,
+          function(result) {
+            if (failed || requests.indexOf(request) === -1) return
+            if (!result.ok) {
+              reject(result.error.code)
+              return
+            }
+            var valid = specification.type === "balances"
+              ? root.isBalanceCollection(result.value)
+              : specification.type === "maximum"
+                ? root.isSendMax(result.value)
+                : root.isOperationCollection(result.value, "send")
+            if (result.status !== 200 || !valid) {
+              reject("invalid_response")
+              return
+            }
+            values[specification.key] = result.value
+            pending--
+            if (pending !== 0) return
+            root.sendReconcileRequests = []
+            callback(values)
+          })
+        if (!request) {
+          reject("credential_unavailable")
+          return
+        }
+        requests.push(request)
+      })(specifications[index])
+    }
+    sendReconcileRequests = requests
+    return !failed
+  }
+
   function abortCanonicalRequests() {
     var requests = canonicalRequests
     canonicalRequests = []
     abortRequests(requests)
   }
 
+  function sendCanonicalMutationBusy() {
+    return !!sendCommandRequest || sendReconcileRequests.length > 0
+      || sendResultReconciling
+      || ["maxing", "preparing", "cancelling", "executing"]
+        .indexOf(sendState) !== -1
+  }
+
+  function resumeDeferredCanonicalReconcile() {
+    var reason = String(deferredReconcileReason || "")
+    if (!reason) {
+      resumeQueuedSendInvalidations()
+      return
+    }
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) return
+    deferredReconcileReason = ""
+    beginReconcile(reason)
+  }
+
   function beginReconcile(reason) {
+    var requestedReason = String(reason || "manual")
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+      if (deferredReconcileReason !== "rotation" || requestedReason === "rotation")
+        deferredReconcileReason = requestedReason
+      return
+    }
+    deferredReconcileReason = ""
     var preserveHealthyStream = !!streamRequest
-      && reason !== "startup" && reason !== "rotation"
+      && requestedReason !== "startup" && requestedReason !== "rotation"
     reconnectTimer.stop()
     if (!preserveHealthyStream) {
       heartbeatTimer.stop()
@@ -582,10 +848,10 @@ Item {
       retryDelayMs = 0
       return
     }
-    if (reason === "startup") {
+    if (requestedReason === "startup") {
       connectionState = "connecting"
       connectionDetail = "Connecting to cocod on loopback"
-    } else if (reason === "panel" && preserveHealthyStream) {
+    } else if (requestedReason === "panel" && preserveHealthyStream) {
       connectionDetail = "Refreshing canonical Wallet resources"
     } else {
       reconnectCount++
@@ -935,6 +1201,15 @@ Item {
       reconcileReceiveOperation(receiveOperationId)
     for (var operationId in queuedInvalidations)
       refetchReceiveOperation(operationId)
+    reconcileAmbiguousSendFromCanonical()
+    if (sendCancelOnPrepared && sendOperationId
+        && ["review", "error"].indexOf(sendState) !== -1) {
+      if (cancelPreparedSend()) sendCancelOnPrepared = false
+    } else if (sendCancelOnPrepared && !sendAmbiguousCreation) {
+      sendCancelOnPrepared = false
+      resetSend()
+    }
+    resumeDeferredCanonicalReconcile()
   }
 
   function handleCredentialUnavailable() {
@@ -996,6 +1271,455 @@ Item {
     receiveError = ""
     receiveOperationId = ""
     return true
+  }
+
+  function resetSend() {
+    if (["preparing", "cancelling", "executing"].indexOf(sendState) !== -1
+        || (sendState === "review" && sendPreparedOperation)
+        || sendResultReconciling) return false
+    var request = sendCommandRequest
+    sendCommandRequest = null
+    if (request) {
+      request.onreadystatechange = null
+      request.abort()
+    }
+    abortRequests(sendReconcileRequests)
+    sendReconcileRequests = []
+    sendState = "idle"
+    sendMaxResource = null
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendCancelOnPrepared = false
+    sendAmbiguousCreation = null
+    sendDismissAfterResult = false
+    resumeDeferredCanonicalReconcile()
+    return true
+  }
+
+  function beginSendFlow() {
+    if (["maxing", "preparing", "cancelling", "executing"]
+        .indexOf(sendState) !== -1 || sendResultReconciling) return false
+    sendCancelOnPrepared = false
+    var prepared = sendPreparedOperation || firstCanonicalPreparedSend()
+    if (prepared) {
+      sendOperationId = String(prepared.id)
+      sendError = ""
+      sendErrorCode = ""
+      sendMaxResource = null
+      sendState = "review"
+      return true
+    }
+    if (sendState === "error"
+        && (sendOperationId !== "" || sendAmbiguousCreation)) return true
+    return resetSend()
+  }
+
+  function dismissSendFlow() {
+    if (sendState === "preparing") {
+      sendCancelOnPrepared = true
+      return true
+    }
+    if (sendState === "executing") return false
+    if (sendState === "cancelling") return true
+    if (sendState === "result" && sendResultReconciling) {
+      sendDismissAfterResult = true
+      return true
+    }
+    if (sendAmbiguousCreation) {
+      sendCancelOnPrepared = true
+      beginReconcile("send-ambiguous-dismiss")
+      return true
+    }
+    if (sendCanCancelReservation) {
+      if (fullFetchInProgress) {
+        sendCancelOnPrepared = true
+        return true
+      }
+      sendCancelOnPrepared = false
+      return cancelPreparedSend()
+    }
+    return resetSend()
+  }
+
+  function cancelSendFlow() {
+    if (sendCanCancelReservation) {
+      if (fullFetchInProgress) {
+        sendCancelOnPrepared = true
+        return "dismissed"
+      }
+      return cancelPreparedSend() ? "cancelling" : ""
+    }
+    if (sendAmbiguousCreation) {
+      sendCancelOnPrepared = true
+      beginReconcile("send-ambiguous-dismiss")
+      return "dismissed"
+    }
+    return resetSend() ? "dismissed" : ""
+  }
+
+  function requestSendMax(mintUrl) {
+    var selectedMint = String(mintUrl || "")
+    if (!selectedMint || !isTrustedSendMint(selectedMint)
+        || sendCommandRequest || fullFetchInProgress
+        || sendState !== "idle"
+        || connectionState !== "connected" || compatibilityState !== "compatible"
+        || walletState !== "unlocked") return false
+    sendMaxResource = null
+    sendError = ""
+    sendErrorCode = ""
+    sendState = "maxing"
+    var request = root.sendRequest("GET", "/v1/operations/send/max?mintUrl="
+      + encodeURIComponent(selectedMint) + "&unit=sat", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.failSend(result.error.code)
+          return
+        }
+        if (result.status !== 200 || !root.isSendMax(result.value)
+            || String(result.value.mintUrl) !== selectedMint) {
+          root.failSend("invalid_response")
+          return
+        }
+        root.sendState = "idle"
+        root.sendMaxResource = root.projectSendMax(result.value)
+        root.resumeDeferredCanonicalReconcile()
+      })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function prepareSend(mintUrl, amount) {
+    var selectedMint = String(mintUrl || "")
+    var requestedAmount = String(amount === undefined || amount === null ? "" : amount)
+    if (!/^[1-9][0-9]*$/.test(requestedAmount) || !selectedMint
+        || fullFetchInProgress
+        || sendCommandRequest || sendState !== "idle") return false
+    var eligible = sendMintOptions(requestedAmount)
+    var canFund = isTrustedSendMint(selectedMint) && isSendMax(sendMaxResource)
+      && String(sendMaxResource.mintUrl) === selectedMint
+      && String(sendMaxResource.maxAmount) === requestedAmount
+    for (var index = 0; index < eligible.length; index++)
+      if (String(eligible[index].mintUrl || "") === selectedMint) canFund = true
+    if (!canFund) return false
+    var knownOperationIds = ({})
+    for (var operationIndex = 0; operationIndex < sendOperations.length;
+        operationIndex++)
+      knownOperationIds[String(sendOperations[operationIndex].id || "")] = true
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendCancelOnPrepared = false
+    sendAmbiguousCreation = null
+    abortIncrementalSendFetches()
+    sendState = "preparing"
+    var request = root.sendRequest("POST", "/v1/operations/send", {
+      mintUrl: selectedMint,
+      unit: "sat",
+      amount: requestedAmount
+    }, function(result) {
+      if (request !== root.sendCommandRequest) return
+      root.sendCommandRequest = null
+      if (!result.ok) {
+        if (result.status === 0
+            || (result.status === 201 && result.error.code === "invalid_response")) {
+          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
+            knownOperationIds, result.error.code)
+          return
+        }
+        if (result.error.code === "insufficient_balance") {
+          root.refreshSendAfterInsufficientBalance(selectedMint)
+          return
+        }
+        root.failSend(result.error.code)
+        return
+      }
+      if (result.status !== 201 || !root.isSendOperation(result.value)
+          || String(result.value.state) !== "prepared"
+          || String(result.value.mintUrl) !== selectedMint
+          || String(result.value.amount) !== requestedAmount) {
+        if (result.status === 201)
+          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
+            knownOperationIds, "invalid_response")
+        else root.failSend("invalid_response")
+        return
+      }
+      root.sendAmbiguousCreation = null
+      root.sendOperationId = String(result.value.id)
+      root.reconcileSendResources(function() {
+        root.finishPreparedSendReconciliation("")
+      }, function(code) {
+        root.finishPreparedSendReconciliation(code)
+      })
+    })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function reconcileAmbiguousSendCreation(mintUrl, amount, knownOperationIds,
+      failureCode) {
+    sendAmbiguousCreation = {
+      mintUrl: String(mintUrl),
+      amount: String(amount),
+      knownOperationIds: knownOperationIds,
+      failureCode: String(failureCode || "transport_unavailable")
+    }
+    sendState = "preparing"
+    reconcileSendResources(function() {
+      var match = root.matchAmbiguousSendCreation(root.sendAmbiguousCreation)
+      if (match.matches !== 1) {
+        if (match.matches === 0) root.sendAmbiguousCreation = null
+        root.failSend(match.matches > 1 ? "invalid_response" : failureCode)
+        return
+      }
+      root.sendAmbiguousCreation = null
+      root.sendOperationId = String(match.operation.id)
+      root.finishPreparedSendReconciliation("")
+    }, function() {
+      root.failSend(failureCode)
+    })
+  }
+
+  function matchAmbiguousSendCreation(context) {
+    var result = { operation: null, matches: 0 }
+    if (!context) return result
+    var known = context.knownOperationIds || ({})
+    for (var index = 0; index < sendOperations.length; index++) {
+      var operation = sendOperations[index]
+      var operationId = String(operation.id || "")
+      if (known[operationId] || String(operation.state || "") !== "prepared"
+          || String(operation.mintUrl || "") !== String(context.mintUrl || "")
+          || String(operation.amount || "") !== String(context.amount || "")) continue
+      result.operation = operation
+      result.matches++
+    }
+    return result
+  }
+
+  function reconcileAmbiguousSendFromCanonical() {
+    if (!sendAmbiguousCreation) return
+    var context = sendAmbiguousCreation
+    var match = matchAmbiguousSendCreation(context)
+    if (match.matches === 1) {
+      sendAmbiguousCreation = null
+      sendOperationId = String(match.operation.id)
+      finishPreparedSendReconciliation("")
+      return
+    }
+    if (match.matches > 1) {
+      failSend("invalid_response")
+      return
+    }
+    sendAmbiguousCreation = null
+    if (sendCancelOnPrepared) {
+      sendCancelOnPrepared = false
+      resetSend()
+    } else if (sendState === "preparing") {
+      failSend(String(context.failureCode || "transport_unavailable"))
+    }
+  }
+
+  function finishPreparedSendReconciliation(code) {
+    if (code) failSend(code)
+    else if (!sendPreparedOperation) failSend("invalid_response")
+    else sendState = "review"
+    if (sendCancelOnPrepared && sendOperationId && cancelPreparedSend()) {
+      sendCancelOnPrepared = false
+      return
+    }
+    resumeDeferredCanonicalReconcile()
+  }
+
+  function resumeSendAfterInsufficientBalance() {
+    if (sendState !== "error" || sendErrorCode !== "insufficient_balance"
+        || !isSendMax(sendMaxResource)) return false
+    sendError = ""
+    sendErrorCode = ""
+    sendState = "idle"
+    return true
+  }
+
+  function refreshSendAfterInsufficientBalance(mintUrl) {
+    sendState = "preparing"
+    var specifications = [
+      { key: "balances", path: "/v1/balances", type: "balances" },
+      { key: "maximum", path: "/v1/operations/send/max?mintUrl="
+        + encodeURIComponent(mintUrl) + "&unit=sat", type: "maximum" }
+    ]
+    collectSendResources(specifications, function(values) {
+      root.balancesResource = values.balances
+      root.sendMaxResource = root.projectSendMax(values.maximum)
+      root.refreshCount++
+      root.failSend("insufficient_balance")
+    })
+  }
+
+  function cancelPreparedSend() {
+    var operationId = String(sendOperationId || "")
+    if (!operationId || fullFetchInProgress || !sendCanCancelReservation) return false
+    abortIncrementalSendFetches()
+    sendState = "cancelling"
+    sendError = ""
+    sendErrorCode = ""
+    var request = root.sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(operationId) + "/cancel", {}, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          if (["operation_not_found", "operation_conflict"]
+              .indexOf(result.error.code) !== -1)
+            root.reconcileSendCommandFailure(result.error.code, operationId)
+          else root.failSend(result.error.code)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id) !== operationId
+            || String(result.value.state) !== "rolled_back") {
+          root.failSend("invalid_response")
+          return
+        }
+        root.sendOperationId = ""
+        root.reconcileSendResources(function() {
+          root.sendState = "idle"
+          root.resumeDeferredCanonicalReconcile()
+        })
+      })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function reconcileSendCommandFailure(code, operationId) {
+    sendErrorCode = String(code || "")
+    sendError = sendErrorMessage(code)
+    reconcileSendResources(function() {
+      var canonical = null
+      for (var index = 0; index < root.sendOperations.length; index++)
+        if (String(root.sendOperations[index].id || "") === String(operationId))
+          canonical = root.sendOperations[index]
+      if (canonical && String(canonical.state || "") === "prepared") {
+        root.sendOperationId = String(canonical.id)
+      } else {
+        root.sendOperationId = ""
+      }
+      root.sendState = "error"
+      root.resumeDeferredCanonicalReconcile()
+    })
+  }
+
+  function executePreparedSend() {
+    var operation = sendPreparedOperation
+    var operationId = operation ? String(operation.id || "") : ""
+    if (!operationId || !sendCommandsAvailable || sendCommandRequest
+        || sendState !== "review") return false
+    abortIncrementalSendFetches()
+    sendState = "executing"
+    sendError = ""
+    sendErrorCode = ""
+    var request = root.sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(operationId) + "/execute", {}, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          if (["operation_not_found", "operation_conflict"]
+              .indexOf(result.error.code) !== -1)
+            root.reconcileSendCommandFailure(result.error.code, operationId)
+          else root.failSend(result.error.code)
+          return
+        }
+        var operation = result.value && result.value.operation
+          ? result.value.operation : null
+        var resultDocument = result.value && result.value.result
+          ? result.value.result : null
+        if (result.status !== 200 || !root.isSendOperation(operation)
+            || String(operation.id) !== operationId
+            || String(operation.state) !== "pending" || !resultDocument
+            || typeof resultDocument.token !== "string"
+            || resultDocument.token.length === 0) {
+          root.failSend("invalid_response")
+          return
+        }
+        var outgoingToken = String(resultDocument.token)
+        resultDocument.token = ""
+        root.sendOperationId = ""
+        root.sendResultReconciling = true
+        root.sendDismissAfterResult = false
+        root.sendState = "result"
+        root.sendExecuted(outgoingToken)
+        outgoingToken = ""
+        root.reconcileSendResources(function() {
+          root.finishSendResultReconciliation()
+        }, function() {
+          root.fetchOperationGroup("send")
+          root.fetchBalances()
+          root.finishSendResultReconciliation()
+        })
+      })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function finishSendResultReconciliation() {
+    sendResultReconciling = false
+    if (sendDismissAfterResult) {
+      sendDismissAfterResult = false
+      resetSend()
+    }
+    resumeDeferredCanonicalReconcile()
+  }
+
+  function reconcileSendResources(callback, failureCallback) {
+    var specifications = [
+      { key: "prepared", path: "/v1/operations/send/prepared", type: "send" },
+      { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
+      { key: "balances", path: "/v1/balances", type: "balances" }
+    ]
+    collectSendResources(specifications, function(values) {
+      root.sendOperations = values.prepared.items.concat(values.inFlight.items)
+      root.balancesResource = values.balances
+      root.refreshCount++
+      callback()
+    }, failureCallback)
+  }
+
+  function failSend(code) {
+    sendCommandRequest = null
+    sendState = "error"
+    sendErrorCode = String(code || "")
+    sendError = sendErrorMessage(code)
+    resumeDeferredCanonicalReconcile()
+  }
+
+  function sendErrorMessage(code) {
+    var messages = {
+      invalid_request: "Enter a positive whole sat amount.",
+      insufficient_balance: "This Mint can no longer fund that Send. Review the refreshed balance and Max.",
+      mint_not_registered: "This Mint is no longer registered. Choose another Trusted Mint.",
+      mint_not_trusted: "This Mint is no longer trusted. Choose another Trusted Mint.",
+      mint_unavailable: "The Mint is unavailable. Try again later or choose another Mint.",
+      operation_not_found: "This Prepared Send is no longer available. Start again.",
+      operation_conflict: "This Send changed in cocod. Review the current Wallet state and try again.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid Send response.",
+      transport_unavailable: "Send could not reach cocod. Try again."
+    }
+    return messages[String(code || "")] || "Send could not be completed. Try again."
   }
 
   function previewReceive(token) {
@@ -1342,6 +2066,10 @@ Item {
   }
 
   function fetchBalances() {
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+      queuedBalanceInvalidation = true
+      return
+    }
     var previous = balanceRequest
     balanceRequest = null
     if (previous) previous.abort()
@@ -1392,6 +2120,10 @@ Item {
   }
 
   function fetchOperationGroup(type) {
+    if (type === "send" && (fullFetchInProgress || sendCanonicalMutationBusy())) {
+      queuedSendInvalidation = true
+      return
+    }
     var existing = type === "receive" ? receiveRequests : sendRequests
     abortRequests(existing)
     if (type === "receive") receiveRequests = []
@@ -1634,6 +2366,7 @@ Item {
 
   function rotateStream() {
     if (!streamRequest) return
+    rotationTimer.stop()
     rotationCount++
     beginReconcile("rotation")
   }
@@ -1703,6 +2436,8 @@ Item {
     }
   }
 
+  onSendOperationsChanged: reconcileFocusedPreparedSend()
+
   Component.onCompleted: Qt.callLater(function() { root.beginReconcile("startup") })
   Component.onDestruction: {
     fullFetchToken++
@@ -1711,6 +2446,11 @@ Item {
     if (mintRequest) mintRequest.abort()
     abortRequests(receiveRequests)
     abortRequests(sendRequests)
+    var sendCommand = sendCommandRequest
+    sendCommandRequest = null
+    if (sendCommand) sendCommand.abort()
+    abortRequests(sendReconcileRequests)
+    sendReconcileRequests = []
     receiveReconcileToken++
     abortRequests(receiveReconcileRequests)
     receiveReconcileRequests = []

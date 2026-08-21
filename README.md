@@ -135,7 +135,8 @@ Wallet creation uses `POST /v1/admin/wallet/initialize`; separately confirmed
 Recovery Phrase access uses `POST /v1/admin/wallet/recovery-material`. Both
 sensitive responses are non-cacheable and their secret values are not retained
 in adapter state. The mock starts without a Wallet and never initializes one on
-startup, reconnect, shell reload, or panel open. Send remains unavailable.
+startup, reconnect, shell reload, or panel open. Wallet actions remain
+unavailable until the Cashu User initializes the Wallet.
 
 Receive uses the implemented cocod transfer resources without extending the
 adapter's projected state with token material. `POST /v1/token-previews`

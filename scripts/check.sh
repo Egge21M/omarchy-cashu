@@ -48,7 +48,8 @@ rg -q 'blockAllReads: true' "$project_dir/Service.qml" \
   || fail "Shell Adapter credential reads are not synchronous and narrow"
 
 if rg -n 'daemonBaseUrl|credential|XMLHttpRequest|text/event-stream|reconnectTimer' \
-  "$project_dir/BarWidget.qml" "$project_dir/Panel.qml"; then
+  "$project_dir/BarWidget.qml" "$project_dir/Panel.qml" \
+  "$project_dir/ReceiveFlow.qml" "$project_dir/SendFlow.qml"; then
   fail "transport details escaped the Shell Adapter"
 fi
 
@@ -68,6 +69,8 @@ rg -q '/v1/operations/receive/prepared' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not discover Receive Operations"
 rg -q '/v1/operations/send/in-flight' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not discover Send Operations"
+rg -q '/v1/operations/send/max' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not request daemon-calculated Send Max"
 rg -q 'isSafeInvalidation' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not validate invalidation metadata"
 rg -q 'isLoopbackBaseUrl' "$project_dir/Service.qml" \
@@ -92,7 +95,8 @@ if rg -n -- '--arg token' "$project_dir/tests/contract.sh" \
 fi
 
 if rg -n 'Number\([^)]*(amount|balance|spendable|reserved)' \
-  "$project_dir/Service.qml" "$project_dir/Panel.qml"; then
+  "$project_dir/Service.qml" "$project_dir/Panel.qml" \
+  "$project_dir/SendFlow.qml"; then
   fail "wallet amounts must never be coerced to JavaScript Number"
 fi
 rg -q 'barStateLabel' "$project_dir/BarWidget.qml" \
@@ -103,9 +107,29 @@ if rg -n --glob '!scripts/check.sh' 'QML_XHR_DUMP' "$project_dir"; then
   fail "QML_XHR_DUMP can expose Wallet material"
 fi
 
-if rg -n -i '\b(restore|passphrase|unlock|reset|delete|clipboard|copy)\b' \
+if rg -n -i '\b(restore|passphrase|unlock|reset|delete)\b' \
   "$project_dir/Panel.qml"; then
-  fail "panel exposes a deferred, destructive, or Recovery Phrase clipboard control"
+  fail "panel exposes a deferred or destructive Wallet control"
+fi
+
+if rg -n 'Quickshell\.clipboardText' \
+    "$project_dir/BarWidget.qml" "$project_dir/Panel.qml" \
+    "$project_dir/Service.qml"; then
+  fail "clipboard access escaped the focused Send and Receive presentation modules"
+fi
+[[ $(rg -c 'tokenInput\.text = String\(Quickshell\.clipboardText' \
+  "$project_dir/ReceiveFlow.qml") == 1 ]] \
+  || fail "Receive must expose exactly one explicit clipboard read"
+[[ $(rg -c 'Quickshell\.clipboardText' "$project_dir/ReceiveFlow.qml") == 1 ]] \
+  || fail "Receive must never read the clipboard through another path"
+[[ $(rg -c 'Quickshell\.clipboardText = outgoingToken' \
+  "$project_dir/SendFlow.qml") == 1 ]] \
+  || fail "Send must expose exactly one explicit outgoing-token clipboard write"
+[[ $(rg -c 'Quickshell\.clipboardText' "$project_dir/SendFlow.qml") == 1 ]] \
+  || fail "Send must never read the clipboard or write it through another path"
+if rg -n -i 'recovery.{0,40}(copy|clipboard)|(copy|clipboard).{0,40}recovery' \
+    "$project_dir/Panel.qml" "$project_dir/SendFlow.qml"; then
+  fail "Recovery Phrase clipboard controls remain forbidden"
 fi
 
 rg -q 'serviceFor\(root\.moduleName\)' "$project_dir/BarWidget.qml" \

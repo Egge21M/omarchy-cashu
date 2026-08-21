@@ -82,8 +82,7 @@ ShellRoot {
     }
 
     function closePanel(): string {
-      walletPanel.close()
-      return "ok"
+      return walletPanel.close() ? "ok" : "disabled"
     }
 
     function createWallet(): string {
@@ -131,6 +130,46 @@ ShellRoot {
 
     function cancelReceive(): string {
       return walletPanel.smokeCancelReceive()
+    }
+
+    function openSend(): string {
+      return walletPanel.smokeOpenSend()
+    }
+
+    function setSendAmount(amount: string): string {
+      return walletPanel.smokeSetSendAmount(amount)
+    }
+
+    function selectSendMint(mintUrl: string): string {
+      return walletPanel.smokeSelectSendMint(mintUrl)
+    }
+
+    function sendMax(): string {
+      return walletPanel.smokeSendMax()
+    }
+
+    function prepareSend(): string {
+      return walletPanel.smokePrepareSend()
+    }
+
+    function useRefreshedSendMax(): string {
+      return walletPanel.smokeUseRefreshedSendMax()
+    }
+
+    function cancelSend(): string {
+      return walletPanel.smokeCancelSend()
+    }
+
+    function confirmSend(): string {
+      return walletPanel.smokeConfirmSend()
+    }
+
+    function copySend(): string {
+      return walletPanel.smokeCopySend()
+    }
+
+    function doneSend(): string {
+      return walletPanel.smokeDoneSend()
     }
   }
 }

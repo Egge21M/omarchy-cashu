@@ -102,7 +102,7 @@ jq -e '
   and ([
     "wallet.lifecycle", "wallet.balances", "wallet.mints",
     "wallet.receive-preview", "wallet.receive-operations",
-    "wallet.send-operations", "wallet.events"
+    "wallet.send-max", "wallet.send-operations", "wallet.events"
   ] - .capabilities | length == 0)
 ' <<<"$capabilities" >/dev/null || fail "capability discovery does not describe the implemented slice"
 
@@ -176,6 +176,141 @@ jq -e '.items == []' <<<"$receive_in_flight" >/dev/null || fail "Receive in-flig
 jq -e '.items[0].amount == "60" and (.items[0].amount | type == "string")' \
   <<<"$send_prepared" >/dev/null || fail "Send Operation collection is invalid"
 jq -e '.items == []' <<<"$send_in_flight" >/dev/null || fail "Send in-flight collection is invalid"
+
+send_max=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/max?mintUrl=https%3A%2F%2Fmint.one&unit=sat") \
+  || fail "daemon-calculated Send Max failed"
+jq -e '
+  . == {
+    mintUrl: "https://mint.one",
+    unit: "sat",
+    spendable: "90071992547409931234567890",
+    maxAmount: "90071992547409931234567890",
+    fee: "0",
+    needsSwap: false
+  }
+  and (.maxAmount | type == "string")
+' <<<"$send_max" >/dev/null || fail "Send Max was not returned losslessly by cocod"
+
+send_mint='https://mint.send.test'
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"100","reserved":"0","total":"100"}]},
+    "mints":{"items":[{"mintUrl":"https://mint.send.test","name":"Send Mint","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}]},
+    "sendPrepared":{"items":[]},
+    "sendInFlight":{"items":[]}
+  }' "$base_url/__test__/resources" >/dev/null \
+  || fail "could not establish funded Send resources"
+
+for invalid_amount in 0 01 -1 1.5; do
+  invalid_send=$(jq -cn --arg mint "$send_mint" --arg amount "$invalid_amount" \
+    '{mintUrl:$mint,unit:"sat",amount:$amount}' \
+    | curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+        -H 'Content-Type: application/json' --data-binary @- \
+        "$base_url/v1/operations/send")
+  [[ ${invalid_send##*$'\n'} == 400 ]] \
+    || fail "Send accepted invalid decimal amount $invalid_amount"
+  jq -e '.error.code == "invalid_request"' <<<"${invalid_send%$'\n'*}" >/dev/null \
+    || fail "invalid Send amount did not use a stable error code"
+done
+
+prepared_send=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -fsS -D "$operation_headers" "${auth[@]}" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$base_url/v1/operations/send") || fail "Send preparation failed"
+prepared_send_id=$(jq -er '.id' <<<"$prepared_send")
+jq -e --arg id "$prepared_send_id" --arg mint "$send_mint" '
+  . == {
+    id:$id,type:"send",state:"prepared",mintUrl:$mint,unit:"sat",
+    amount:"60",fee:"2",inputAmount:"70",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"
+  }
+  and ([.amount,.fee,.inputAmount] | all(type == "string"))
+' <<<"$prepared_send" >/dev/null || fail "Send preparation did not return a safe Prepared Send"
+rg -q '^HTTP/.* 201' "$operation_headers" \
+  || fail "Send preparation did not return 201 Created"
+rg -qi '^Location: /v1/operations/send/' "$operation_headers" \
+  || fail "Send preparation omitted its canonical Location"
+reserved_send_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"30",reserved:"70",total:"100"}]
+' <<<"$reserved_send_balances" >/dev/null \
+  || fail "Prepared Send did not reserve inputs in canonical balances"
+canonical_prepared_send=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/$prepared_send_id")
+[[ $canonical_prepared_send == "$prepared_send" ]] \
+  || fail "canonical Send resource disagreed with preparation"
+
+cancelled_send=$(curl -fsS "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$prepared_send_id/cancel") \
+  || fail "Prepared Send cancellation failed"
+jq -e --arg id "$prepared_send_id" \
+  '.id == $id and .state == "rolled_back"' <<<"$cancelled_send" >/dev/null \
+  || fail "Send cancellation did not return the rolled-back Operation"
+released_send_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"100",reserved:"0",total:"100"}]
+' <<<"$released_send_balances" >/dev/null \
+  || fail "Send cancellation did not release its reservation"
+jq -e '.items == []' \
+  <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/prepared")" >/dev/null \
+  || fail "cancelled Send remained in the Prepared Send collection"
+
+stale_max=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/max?mintUrl=https%3A%2F%2Fmint.send.test&unit=sat")
+jq -e '.maxAmount == "100"' <<<"$stale_max" >/dev/null \
+  || fail "stale-Max fixture did not begin at 100 sats"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"50","reserved":"0","total":"50"}]}}' \
+  "$base_url/__test__/resources" >/dev/null
+stale_prepare=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$base_url/v1/operations/send")
+[[ ${stale_prepare##*$'\n'} == 409 ]] \
+  || fail "stale Send Max did not fail preparation"
+jq -e '.error.code == "insufficient_balance"' \
+  <<<"${stale_prepare%$'\n'*}" >/dev/null \
+  || fail "stale Send Max failure was not actionable"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"100","reserved":"0","total":"100"}]}}' \
+  "$base_url/__test__/resources" >/dev/null
+max_prepared_send=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"100"}' \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$base_url/v1/operations/send") \
+  || fail "exact Send Max preparation failed"
+max_prepared_send_id=$(jq -er '.id' <<<"$max_prepared_send")
+jq -e '.amount == "100" and .fee == "0" and .inputAmount == "100"
+  and .needsSwap == false' <<<"$max_prepared_send" >/dev/null \
+  || fail "exact Send Max was recalculated by the client fixture"
+executed_send=$(curl -fsS -D "$command_headers" "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$max_prepared_send_id/execute") \
+  || fail "Prepared Send execution failed"
+send_token=$(jq -er '.result.token | select(type == "string" and length > 0)' \
+  <<<"$executed_send") || fail "Send execution omitted its outgoing token"
+jq -e --arg id "$max_prepared_send_id" '
+  .operation.id == $id and .operation.state == "pending"
+  and .operation.amount == "100" and .operation.fee == "0"
+  and (.operation | has("token") | not)
+' <<<"$executed_send" >/dev/null \
+  || fail "Send execution mixed its sensitive result into the Operation"
+rg -qi '^Cache-Control: no-store' "$command_headers" \
+  || fail "Send execution result is cacheable"
+safe_send_lookup=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/$max_prepared_send_id")
+safe_send_in_flight=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/in-flight")
+send_status=$(curl -fsS "$base_url/__test__/status")
+if rg -Fq "$send_token" <<<"$safe_send_lookup$safe_send_in_flight$send_status" \
+    || rg -Fq "$send_token" "$daemon_log" "$stream_output"; then
+  fail "outgoing Send token escaped its immediate execution result"
+fi
 
 receive_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ'
 cancel_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jYW5jZWwifQ'
