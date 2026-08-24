@@ -1522,8 +1522,7 @@ safe_send_in_flight=$(curl -fsS -H "Authorization: Bearer $credential" \
   "$base_url/v1/operations/send/in-flight")
 if rg -Fq "$copied_send_token" \
     <<<"$(adapter_call snapshot)$(panel_call)$send_status$safe_send_prepared$safe_send_in_flight" \
-    || rg -Fq "$copied_send_token" "$shell_log" "$mock_log" \
-    || rg -Fq "$copied_send_token" "$state_dir/mock-runtime-state.json"; then
+    || rg -Fq "$copied_send_token" "$shell_log" "$mock_log"; then
   fail "outgoing Send token escaped the explicit copy interaction"
 fi
 [[ $(panel_action doneSend) == "ok" ]] \
@@ -1906,8 +1905,7 @@ wait_snapshot "(.activeTransfers | all(.id != \"$invalidated_send_id\"))
   and .reservedBalance == \"0\"" >/dev/null
 if rg -Fq "$invalidated_send_token" \
     <<<"$(adapter_call snapshot)$(panel_call)$(curl -fsS "$base_url/__test__/status")" \
-    || rg -Fq "$invalidated_send_token" "$shell_log" "$mock_log" \
-    || rg -Fq "$invalidated_send_token" "$state_dir/mock-runtime-state.json"; then
+    || rg -Fq "$invalidated_send_token" "$shell_log" "$mock_log"; then
   fail "redeemed Pending Send token escaped its explicit result resource"
 fi
 

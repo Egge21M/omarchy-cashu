@@ -205,7 +205,6 @@ class MockState:
         self.send_operation_sequence = 0
         self.send_operations: dict[str, dict[str, Any]] = {}
         self.send_results: dict[str, str] = {}
-        self.send_result_operation_ids: set[str] = set()
         self.send_create_error = ""
         self.send_create_empty_id = False
         self.send_create_interruption = "none"
@@ -245,16 +244,14 @@ class MockState:
         send_operations = value.get("sendOperations")
         if isinstance(send_operations, dict):
             self.send_operations = copy.deepcopy(send_operations)
-        send_result_operation_ids = value.get("sendResultOperationIds")
-        if isinstance(send_result_operation_ids, list):
-            self.send_result_operation_ids = {
-                str(operation_id)
-                for operation_id in send_result_operation_ids
-                if str(operation_id) in self.send_operations
-            }
+        send_results = value.get("sendResults")
+        if isinstance(send_results, dict):
             self.send_results = {
-                operation_id: self._send_token(operation_id)
-                for operation_id in self.send_result_operation_ids
+                str(operation_id): token
+                for operation_id, token in send_results.items()
+                if str(operation_id) in self.send_operations
+                and isinstance(token, str)
+                and token
             }
         input_digests = value.get("receiveInputDigests")
         if isinstance(input_digests, dict):
@@ -293,9 +290,9 @@ class MockState:
             "receiveOperationSequence": self.receive_operation_sequence,
             "sendOperations": self.send_operations,
             "sendOperationSequence": self.send_operation_sequence,
-            # Result ownership is durable, while the deterministic fixture
-            # reconstructs bearer material instead of writing it to disk.
-            "sendResultOperationIds": sorted(self.send_result_operation_ids),
+            # This private mode-0600 state models the result retained by Coco's
+            # durable Operation. Safe resources and diagnostics never expose it.
+            "sendResults": self.send_results,
             "receiveRecoveryOutcomes": self.receive_recovery_outcomes,
             # One-way fixture digests preserve replay behavior without retaining
             # encoded Cashu token material.
@@ -810,7 +807,6 @@ class MockState:
                         )
                     self.send_operations.pop(operation_id, None)
                     self.send_results.pop(operation_id, None)
-                    self.send_result_operation_ids.discard(operation_id)
                     self._persist_locked()
                     return 404, error_document(
                         "operation_not_found", "The Send does not exist"
@@ -871,7 +867,6 @@ class MockState:
                 self.resources["sendInFlight"]["items"].append(copy.deepcopy(operation))
                 token = self._send_token(operation_id)
                 self.send_results[operation_id] = token
-                self.send_result_operation_ids.add(operation_id)
                 response = {
                     "operation": copy.deepcopy(operation),
                     "result": {"token": token},

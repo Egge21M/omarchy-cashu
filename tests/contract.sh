@@ -787,6 +787,18 @@ if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
     "$recovery_base_url/v1/operations/send/$recovery_send_id/execute" >/dev/null 2>&1; then
   fail "dropped Send execute response returned an optimistic success"
 fi
+retained_send_result_before_restart=$(curl -fsS "${auth[@]}" \
+  "$recovery_base_url/v1/operations/send/$recovery_send_id/result") \
+  || fail "committed Send result was unavailable before restart"
+retained_send_token_before_restart=$(jq -er \
+  '.token | select(type == "string" and startswith("cashuA"))' \
+  <<<"$retained_send_result_before_restart") \
+  || fail "committed Send result omitted its original token"
+jq -e --arg id "$recovery_send_id" \
+  --slurpfile state "$recovery_state_dir/mock-runtime-state.json" \
+  '$state[0].sendResults[$id] == .token' \
+  <<<"$retained_send_result_before_restart" >/dev/null \
+  || fail "mock persisted only enough data to regenerate the Send result"
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"receiveInterruption":"before_commit"}' \
@@ -856,6 +868,8 @@ recovered_send_result=$(curl -fsS -D "$result_headers" "${auth[@]}" \
 recovered_send_token=$(jq -er '.token | select(type == "string" and startswith("cashuA"))' \
   <<<"$recovered_send_result") \
   || fail "recovered Send result omitted its token"
+[[ $recovered_send_token == "$retained_send_token_before_restart" ]] \
+  || fail "restart regenerated a different Send bearer result"
 [[ $(curl -fsS "${auth[@]}" \
   "$recovery_base_url/v1/operations/send/$recovery_send_id/result") \
   == "$recovered_send_result" ]] \
@@ -916,10 +930,8 @@ jq -e '
   || fail "restart replay created or re-executed an Operation"
 if rg -Fq "$receive_token" "$recovery_state_dir/mock-runtime-state.json" \
     || rg -Fq "$cancel_token" "$recovery_state_dir/mock-runtime-state.json" \
-    || rg -Fq "$recovered_send_token" "$recovery_state_dir/mock-runtime-state.json" \
-    || rg -q 'cashuA' "$recovery_state_dir/mock-runtime-state.json" \
     || rg -qi 'proof|credential|mnemonic' "$recovery_state_dir/mock-runtime-state.json"; then
-  fail "durable recovery fixture persisted sensitive Wallet material"
+  fail "durable recovery fixture persisted sensitive material outside its Send result"
 fi
 
 echo "contract: cocod v1 auth, lifecycle, resources, decimal strings, errors, SSE, and redaction passed"
