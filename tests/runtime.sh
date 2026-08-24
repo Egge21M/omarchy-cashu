@@ -927,6 +927,10 @@ wait_snapshot '
   and .trustedMintCount == 2
 ' >/dev/null
 panel_action openPanel >/dev/null
+wait_panel_snapshot '.opened == true
+  and .walletState == "unlocked"
+  and .sendViewState == "closed"
+  and .receiveViewState == "closed"' >/dev/null
 [[ $(panel_action openSend) == "ok" ]] \
   || fail "Send entry point was unavailable"
 wait_panel_snapshot '
@@ -1276,29 +1280,19 @@ for external_send_state in removed pending; do
   prepare_send_flow 60
   external_send_id=$(curl -fsS -H "Authorization: Bearer $credential" \
     "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
-  external_send_operation=$(curl -fsS -H "Authorization: Bearer $credential" \
-    "$base_url/v1/operations/send/prepared" | jq -c '.items[0]')
   before_external_cancel=$(curl -fsS "$base_url/__test__/status" \
     | jq -r '.sendCancelRequests')
   if [[ $external_send_state == pending ]]; then
-    external_send_in_flight=$(jq -c '.state = "pending"' \
-      <<<"$external_send_operation")
+    curl -fsS -H "Authorization: Bearer $credential" -X POST \
+      -H 'Content-Type: application/json' --data '{}' \
+      "$base_url/v1/operations/send/$external_send_id/execute" >/dev/null
     external_send_error=operation_conflict
   else
-    external_send_in_flight='null'
+    curl -fsS -X POST -H 'Content-Type: application/json' \
+      --data "$(jq -cn --arg id "$external_send_id" '{operationId:$id}')" \
+      "$base_url/__test__/remove-send" >/dev/null
     external_send_error=operation_not_found
   fi
-  jq -cn --arg id "$external_send_id" --argjson inFlight "$external_send_in_flight" '
-    {
-      sendPrepared:{items:[]},
-      sendInFlight:{items:(if $inFlight == null then [] else [$inFlight] end)},
-      event:{
-        type:"operation.updated",timestamp:"2026-08-20T12:06:30Z",
-        data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
-      }
-    }
-  ' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
-    "$base_url/__test__/resources" >/dev/null
   wait_panel_snapshot ".sendViewState == \"error\"
     and .sendErrorCode == \"$external_send_error\"
     and .sendReviewAmount == \"\"" >/dev/null
@@ -1784,6 +1778,255 @@ wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
 echo "runtime: stale Send Max, structured errors, and lossless decimal strings passed"
 
+fund_send_fixture 100
+prepare_send_flow 60
+before_dropped_send=$(curl -fsS "$base_url/__test__/status")
+before_dropped_send_creates=$(jq -r '.sendCreateRequests' <<<"$before_dropped_send")
+before_dropped_send_executes=$(jq -r '.sendExecuteRequests' <<<"$before_dropped_send")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendExecuteInterruption":"after_commit"}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action confirmSend >/dev/null
+wait_mock_status ".sendExecuteRequests == $((before_dropped_send_executes + 1))" >/dev/null
+wait_panel_snapshot '.sendViewState == "error"
+  and .sendErrorCode == "transport_unavailable"' >/dev/null
+adapter_call reconnect >/dev/null
+wait_panel_snapshot '.sendViewState == "result"
+  and .sendCopyAvailable == true
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"
+  and .activeTransferCount == 1
+  and .activeTransferStateLabel == "Pending Send"' >/dev/null
+wait_mock_status ".sendCreateRequests == $before_dropped_send_creates
+  and .sendExecuteRequests == $((before_dropped_send_executes + 1))
+  and .sendResultRequests >= 1" >/dev/null
+panel_action doneSend >/dev/null
+wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+panel_action closePanel >/dev/null
+
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
+  quickshell --no-color -p "$shell_qml" >>"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '.connectionState == "connected"
+  and .activeTransfers[0].state == "pending"
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"' >/dev/null
+panel_action openPanel >/dev/null
+wait_panel_snapshot '.opened == true
+  and .walletState == "unlocked"
+  and .sendViewState == "closed"
+  and .receiveViewState == "closed"' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultUnavailableResponses":1}' \
+  "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action openSend) == "ok" ]] \
+  || fail "reloaded Pending Send could not be reopened"
+wait_panel_snapshot '.sendViewState == "pending"
+  and .sendErrorCode == "result_not_available"
+  and .sendError != ""
+  and .sendCopyAvailable == false
+  and .activeTransferStateLabel == "Pending Send"' >/dev/null
+[[ $(panel_action retrySend) == "ok" ]] \
+  || fail "retryable Pending Send result could not be requested again"
+wait_panel_snapshot '.sendViewState == "result"
+  and .sendCopyAvailable == true' >/dev/null
+wait_mock_status ".sendCreateRequests == $before_dropped_send_creates
+  and .sendExecuteRequests == $((before_dropped_send_executes + 1))
+  and .sendResultRequests >= 3" >/dev/null
+[[ $(panel_action beginReclaimSend) == "ok" ]] \
+  || fail "Pending Send did not offer Reclaim"
+wait_panel_snapshot '.sendViewState == "reclaim-warning"
+  and .sendReclaimWarningVisible == true
+  and (.sendReclaimWarning | test("race"; "i"))' >/dev/null
+[[ $(panel_action confirmReclaimSend) == "ok" ]] \
+  || fail "warned Pending Send Reclaim could not begin"
+wait_panel_snapshot '.sendViewState == "reclaimed"
+  and .spendableBalance == "100"
+  and .reservedBalance == "0"
+  and .activeTransferCount == 0
+  and .sendCopyAvailable == false' >/dev/null
+panel_action doneSend >/dev/null
+wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+panel_action closePanel >/dev/null
+
+echo "runtime: dropped Send recovery, reload, explicit result, and warned Reclaim passed"
+
+fund_send_fixture 100
+invalidated_send=$(jq -cn '{mintUrl:"https://mint.one",unit:"sat",amount:"60"}' \
+  | curl -fsS -H "Authorization: Bearer $credential" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$base_url/v1/operations/send")
+invalidated_send_id=$(jq -er '.id' <<<"$invalidated_send")
+invalidated_send_execution=$(curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$invalidated_send_id/execute")
+invalidated_send_token=$(jq -er '.result.token' <<<"$invalidated_send_execution")
+adapter_call reconnect >/dev/null
+wait_snapshot ".activeTransfers[0].id == \"$invalidated_send_id\"
+  and .activeTransfers[0].state == \"pending\"
+  and .spendableBalance == \"30\"
+  and .reservedBalance == \"70\"" >/dev/null
+before_send_invalidation=$(curl -fsS "$base_url/__test__/status")
+before_send_lookup=$(jq -r '.sendLookupRequests' <<<"$before_send_invalidation")
+before_send_refresh=$(jq -r '.sendRefreshRequests' <<<"$before_send_invalidation")
+before_send_balance=$(jq -r '.resourceRequests.balances' <<<"$before_send_invalidation")
+before_send_invalidation_creates=$(jq -r '.sendCreateRequests' <<<"$before_send_invalidation")
+before_send_invalidation_executes=$(jq -r '.sendExecuteRequests' <<<"$before_send_invalidation")
+for _duplicate in 1 2; do
+  jq -cn --arg id "$invalidated_send_id" '{event:{
+    type:"operation.updated",timestamp:"2026-08-20T12:08:00Z",
+    data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
+  }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
+    "$base_url/__test__/resources" >/dev/null
+done
+wait_mock_status ".sendLookupRequests > $before_send_lookup
+  and .sendRefreshRequests > $before_send_refresh
+  and .resourceRequests.balances > $before_send_balance
+  and .sendCreateRequests == $before_send_invalidation_creates
+  and .sendExecuteRequests == $before_send_invalidation_executes" >/dev/null
+after_operation_invalidation=$(curl -fsS "$base_url/__test__/status")
+after_operation_lookup=$(jq -r '.sendLookupRequests' <<<"$after_operation_invalidation")
+after_operation_refresh=$(jq -r '.sendRefreshRequests' <<<"$after_operation_invalidation")
+jq -cn '{event:{
+  type:"balance.updated",timestamp:"2026-08-20T12:08:01Z",
+  data:{mintUrl:"https://mint.one"}
+}}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
+  "$base_url/__test__/resources" >/dev/null
+wait_mock_status ".sendLookupRequests > $after_operation_lookup
+  and .sendRefreshRequests > $after_operation_refresh" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$invalidated_send_id" '{operationId:$id}')" \
+  "$base_url/__test__/redeem-send" >/dev/null \
+  || fail "recipient redemption fixture failed"
+wait_snapshot "(.activeTransfers | all(.id != \"$invalidated_send_id\"))
+  and .spendableBalance == \"30\"
+  and .reservedBalance == \"0\"" >/dev/null
+if rg -Fq "$invalidated_send_token" \
+    <<<"$(adapter_call snapshot)$(panel_call)$(curl -fsS "$base_url/__test__/status")" \
+    || rg -Fq "$invalidated_send_token" "$shell_log" "$mock_log" \
+    || rg -Fq "$invalidated_send_token" "$state_dir/mock-runtime-state.json"; then
+  fail "redeemed Pending Send token escaped its explicit result resource"
+fi
+
+echo "runtime: operation and proof-change Send invalidations and recipient redemption passed"
+
+fund_send_fixture 100
+prepare_send_flow 60
+panel_action confirmSend >/dev/null
+wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
+  and .activeTransferStateLabel == "Pending Send"
+  and .sendReclaimAvailable == true
+  and .sendOperationId != ""' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action beginReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
+panel_action confirmReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "error"
+  and .sendErrorCode == "reclaim_inconclusive"
+  and (.sendError | test("recoverable"; "i"))
+  and .sendCopyAvailable == false
+  and .activeTransferStateLabel == "Pending Send"
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"' >/dev/null
+panel_action retrySend >/dev/null
+wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
+  and .activeTransferStateLabel == "Pending Send"
+  and .sendReclaimAvailable == true' >/dev/null
+panel_action beginReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
+recipient_race_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$recipient_race_id" \
+    '{operationId:$id,suppressEvents:true}')" \
+  "$base_url/__test__/redeem-send" >/dev/null \
+  || fail "concurrent recipient redemption fixture failed"
+panel_action confirmReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "error"
+  and .sendErrorCode == "recipient_won"
+  and (.sendError | test("recipient"; "i"))
+  and .sendCopyAvailable == false
+  and .activeTransferCount == 0
+  and .spendableBalance == "30"
+  and .reservedBalance == "0"' >/dev/null
+panel_action cancelSend >/dev/null
+wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+
+fund_send_fixture 100
+prepare_send_flow 60
+panel_action confirmSend >/dev/null
+wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
+  and .activeTransferStateLabel == "Pending Send"
+  and .sendReclaimAvailable == true' >/dev/null
+pending_unavailable_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendRefreshError":"mint_unavailable"}' \
+  "$base_url/__test__/mode" >/dev/null
+jq -cn --arg id "$pending_unavailable_id" '{event:{
+  type:"operation.updated",timestamp:"2026-08-20T12:09:00Z",
+  data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
+}}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
+  "$base_url/__test__/resources" >/dev/null
+wait_panel_snapshot '.sendViewState == "error"
+  and .sendErrorCode == "mint_unavailable"
+  and .sendCopyAvailable == false
+  and .activeTransferStateLabel == "Pending Send"
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"' >/dev/null
+panel_action retrySend >/dev/null
+wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true' >/dev/null
+panel_action beginReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
+panel_action confirmReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaimed"
+  and .spendableBalance == "100" and .reservedBalance == "0"' >/dev/null
+panel_action doneSend >/dev/null
+panel_action closePanel >/dev/null
+
+for reclaim_error in operation_conflict operation_not_found; do
+  fund_send_fixture 100
+  prepare_send_flow 60
+  panel_action confirmSend >/dev/null
+  wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
+    and .activeTransferStateLabel == "Pending Send"
+    and .sendReclaimAvailable == true' >/dev/null
+  curl -fsS -X POST -H 'Content-Type: application/json' \
+    --data "$(jq -cn --arg outcome "$reclaim_error" \
+      '{sendReclaimOutcome:$outcome}')" \
+    "$base_url/__test__/mode" >/dev/null
+  panel_action beginReclaimSend >/dev/null
+  wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
+  panel_action confirmReclaimSend >/dev/null
+  wait_panel_snapshot ".sendViewState == \"error\"
+    and .sendErrorCode == \"$reclaim_error\"
+    and .sendError != \"\"" >/dev/null
+  if [[ $reclaim_error == operation_conflict ]]; then
+    wait_panel_snapshot '.activeTransferStateLabel == "Pending Send"
+      and .spendableBalance == "30" and .reservedBalance == "70"' >/dev/null
+    panel_action retrySend >/dev/null
+    wait_panel_snapshot '.sendViewState == "result"' >/dev/null
+    panel_action beginReclaimSend >/dev/null
+    wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
+    panel_action confirmReclaimSend >/dev/null
+    wait_panel_snapshot '.sendViewState == "reclaimed"' >/dev/null
+    panel_action doneSend >/dev/null
+  else
+    wait_panel_snapshot '.activeTransferCount == 0
+      and .spendableBalance == "100" and .reservedBalance == "0"' >/dev/null
+    panel_action cancelSend >/dev/null
+  fi
+  wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+  panel_action closePanel >/dev/null
+done
+
+echo "runtime: Pending Send Reclaim outcomes and recoverable errors passed"
+
 kill "$shell_pid"
 wait "$shell_pid" 2>/dev/null || true
 shell_pid=""
@@ -1823,24 +2066,32 @@ wait_mock_status \
    and .resourceRequests.mints == $before_mint_requests" >/dev/null
 
 before_operation=$(curl -fsS "$base_url/__test__/status")
-before_send_prepared=$(jq -r '.resourceRequests.sendPrepared' <<<"$before_operation")
-before_send_in_flight=$(jq -r '.resourceRequests.sendInFlight' <<<"$before_operation")
+before_send_lookup=$(jq -r '.sendLookupRequests' <<<"$before_operation")
+before_send_refresh=$(jq -r '.sendRefreshRequests' <<<"$before_operation")
+before_send_balance=$(jq -r '.resourceRequests.balances' <<<"$before_operation")
 before_receive_prepared=$(jq -r '.resourceRequests.receivePrepared' <<<"$before_operation")
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{
-    "sendPrepared":{"items":[{"id":"send-1","type":"send","state":"prepared","mintUrl":"https://mint.one","unit":"sat","amount":"60","fee":"2","inputAmount":"70","needsSwap":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}]},
-    "event":{"type":"operation.updated","timestamp":"2026-08-20T12:01:01Z","data":{"operationType":"send","operationId":"send-1","mintUrl":"https://mint.one"}}
-  }' "$base_url/__test__/resources" >/dev/null
-wait_snapshot '
+canonical_invalidation_send=$(jq -cn \
+  '{mintUrl:"https://mint.one",unit:"sat",amount:"60"}' \
+  | curl -fsS -H "Authorization: Bearer $credential" -X POST \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$base_url/v1/operations/send")
+canonical_invalidation_send_id=$(jq -er '.id' <<<"$canonical_invalidation_send")
+wait_snapshot "
   (.activeTransfers | length) == 1
-  and .activeTransfers[0].id == "send-1"
-  and .activeTransfers[0].amount == "60"
+  and .activeTransfers[0].id == \"$canonical_invalidation_send_id\"
+  and .activeTransfers[0].amount == \"60\"
   and .barActive == true
-' >/dev/null
+" >/dev/null
 wait_mock_status \
-  ".resourceRequests.sendPrepared > $before_send_prepared
-   and .resourceRequests.sendInFlight > $before_send_in_flight
+  ".sendLookupRequests > $before_send_lookup
+   and .sendRefreshRequests > $before_send_refresh
+   and .resourceRequests.balances > $before_send_balance
    and .resourceRequests.receivePrepared == $before_receive_prepared" >/dev/null
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$canonical_invalidation_send_id/cancel" >/dev/null
+wait_snapshot ".activeTransfers | all(.id != \"$canonical_invalidation_send_id\")" \
+  >/dev/null
 
 before_mint=$(curl -fsS "$base_url/__test__/status")
 before_mint_requests=$(jq -r '.resourceRequests.mints' <<<"$before_mint")

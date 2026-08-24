@@ -197,15 +197,23 @@ class MockState:
         self.send_create_delay_ms = 0
         self.send_execute_requests = 0
         self.send_cancel_requests = 0
+        self.send_reclaim_requests = 0
+        self.send_refresh_requests = 0
         self.send_lookup_requests = 0
+        self.send_result_requests = 0
+        self.send_result_unavailable_responses = 0
         self.send_operation_sequence = 0
         self.send_operations: dict[str, dict[str, Any]] = {}
         self.send_results: dict[str, str] = {}
+        self.send_result_operation_ids: set[str] = set()
         self.send_create_error = ""
         self.send_create_empty_id = False
         self.send_create_interruption = "none"
         self.send_command_error = ""
         self.send_cancel_error = ""
+        self.send_reclaim_outcome = "success"
+        self.send_refresh_error = ""
+        self.send_execute_interruption = "none"
         self.send_command_delay_ms = 0
         self.send_prepared_failures = 0
         self.suppress_next_send_events = False
@@ -237,6 +245,17 @@ class MockState:
         send_operations = value.get("sendOperations")
         if isinstance(send_operations, dict):
             self.send_operations = copy.deepcopy(send_operations)
+        send_result_operation_ids = value.get("sendResultOperationIds")
+        if isinstance(send_result_operation_ids, list):
+            self.send_result_operation_ids = {
+                str(operation_id)
+                for operation_id in send_result_operation_ids
+                if str(operation_id) in self.send_operations
+            }
+            self.send_results = {
+                operation_id: self._send_token(operation_id)
+                for operation_id in self.send_result_operation_ids
+            }
         input_digests = value.get("receiveInputDigests")
         if isinstance(input_digests, dict):
             self.receive_token_keys = {
@@ -274,6 +293,9 @@ class MockState:
             "receiveOperationSequence": self.receive_operation_sequence,
             "sendOperations": self.send_operations,
             "sendOperationSequence": self.send_operation_sequence,
+            # Result ownership is durable, while the deterministic fixture
+            # reconstructs bearer material instead of writing it to disk.
+            "sendResultOperationIds": sorted(self.send_result_operation_ids),
             "receiveRecoveryOutcomes": self.receive_recovery_outcomes,
             # One-way fixture digests preserve replay behavior without retaining
             # encoded Cashu token material.
@@ -559,6 +581,34 @@ class MockState:
             operation = self.send_operations.get(operation_id)
             return copy.deepcopy(operation) if operation else None
 
+    @staticmethod
+    def _send_token(operation_id: str) -> str:
+        return "cashuAeyJ0ZXN0Ijoic2xpY2UtNSIsIm9wIjoi" + operation_id + "In0"
+
+    def send_result(self, operation_id: str) -> tuple[int, dict[str, Any]]:
+        with self.lock:
+            self.send_result_requests += 1
+            operation = self.send_operations.get(operation_id)
+            if operation is None:
+                return 404, error_document(
+                    "operation_not_found", "The Send does not exist"
+                )
+            if self.send_result_unavailable_responses > 0:
+                self.send_result_unavailable_responses -= 1
+                return 409, error_document(
+                    "result_not_available",
+                    "The Send result is not available yet",
+                    True,
+                )
+            token = self.send_results.get(operation_id)
+            if token is None:
+                return 409, error_document(
+                    "result_not_available",
+                    "The Send result is not available yet",
+                    True,
+                )
+            return 200, {"token": token}
+
     def create_send(
         self, value: object
     ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
@@ -667,11 +717,20 @@ class MockState:
                 self.send_execute_requests += 1
             elif command == "cancel":
                 self.send_cancel_requests += 1
+            elif command == "reclaim":
+                self.send_reclaim_requests += 1
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 return 404, error_document("operation_not_found", "The Send does not exist"), []
-            if operation["state"] != "prepared":
-                return 409, error_document("operation_conflict", "The Send is not prepared"), []
+            if command == "reclaim" and operation["state"] == "finalized":
+                return 409, error_document(
+                    "recipient_won", "The recipient redeemed the Send first"
+                ), []
+            expected_state = "pending" if command == "reclaim" else "prepared"
+            if operation["state"] != expected_state:
+                return 409, error_document(
+                    "operation_conflict", f"The Send is not {expected_state}"
+                ), []
             forced_error = (
                 self.send_command_error
                 if command == "execute"
@@ -710,9 +769,56 @@ class MockState:
                 return 404, error_document(
                     "operation_not_found", "The Send does not exist"
                 ), []
-            self.resources["sendPrepared"]["items"] = [
+            if command == "reclaim":
+                reclaim_outcome = self.send_reclaim_outcome
+                self.send_reclaim_outcome = "success"
+                if reclaim_outcome == "reclaim_inconclusive":
+                    return 503, error_document(
+                        "reclaim_inconclusive",
+                        "The Mint could not establish whether Reclaim succeeded",
+                        True,
+                    ), []
+                if reclaim_outcome == "operation_conflict":
+                    return 409, error_document(
+                        "operation_conflict", "The Send changed before Reclaim"
+                    ), []
+                if reclaim_outcome == "operation_not_found":
+                    self.resources["sendInFlight"]["items"] = [
+                        item
+                        for item in self.resources["sendInFlight"]["items"]
+                        if item.get("id") != operation_id
+                    ]
+                    balance = next(
+                        (
+                            item
+                            for item in self.resources["balances"]["items"]
+                            if item.get("mintUrl") == operation["mintUrl"]
+                            and item.get("unit") == operation["unit"]
+                        ),
+                        None,
+                    )
+                    if balance is not None:
+                        released = int(operation["inputAmount"])
+                        balance["spendable"] = str(
+                            int(balance["spendable"]) + released
+                        )
+                        balance["reserved"] = str(
+                            int(balance["reserved"]) - released
+                        )
+                        balance["total"] = str(
+                            int(balance["spendable"]) + int(balance["reserved"])
+                        )
+                    self.send_operations.pop(operation_id, None)
+                    self.send_results.pop(operation_id, None)
+                    self.send_result_operation_ids.discard(operation_id)
+                    self._persist_locked()
+                    return 404, error_document(
+                        "operation_not_found", "The Send does not exist"
+                    ), []
+            collection = "sendInFlight" if command == "reclaim" else "sendPrepared"
+            self.resources[collection]["items"] = [
                 item
-                for item in self.resources["sendPrepared"]["items"]
+                for item in self.resources[collection]["items"]
                 if item.get("id") != operation_id
             ]
             balance = next(
@@ -734,7 +840,23 @@ class MockState:
                     },
                 )
             ]
-            if command == "cancel":
+            if command == "reclaim" and reclaim_outcome == "recipient_won":
+                operation["state"] = "finalized"
+                operation["updatedAt"] = FIXED_TIME
+                if balance is not None:
+                    spent = int(operation["inputAmount"])
+                    balance["reserved"] = str(int(balance["reserved"]) - spent)
+                    balance["total"] = str(
+                        int(balance["spendable"]) + int(balance["reserved"])
+                    )
+                events.append(
+                    self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]})
+                )
+                self._persist_locked()
+                return 409, error_document(
+                    "recipient_won", "The recipient redeemed the Send first"
+                ), events
+            if command in ("cancel", "reclaim"):
                 operation["state"] = "rolled_back"
                 if balance is not None:
                     released = int(operation["inputAmount"])
@@ -747,8 +869,9 @@ class MockState:
             else:
                 operation["state"] = "pending"
                 self.resources["sendInFlight"]["items"].append(copy.deepcopy(operation))
-                token = "cashuAeyJ0ZXN0Ijoic2xpY2UtNSIsIm9wIjoi" + operation_id + "In0"
+                token = self._send_token(operation_id)
                 self.send_results[operation_id] = token
+                self.send_result_operation_ids.add(operation_id)
                 response = {
                     "operation": copy.deepcopy(operation),
                     "result": {"token": token},
@@ -759,7 +882,150 @@ class MockState:
             suppress_events = command == "execute" and self.suppress_next_send_execute_events
             if suppress_events:
                 self.suppress_next_send_execute_events = False
+            interruption = self.send_execute_interruption if command == "execute" else "none"
+            if command == "execute":
+                self.send_execute_interruption = "none"
+        if interruption == "after_commit":
+            return 0, {}, []
         return 200, response, [] if suppress_events else events
+
+    def refresh_send(
+        self, operation_id: str
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        with self.lock:
+            self.send_refresh_requests += 1
+            operation = self.send_operations.get(operation_id)
+            if operation is None:
+                return 404, error_document(
+                    "operation_not_found", "The Send does not exist"
+                ), []
+            forced_error = self.send_refresh_error
+            self.send_refresh_error = ""
+            if forced_error:
+                status = 503 if forced_error == "mint_unavailable" else 409
+                return status, error_document(
+                    forced_error,
+                    "The Send could not be refreshed",
+                    forced_error == "mint_unavailable",
+                ), []
+            result = copy.deepcopy(operation)
+        event = self.safe_event(
+            "operation.updated",
+            {
+                "operationType": "send",
+                "operationId": operation_id,
+                "mintUrl": result["mintUrl"],
+            },
+        )
+        return 200, result, [event]
+
+    def redeem_send(
+        self, operation_id: object
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        if not isinstance(operation_id, str) or not operation_id:
+            return 400, error_document(
+                "invalid_request", "A Send Operation ID is required"
+            ), []
+        with self.lock:
+            operation = self.send_operations.get(operation_id)
+            if operation is None:
+                return 404, error_document(
+                    "operation_not_found", "The Send does not exist"
+                ), []
+            if operation["state"] != "pending":
+                return 409, error_document(
+                    "operation_conflict", "The Send is not pending"
+                ), []
+            operation["state"] = "finalized"
+            operation["updatedAt"] = FIXED_TIME
+            self.resources["sendInFlight"]["items"] = [
+                item
+                for item in self.resources["sendInFlight"]["items"]
+                if item.get("id") != operation_id
+            ]
+            balance = next(
+                (
+                    item
+                    for item in self.resources["balances"]["items"]
+                    if item.get("mintUrl") == operation["mintUrl"]
+                    and item.get("unit") == operation["unit"]
+                ),
+                None,
+            )
+            if balance is not None:
+                balance["reserved"] = str(
+                    int(balance["reserved"]) - int(operation["inputAmount"])
+                )
+                balance["total"] = str(
+                    int(balance["spendable"]) + int(balance["reserved"])
+                )
+            self._persist_locked()
+            result = copy.deepcopy(operation)
+        events = [
+            self.safe_event(
+                "operation.updated",
+                {
+                    "operationType": "send",
+                    "operationId": operation_id,
+                    "mintUrl": result["mintUrl"],
+                },
+            ),
+            self.safe_event("balance.updated", {"mintUrl": result["mintUrl"]}),
+        ]
+        return 200, result, events
+
+    def remove_send_for_test(
+        self, operation_id: object
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        if not isinstance(operation_id, str) or not operation_id:
+            return 400, error_document(
+                "invalid_request", "A Send Operation ID is required"
+            ), []
+        with self.lock:
+            operation = self.send_operations.pop(operation_id, None)
+            if operation is None:
+                return 404, error_document(
+                    "operation_not_found", "The Send does not exist"
+                ), []
+            self.resources["sendPrepared"]["items"] = [
+                item
+                for item in self.resources["sendPrepared"]["items"]
+                if item.get("id") != operation_id
+            ]
+            self.resources["sendInFlight"]["items"] = [
+                item
+                for item in self.resources["sendInFlight"]["items"]
+                if item.get("id") != operation_id
+            ]
+            balance = next(
+                (
+                    item
+                    for item in self.resources["balances"]["items"]
+                    if item.get("mintUrl") == operation["mintUrl"]
+                    and item.get("unit") == operation["unit"]
+                ),
+                None,
+            )
+            if balance is not None and operation["state"] == "prepared":
+                released = int(operation["inputAmount"])
+                balance["spendable"] = str(int(balance["spendable"]) + released)
+                balance["reserved"] = str(int(balance["reserved"]) - released)
+                balance["total"] = str(
+                    int(balance["spendable"]) + int(balance["reserved"])
+                )
+            self._persist_locked()
+        events = [
+            self.safe_event(
+                "operation.updated",
+                {
+                    "operationType": "send",
+                    "operationId": operation_id,
+                    "mintUrl": operation["mintUrl"],
+                },
+            ),
+            self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]}),
+        ]
+        return 200, {"removed": True}, events
 
     def receive_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -1018,7 +1284,10 @@ class MockState:
                 "sendCreateDelayMs": self.send_create_delay_ms,
                 "sendExecuteRequests": self.send_execute_requests,
                 "sendCancelRequests": self.send_cancel_requests,
+                "sendReclaimRequests": self.send_reclaim_requests,
+                "sendRefreshRequests": self.send_refresh_requests,
                 "sendLookupRequests": self.send_lookup_requests,
+                "sendResultRequests": self.send_result_requests,
                 "sendOperationCount": len(self.send_operations),
                 "sendCommandDelayMs": self.send_command_delay_ms,
             }
@@ -1178,6 +1447,13 @@ class Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 value = copy.deepcopy(self.state.resources[name])
             self.resource_response(name, value)
+            return
+        match = re.fullmatch(r"/v1/operations/send/([^/]+)/result", self.path)
+        if match:
+            if not self.wallet_required():
+                return
+            status, response = self.state.send_result(match.group(1))
+            self.send_json(status, response)
             return
         match = re.fullmatch(r"/v1/operations/receive/([^/]+)", self.path)
         if match:
@@ -1386,10 +1662,66 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.send_cancel_error = cancel_error
+                if "sendReclaimOutcome" in value:
+                    reclaim_outcome = str(value["sendReclaimOutcome"])
+                    if reclaim_outcome not in (
+                        "success",
+                        "reclaim_inconclusive",
+                        "recipient_won",
+                        "operation_conflict",
+                        "operation_not_found",
+                    ):
+                        self.send_json(
+                            400,
+                            error_document("invalid_request", "Invalid Reclaim outcome"),
+                        )
+                        return
+                    self.state.send_reclaim_outcome = reclaim_outcome
+                if "sendRefreshError" in value:
+                    refresh_error = str(value["sendRefreshError"])
+                    if refresh_error not in (
+                        "",
+                        "mint_unavailable",
+                        "operation_conflict",
+                        "operation_not_found",
+                    ):
+                        self.send_json(
+                            400,
+                            error_document("invalid_request", "Invalid Send refresh error"),
+                        )
+                        return
+                    self.state.send_refresh_error = refresh_error
                 if "sendCommandDelayMs" in value:
                     self.state.send_command_delay_ms = max(
                         0, min(5000, int(value["sendCommandDelayMs"]))
                     )
+                if "sendExecuteInterruption" in value:
+                    interruption = str(value["sendExecuteInterruption"])
+                    if interruption not in ("none", "after_commit"):
+                        self.send_json(
+                            400,
+                            error_document(
+                                "invalid_request", "Invalid Send execute interruption"
+                            ),
+                        )
+                        return
+                    self.state.send_execute_interruption = interruption
+                if "sendResultUnavailableResponses" in value:
+                    try:
+                        unavailable_responses = int(
+                            value["sendResultUnavailableResponses"]
+                        )
+                    except (TypeError, ValueError):
+                        unavailable_responses = -1
+                    if unavailable_responses < 0 or unavailable_responses > 10:
+                        self.send_json(
+                            400,
+                            error_document(
+                                "invalid_request", "Invalid unavailable result count"
+                            ),
+                        )
+                        return
+                    self.state.send_result_unavailable_responses = unavailable_responses
                 if value.get("sendPrepareReconcileError") is True:
                     self.state.send_prepared_failures = 1
                     self.state.suppress_next_send_events = True
@@ -1402,6 +1734,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/__test__/disconnect":
             self.state.disconnect_streams()
             self.send_json(200, {"disconnected": True})
+            return
+        if self.path == "/__test__/redeem-send":
+            operation_id = value.get("operationId") if isinstance(value, dict) else None
+            status, response, events = self.state.redeem_send(operation_id)
+            self.send_json(status, response)
+            if not (isinstance(value, dict) and value.get("suppressEvents") is True):
+                self.state.publish_events(events)
+            return
+        if self.path == "/__test__/remove-send":
+            operation_id = value.get("operationId") if isinstance(value, dict) else None
+            status, response, events = self.state.remove_send_for_test(operation_id)
+            self.send_json(status, response)
+            self.state.publish_events(events)
             return
         if not self.path.startswith("/v1/"):
             self.send_json(404, error_document("not_found", "Resource not found"))
@@ -1488,10 +1833,15 @@ class Handler(BaseHTTPRequestHandler):
             self.state.publish_events(events)
             return
         match = re.fullmatch(
-            r"/v1/operations/send/([^/]+)/(execute|cancel)", self.path
+            r"/v1/operations/send/([^/]+)/(execute|cancel|refresh|reclaim)",
+            self.path,
         )
         if match:
             if not self.wallet_required():
+                return
+            if match.group(2) == "refresh":
+                status, response, events = self.state.refresh_send(match.group(1))
+                self.send_json(status, response)
                 return
             with self.state.lock:
                 command_delay_ms = self.state.send_command_delay_ms
@@ -1500,6 +1850,10 @@ class Handler(BaseHTTPRequestHandler):
             status, response, events = self.state.command_send(
                 match.group(1), match.group(2)
             )
+            if status == 0:
+                self.close_connection = True
+                self.state.publish_events(events)
+                return
             self.send_json(status, response)
             self.state.publish_events(events)
             return

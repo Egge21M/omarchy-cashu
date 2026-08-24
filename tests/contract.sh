@@ -20,6 +20,7 @@ preview_headers=$(mktemp)
 operation_headers=$(mktemp)
 mint_headers=$(mktemp)
 command_headers=$(mktemp)
+result_headers=$(mktemp)
 daemon_pid=""
 recovery_daemon_pid=""
 stream_pid=""
@@ -40,6 +41,7 @@ cleanup() {
   rm -f "$daemon_log" "$recovery_daemon_log" "$stream_output" "$stream_headers" \
     "$initialize_headers" "$recovery_headers" "$preview_headers" \
     "$operation_headers" "$mint_headers" "$command_headers"
+  rm -f "$result_headers"
   rm -rf "$state_dir" "$recovery_state_dir"
 }
 trap cleanup EXIT
@@ -311,6 +313,131 @@ if rg -Fq "$send_token" <<<"$safe_send_lookup$safe_send_in_flight$send_status" \
     || rg -Fq "$send_token" "$daemon_log" "$stream_output"; then
   fail "outgoing Send token escaped its immediate execution result"
 fi
+
+recovered_send_result=$(curl -fsS -D "$result_headers" "${auth[@]}" \
+  "$base_url/v1/operations/send/$max_prepared_send_id/result") \
+  || fail "retained Send result was not retrievable"
+[[ $(jq -er '.token' <<<"$recovered_send_result") == "$send_token" ]] \
+  || fail "Send result retrieval did not return the retained token"
+rg -qi '^Cache-Control: no-store' "$result_headers" \
+  || fail "retrieved Send result is cacheable"
+
+reclaimed_send=$(curl -fsS "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$max_prepared_send_id/reclaim") \
+  || fail "Pending Send Reclaim failed"
+jq -e --arg id "$max_prepared_send_id" '
+  .id == $id and .type == "send" and .state == "rolled_back"
+  and .amount == "100" and .fee == "0" and .inputAmount == "100"
+  and ([.amount,.fee,.inputAmount] | all(type == "string"))
+  and (has("token") | not)
+' <<<"$reclaimed_send" >/dev/null \
+  || fail "successful Reclaim did not return the safe rolled-back Send"
+reclaimed_send_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"100",reserved:"0",total:"100"}]
+' <<<"$reclaimed_send_balances" >/dev/null \
+  || fail "successful Reclaim did not return Reserved Balance to Spendable Balance"
+jq -e '.items == []' \
+  <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/in-flight")" \
+  >/dev/null || fail "reclaimed Send remained in the in-flight collection"
+
+inconclusive_send=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$base_url/v1/operations/send") \
+  || fail "inconclusive Reclaim fixture preparation failed"
+inconclusive_send_id=$(jq -er '.id' <<<"$inconclusive_send")
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$inconclusive_send_id/execute" >/dev/null \
+  || fail "inconclusive Reclaim fixture execution failed"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
+  "$base_url/__test__/mode" >/dev/null
+inconclusive_reclaim=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$inconclusive_send_id/reclaim")
+[[ ${inconclusive_reclaim##*$'\n'} == 503 ]] \
+  || fail "inconclusive Reclaim returned the wrong status"
+jq -e '.error.code == "reclaim_inconclusive" and .error.retryable == true' \
+  <<<"${inconclusive_reclaim%$'\n'*}" >/dev/null \
+  || fail "inconclusive Reclaim was not a structured retryable state"
+jq -e --arg id "$inconclusive_send_id" '
+  .id == $id and .state == "pending"
+' <<<"$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/$inconclusive_send_id")" >/dev/null \
+  || fail "inconclusive Reclaim did not leave the Send recoverable"
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"30",reserved:"70",total:"100"}]
+' <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/balances")" >/dev/null \
+  || fail "inconclusive Reclaim changed the Pending Send reservation"
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$inconclusive_send_id/reclaim" >/dev/null \
+  || fail "retry after inconclusive Reclaim did not succeed"
+
+recipient_send=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$base_url/v1/operations/send") \
+  || fail "recipient-won fixture preparation failed"
+recipient_send_id=$(jq -er '.id' <<<"$recipient_send")
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$recipient_send_id/execute" >/dev/null \
+  || fail "recipient-won fixture execution failed"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg id "$recipient_send_id" '{operationId:$id}')" \
+  "$base_url/__test__/redeem-send" >/dev/null \
+  || fail "recipient-won fixture redemption failed"
+recipient_won=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$recipient_send_id/reclaim")
+[[ ${recipient_won##*$'\n'} == 409 ]] \
+  || fail "recipient-won Reclaim race returned the wrong status"
+jq -e '.error.code == "recipient_won" and .error.retryable == false' \
+  <<<"${recipient_won%$'\n'*}" >/dev/null \
+  || fail "recipient-won Reclaim race was not a stable terminal state"
+jq -e --arg id "$recipient_send_id" '
+  .id == $id and .state == "finalized"
+' <<<"$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/$recipient_send_id")" >/dev/null \
+  || fail "recipient-won Reclaim race did not finalize the same Send"
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"30",reserved:"0",total:"30"}]
+' <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/balances")" >/dev/null \
+  || fail "recipient-won race did not consume the Reserved Balance"
+jq -e '.items == []' \
+  <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/in-flight")" \
+  >/dev/null || fail "recipient-won Send remained canonically active"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg mint "$send_mint" '{
+    balances:{items:[{mintUrl:$mint,unit:"sat",spendable:"100",reserved:"0",total:"100"}]},
+    sendPrepared:{items:[]},sendInFlight:{items:[]}
+  }')" "$base_url/__test__/resources" >/dev/null
+unavailable_refresh_send=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$base_url/v1/operations/send")
+unavailable_refresh_send_id=$(jq -er '.id' <<<"$unavailable_refresh_send")
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$unavailable_refresh_send_id/execute" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendRefreshError":"mint_unavailable"}' \
+  "$base_url/__test__/mode" >/dev/null
+unavailable_refresh=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
+  -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$unavailable_refresh_send_id/refresh")
+[[ ${unavailable_refresh##*$'\n'} == 503 ]] \
+  || fail "unavailable Mint Send refresh returned the wrong status"
+jq -e '.error.code == "mint_unavailable" and .error.retryable == true' \
+  <<<"${unavailable_refresh%$'\n'*}" >/dev/null \
+  || fail "unavailable Mint Send refresh was not a stable retryable state"
+jq -e --arg id "$unavailable_refresh_send_id" '.id == $id and .state == "pending"' \
+  <<<"$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/$unavailable_refresh_send_id")" >/dev/null \
+  || fail "unavailable Mint refresh did not leave the Send recoverable"
+curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/v1/operations/send/$unavailable_refresh_send_id/reclaim" >/dev/null
 
 receive_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ'
 cancel_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jYW5jZWwifQ'
@@ -624,6 +751,43 @@ curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
   "$recovery_base_url/v1/mints/trust" >/dev/null \
   || fail "recovery fixture Mint trust failed"
 
+send_recovery_mint='https://mint.slice7.test'
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg receiveMint "$receive_mint" \
+    --arg sendMint "$send_recovery_mint" '{
+      balances:{items:[{
+        mintUrl:$sendMint,unit:"sat",spendable:"100",reserved:"0",total:"100"
+      }]},
+      mints:{items:[
+        {mintUrl:$receiveMint,name:"Receive Mint",trusted:true,
+          createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"},
+        {mintUrl:$sendMint,name:"Recovery Send Mint",trusted:true,
+          createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"}
+      ]}
+    }')" "$recovery_base_url/__test__/resources" >/dev/null \
+  || fail "could not fund the recovered Send fixture"
+recovery_send=$(jq -cn --arg mint "$send_recovery_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}' \
+  | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "$recovery_base_url/v1/operations/send") \
+  || fail "recovered Send preparation failed"
+recovery_send_id=$(jq -er '.id' <<<"$recovery_send")
+unavailable_send_result=$(curl -sS -w '\n%{http_code}' "${auth[@]}" \
+  "$recovery_base_url/v1/operations/send/$recovery_send_id/result")
+[[ ${unavailable_send_result##*$'\n'} == 409 ]] \
+  || fail "Prepared Send result did not remain unavailable"
+jq -e '.error.code == "result_not_available" and .error.retryable == true' \
+  <<<"${unavailable_send_result%$'\n'*}" >/dev/null \
+  || fail "unavailable Send result was not a structured retryable state"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendExecuteInterruption":"after_commit"}' \
+  "$recovery_base_url/__test__/mode" >/dev/null
+if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
+    --data '{}' \
+    "$recovery_base_url/v1/operations/send/$recovery_send_id/execute" >/dev/null 2>&1; then
+  fail "dropped Send execute response returned an optimistic success"
+fi
+
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"receiveInterruption":"before_commit"}' \
   "$recovery_base_url/__test__/mode" >/dev/null
@@ -673,6 +837,39 @@ jq -e --arg before "$before_interrupt_id" --arg after "$after_interrupt_id" '
 ' <<<"$recovered_in_flight" >/dev/null \
   || fail "restart did not rehydrate the same safe executing Operations"
 
+recovered_send_in_flight=$(curl -fsS "${auth[@]}" \
+  "$recovery_base_url/v1/operations/send/in-flight") \
+  || fail "Pending Send was not discoverable after restart"
+jq -e --arg id "$recovery_send_id" '
+  .items == [{
+    id:$id,type:"send",state:"pending",mintUrl:"https://mint.slice7.test",
+    unit:"sat",amount:"60",fee:"2",inputAmount:"70",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"
+  }]
+  and ([.items[0].amount,.items[0].fee,.items[0].inputAmount]
+    | all(type == "string"))
+' <<<"$recovered_send_in_flight" >/dev/null \
+  || fail "restart did not recover the same safe Pending Send"
+recovered_send_result=$(curl -fsS -D "$result_headers" "${auth[@]}" \
+  "$recovery_base_url/v1/operations/send/$recovery_send_id/result") \
+  || fail "dropped Send execute result was not recoverable after restart"
+recovered_send_token=$(jq -er '.token | select(type == "string" and startswith("cashuA"))' \
+  <<<"$recovered_send_result") \
+  || fail "recovered Send result omitted its token"
+[[ $(curl -fsS "${auth[@]}" \
+  "$recovery_base_url/v1/operations/send/$recovery_send_id/result") \
+  == "$recovered_send_result" ]] \
+  || fail "repeated Send result retrieval returned a different token"
+rg -qi '^Cache-Control: no-store' "$result_headers" \
+  || fail "recovered Send result is cacheable"
+recovered_send_balances=$(curl -fsS "${auth[@]}" "$recovery_base_url/v1/balances")
+jq -e --arg mint "$send_recovery_mint" '
+  .items | any(.mintUrl == $mint and .unit == "sat"
+    and .spendable == "30" and .reserved == "70" and .total == "100"
+    and ([.spendable,.reserved,.total] | all(type == "string")))
+' <<<"$recovered_send_balances" >/dev/null \
+  || fail "recovered Pending Send did not preserve its Reserved Balance"
+
 before_refreshed=$(curl -fsS "${auth[@]}" -X POST \
   -H 'Content-Type: application/json' --data '{}' \
   "$recovery_base_url/v1/operations/receive/$before_interrupt_id/refresh") \
@@ -711,10 +908,16 @@ jq -e '
   and .receiveExecuteRequests == 0
   and .receiveRefreshRequests == 2
   and .receiveOperationCount == 2
+  and .sendCreateRequests == 0
+  and .sendExecuteRequests == 0
+  and .sendResultRequests == 2
+  and .sendOperationCount == 1
 ' <<<"$recovery_status" >/dev/null \
-  || fail "restart replay created or re-executed a Receive"
+  || fail "restart replay created or re-executed an Operation"
 if rg -Fq "$receive_token" "$recovery_state_dir/mock-runtime-state.json" \
     || rg -Fq "$cancel_token" "$recovery_state_dir/mock-runtime-state.json" \
+    || rg -Fq "$recovered_send_token" "$recovery_state_dir/mock-runtime-state.json" \
+    || rg -q 'cashuA' "$recovery_state_dir/mock-runtime-state.json" \
     || rg -qi 'proof|credential|mnemonic' "$recovery_state_dir/mock-runtime-state.json"; then
   fail "durable recovery fixture persisted sensitive Wallet material"
 fi

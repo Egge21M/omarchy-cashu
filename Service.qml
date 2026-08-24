@@ -81,6 +81,8 @@ Item {
   property var mintRequest: null
   property var receiveRequests: []
   property var sendRequests: []
+  property var sendLookupRequestsById: ({})
+  property var queuedSendOperationInvalidations: ({})
   property var streamRequest: null
   property int streamOffset: 0
   property string streamBuffer: ""
@@ -116,10 +118,20 @@ Item {
   property var sendAmbiguousCreation: null
   property bool sendResultReconciling: false
   property bool sendDismissAfterResult: false
+  readonly property var sendFocusedOperation: canonicalSendOperation(sendOperationId)
   readonly property var sendPreparedOperation: canonicalPreparedSend(sendOperationId)
+  readonly property var sendPendingOperation: sendFocusedOperation
+    && String(sendFocusedOperation.state || "") === "pending"
+    ? sendFocusedOperation : null
   readonly property bool sendCanCancelReservation: sendOperationId !== ""
     && ["review", "error"].indexOf(sendState) !== -1
     && !sendCommandRequest
+    && (!!sendPreparedOperation || (!sendPendingOperation && sendState === "error"
+      && sendErrorCode !== "recipient_won"))
+  readonly property bool sendCanReclaim: !!sendPendingOperation
+    && ["result", "pending", "error"].indexOf(sendState) !== -1
+    && !sendCommandRequest && !sendResultReconciling
+    && sendReconcileRequests.length === 0
   readonly property bool sendCommandsAvailable: !fullFetchInProgress
     && connectionState === "connected" && compatibilityState === "compatible"
     && walletState === "unlocked"
@@ -265,6 +277,7 @@ Item {
       sendMaxMintUrl: sendMaxResource ? String(sendMaxResource.mintUrl || "") : "",
       sendMaxAmount: sendMaxResource ? String(sendMaxResource.maxAmount || "") : "",
       sendPreparedOperation: sendPreparedOperation,
+      sendPendingOperation: sendPendingOperation,
       creating: creating,
       createError: createError,
       connectionState: connectionState,
@@ -422,12 +435,37 @@ Item {
     return null
   }
 
+  function firstCanonicalPendingSend() {
+    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    for (var index = 0; index < operations.length; index++)
+      if (String(operations[index].state || "") === "pending")
+        return operations[index]
+    return null
+  }
+
   function reconcileFocusedPreparedSend() {
+    if (!sendOperationId) return
+    var operation = canonicalSendOperation(sendOperationId)
+    if (operation && String(operation.state || "") === "pending") {
+      if (sendState === "executing"
+          || (sendState === "error" && sendErrorCode === "transport_unavailable")) {
+        retrievePendingSendResult(sendOperationId)
+        return
+      }
+      if (["result", "recovering-result", "pending", "reclaiming"]
+          .indexOf(sendState) !== -1) return
+      if (sendState === "error"
+          && ["result_not_available", "mint_unavailable", "reclaim_inconclusive",
+            "operation_conflict"].indexOf(sendErrorCode) !== -1) return
+      sendOperationId = ""
+      failSend("operation_conflict")
+      return
+    }
     var reconcilesCommandError = sendState === "error"
       && ["operation_not_found", "operation_conflict"].indexOf(sendErrorCode) !== -1
-    if ((sendState !== "review" && !reconcilesCommandError) || !sendOperationId) return
-    var operation = canonicalSendOperation(sendOperationId)
-    if (operation && String(operation.state || "") === "prepared") return
+    if (operation && String(operation.state || "") === "prepared"
+        && (sendState === "review" || reconcilesCommandError)) return
+    if (sendState !== "review" && !reconcilesCommandError) return
     sendOperationId = ""
     failSend(operation ? "operation_conflict" : "operation_not_found")
   }
@@ -660,6 +698,14 @@ Item {
       && typeof value.needsSwap === "boolean"
   }
 
+  function isSendResult(value) {
+    if (!value || typeof value !== "object"
+        || typeof value.token !== "string" || value.token.length === 0)
+      return false
+    var keys = Object.keys(value)
+    return keys.length === 1 && keys[0] === "token"
+  }
+
   function parseErrorDocument(request) {
     var value
     try {
@@ -724,6 +770,15 @@ Item {
       request.onreadystatechange = null
       request.abort()
     }
+    for (var operationId in sendLookupRequestsById) {
+      var lookup = sendLookupRequestsById[operationId]
+      if (lookup) {
+        lookup.onreadystatechange = null
+        lookup.abort()
+      }
+    }
+    sendLookupRequestsById = ({})
+    queuedSendOperationInvalidations = ({})
   }
 
   function resumeQueuedSendInvalidations() {
@@ -734,6 +789,9 @@ Item {
     queuedBalanceInvalidation = false
     if (refreshSends) fetchOperationGroup("send")
     if (refreshBalances) fetchBalances()
+    var queuedOperations = queuedSendOperationInvalidations
+    queuedSendOperationInvalidations = ({})
+    for (var operationId in queuedOperations) refetchSendOperation(operationId)
   }
 
   function collectSendResources(specifications, callback, failureCallback) {
@@ -798,7 +856,8 @@ Item {
   function sendCanonicalMutationBusy() {
     return !!sendCommandRequest || sendReconcileRequests.length > 0
       || sendResultReconciling
-      || ["maxing", "preparing", "cancelling", "executing"]
+      || ["maxing", "preparing", "cancelling", "executing",
+        "recovering-result", "reclaiming"]
         .indexOf(sendState) !== -1
   }
 
@@ -1274,7 +1333,8 @@ Item {
   }
 
   function resetSend() {
-    if (["preparing", "cancelling", "executing"].indexOf(sendState) !== -1
+    if (["preparing", "cancelling", "executing", "reclaiming"]
+        .indexOf(sendState) !== -1
         || (sendState === "review" && sendPreparedOperation)
         || sendResultReconciling) return false
     var request = sendCommandRequest
@@ -1298,9 +1358,17 @@ Item {
   }
 
   function beginSendFlow() {
-    if (["maxing", "preparing", "cancelling", "executing"]
+    if (["maxing", "preparing", "cancelling", "executing", "reclaiming"]
         .indexOf(sendState) !== -1 || sendResultReconciling) return false
     sendCancelOnPrepared = false
+    var pending = sendPendingOperation || firstCanonicalPendingSend()
+    if (pending) {
+      sendOperationId = String(pending.id)
+      sendError = ""
+      sendErrorCode = ""
+      sendMaxResource = null
+      return retrievePendingSendResult(sendOperationId)
+    }
     var prepared = sendPreparedOperation || firstCanonicalPreparedSend()
     if (prepared) {
       sendOperationId = String(prepared.id)
@@ -1320,7 +1388,7 @@ Item {
       sendCancelOnPrepared = true
       return true
     }
-    if (sendState === "executing") return false
+    if (["executing", "reclaiming"].indexOf(sendState) !== -1) return false
     if (sendState === "cancelling") return true
     if (sendState === "result" && sendResultReconciling) {
       sendDismissAfterResult = true
@@ -1392,6 +1460,22 @@ Item {
     }
     sendCommandRequest = request
     return true
+  }
+
+  function reconcileFailedReclaim(code, operationId) {
+    sendErrorCode = String(code || "")
+    sendError = sendErrorMessage(code)
+    sendState = "error"
+    reconcileSendResources(function() {
+      var canonical = root.canonicalSendOperation(operationId)
+      if (!canonical || String(canonical.state || "") !== "pending")
+        root.sendOperationId = ""
+      root.resumeDeferredCanonicalReconcile()
+    }, function() {
+      root.fetchOperationGroup("send")
+      root.fetchBalances()
+      root.resumeDeferredCanonicalReconcile()
+    })
   }
 
   function prepareSend(mintUrl, amount) {
@@ -1645,15 +1729,14 @@ Item {
           ? result.value.result : null
         if (result.status !== 200 || !root.isSendOperation(operation)
             || String(operation.id) !== operationId
-            || String(operation.state) !== "pending" || !resultDocument
-            || typeof resultDocument.token !== "string"
-            || resultDocument.token.length === 0) {
+            || String(operation.state) !== "pending"
+            || !root.isSendResult(resultDocument)) {
           root.failSend("invalid_response")
           return
         }
         var outgoingToken = String(resultDocument.token)
         resultDocument.token = ""
-        root.sendOperationId = ""
+        root.sendOperationId = operationId
         root.sendResultReconciling = true
         root.sendDismissAfterResult = false
         root.sendState = "result"
@@ -1664,6 +1747,89 @@ Item {
         }, function() {
           root.fetchOperationGroup("send")
           root.fetchBalances()
+          root.finishSendResultReconciliation()
+        })
+      })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function retrievePendingSendResult(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "pending"
+        || fullFetchInProgress || sendCommandRequest) return false
+    sendOperationId = id
+    sendState = "recovering-result"
+    sendError = ""
+    sendErrorCode = ""
+    var request = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/result", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.sendErrorCode = String(result.error.code || "")
+          root.sendError = root.sendErrorMessage(result.error.code)
+          root.sendState = result.error.code === "result_not_available"
+            ? "pending" : "error"
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        if (result.status !== 200 || !root.isSendResult(result.value)) {
+          root.failSend("invalid_response")
+          return
+        }
+        var outgoingToken = String(result.value.token)
+        result.value.token = ""
+        root.sendState = "result"
+        root.sendExecuted(outgoingToken)
+        outgoingToken = ""
+        root.resumeDeferredCanonicalReconcile()
+      })
+    if (!request) {
+      failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function reclaimPendingSend() {
+    var operation = sendPendingOperation
+    var operationId = operation ? String(operation.id || "") : ""
+    if (!operationId || !sendCanReclaim || !sendCommandsAvailable) return false
+    abortIncrementalSendFetches()
+    sendState = "reclaiming"
+    sendError = ""
+    sendErrorCode = ""
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(operationId) + "/reclaim", {}, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileFailedReclaim(result.error.code, operationId)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id) !== operationId
+            || String(result.value.state) !== "rolled_back") {
+          root.failSend("invalid_response")
+          return
+        }
+        root.sendResultReconciling = true
+        root.reconcileSendResources(function() {
+          root.sendOperationId = ""
+          root.sendState = "reclaimed"
+          root.finishSendResultReconciliation()
+        }, function() {
+          root.fetchOperationGroup("send")
+          root.fetchBalances()
+          root.sendOperationId = ""
+          root.sendState = "reclaimed"
           root.finishSendResultReconciliation()
         })
       })
@@ -1713,8 +1879,11 @@ Item {
       mint_not_registered: "This Mint is no longer registered. Choose another Trusted Mint.",
       mint_not_trusted: "This Mint is no longer trusted. Choose another Trusted Mint.",
       mint_unavailable: "The Mint is unavailable. Try again later or choose another Mint.",
-      operation_not_found: "This Prepared Send is no longer available. Start again.",
+      operation_not_found: "This Send is no longer available in cocod. Canonical Wallet state was refreshed.",
       operation_conflict: "This Send changed in cocod. Review the current Wallet state and try again.",
+      result_not_available: "The outgoing token is not available yet. Check the Pending Send again.",
+      reclaim_inconclusive: "Reclaim was inconclusive. The Pending Send remains recoverable.",
+      recipient_won: "The recipient redeemed this Send before Reclaim completed.",
       credential_unavailable: "The cocod Client Credential is unavailable.",
       invalid_response: "cocod returned an invalid Send response.",
       transport_unavailable: "Send could not reach cocod. Try again."
@@ -2172,6 +2341,138 @@ Item {
     else sendRequests = requests
   }
 
+  function withSendOperation(values, operation) {
+    var result = []
+    var source = Array.isArray(values) ? values : []
+    var activeStates = ["init", "prepared", "executing", "pending", "rolling_back"]
+    var active = operation && activeStates.indexOf(String(operation.state || "")) !== -1
+    var found = false
+    for (var i = 0; i < source.length; i++) {
+      if (String(source[i].id || "") === String(operation.id || "")) {
+        found = true
+        if (active) result.push(operation)
+      } else result.push(source[i])
+    }
+    if (!found && active) result.push(operation)
+    return result
+  }
+
+  function withoutSendOperation(values, operationId) {
+    var result = []
+    var source = Array.isArray(values) ? values : []
+    for (var i = 0; i < source.length; i++)
+      if (String(source[i].id || "") !== String(operationId || ""))
+        result.push(source[i])
+    return result
+  }
+
+  function queueSendOperationInvalidation(operationId) {
+    var id = String(operationId || "")
+    if (!id) return
+    var queued = ({})
+    for (var key in queuedSendOperationInvalidations)
+      queued[key] = true
+    queued[id] = true
+    queuedSendOperationInvalidations = queued
+  }
+
+  function refetchSendOperation(operationId) {
+    var id = String(operationId || "")
+    if (!id) return
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+      queueSendOperationInvalidation(id)
+      return
+    }
+    if (sendLookupRequestsById[id]) {
+      queueSendOperationInvalidation(id)
+      return
+    }
+
+    function complete(operation, remove) {
+      var requests = ({})
+      for (var key in root.sendLookupRequestsById)
+        if (key !== id) requests[key] = root.sendLookupRequestsById[key]
+      root.sendLookupRequestsById = requests
+      if (operation) root.sendOperations = root.withSendOperation(
+        root.sendOperations, operation)
+      else if (remove) root.sendOperations = root.withoutSendOperation(
+        root.sendOperations, id)
+      root.fetchBalances()
+      root.refreshCount++
+      if (root.queuedSendOperationInvalidations[id]) {
+        var queued = ({})
+        for (var queuedId in root.queuedSendOperationInvalidations)
+          if (queuedId !== id) queued[queuedId] = true
+        root.queuedSendOperationInvalidations = queued
+        Qt.callLater(function() { root.refetchSendOperation(id) })
+      }
+    }
+
+    var lookup = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id), undefined, function(result) {
+        if (root.sendLookupRequestsById[id] !== lookup) return
+        if (!result.ok) {
+          complete(null, result.error.code === "operation_not_found")
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)) {
+          complete(null)
+          root.handleContractFailure("invalid_send_operation",
+            "cocod returned an invalid Send Operation")
+          return
+        }
+        var canonical = result.value
+        var refresh = root.sendRequest("POST", "/v1/operations/send/"
+          + encodeURIComponent(id) + "/refresh", {}, function(refreshResult) {
+            if (root.sendLookupRequestsById[id] !== refresh) return
+            if (!refreshResult.ok) {
+              if (refreshResult.error.code === "operation_not_found")
+                complete(null, true)
+              else complete(canonical)
+              if (String(root.sendOperationId || "") === id)
+                root.failSend(refreshResult.error.code)
+              return
+            }
+            if (refreshResult.status !== 200
+                || !root.isSendOperation(refreshResult.value)) {
+              complete(canonical)
+              root.handleContractFailure("invalid_send_operation",
+                "cocod returned an invalid refreshed Send Operation")
+              return
+            }
+            complete(refreshResult.value)
+          })
+        if (!refresh) {
+          complete(canonical)
+          root.handleCredentialUnavailable()
+          return
+        }
+        var requests = ({})
+        for (var key in root.sendLookupRequestsById)
+          requests[key] = root.sendLookupRequestsById[key]
+        requests[id] = refresh
+        root.sendLookupRequestsById = requests
+      })
+    if (!lookup) {
+      handleCredentialUnavailable()
+      return
+    }
+    var requests = ({})
+    for (var key in sendLookupRequestsById)
+      requests[key] = sendLookupRequestsById[key]
+    requests[id] = lookup
+    sendLookupRequestsById = requests
+  }
+
+  function refetchPendingSendOperations() {
+    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    for (var i = 0; i < operations.length; i++) {
+      var operation = operations[i]
+      if (operation && String(operation.state || "") === "pending")
+        refetchSendOperation(operation.id)
+    }
+  }
+
   function withoutReceiveOperation(operationId) {
     var result = []
     for (var i = 0; i < receiveOperations.length; i++)
@@ -2311,7 +2612,10 @@ Item {
       handleContractFailure("invalid_event", "cocod sent unsafe invalidation metadata")
       return
     }
-    if (event.type === "balance.updated") fetchBalances()
+    if (event.type === "balance.updated") {
+      fetchBalances()
+      refetchPendingSendOperations()
+    }
     else if (event.type === "mint.updated") fetchMints()
     else if (event.type === "operation.updated") {
       var operationType = String(event.data.operationType || "")
@@ -2324,7 +2628,14 @@ Item {
           if (operationId) queued[operationId] = true
           queuedReceiveInvalidations = queued
         } else refetchReceiveOperation(operationId)
-      } else fetchOperationGroup(operationType)
+      } else if (operationType === "send") {
+        var sendOperationId = String(event.data.operationId || "")
+        if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+          queueSendOperationInvalidation(sendOperationId)
+          queuedSendInvalidation = true
+          queuedBalanceInvalidation = true
+        } else refetchSendOperation(sendOperationId)
+      }
       if (operationType === "receive" && receiveState === "reconciling"
           && String(event.data.operationId || "") === receiveOperationId)
         reconcileReceiveOperation(receiveOperationId)
@@ -2446,6 +2757,10 @@ Item {
     if (mintRequest) mintRequest.abort()
     abortRequests(receiveRequests)
     abortRequests(sendRequests)
+    for (var sendLookupId in sendLookupRequestsById)
+      if (sendLookupRequestsById[sendLookupId])
+        sendLookupRequestsById[sendLookupId].abort()
+    sendLookupRequestsById = ({})
     var sendCommand = sendCommandRequest
     sendCommandRequest = null
     if (sendCommand) sendCommand.abort()

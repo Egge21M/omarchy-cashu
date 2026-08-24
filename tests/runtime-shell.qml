@@ -171,5 +171,17 @@ ShellRoot {
     function doneSend(): string {
       return walletPanel.smokeDoneSend()
     }
+
+    function beginReclaimSend(): string {
+      return walletPanel.smokeBeginReclaimSend()
+    }
+
+    function confirmReclaimSend(): string {
+      return walletPanel.smokeConfirmReclaimSend()
+    }
+
+    function retrySend(): string {
+      return walletPanel.smokeRetrySend()
+    }
   }
 }

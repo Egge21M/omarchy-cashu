@@ -247,6 +247,18 @@ Item {
     return sendFlow.done() ? "ok" : "disabled"
   }
 
+  function smokeBeginReclaimSend() {
+    return sendFlow.beginReclaim() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmReclaimSend() {
+    return sendFlow.confirmReclaim() ? "ok" : "disabled"
+  }
+
+  function smokeRetrySend() {
+    return sendFlow.retryPending() ? "ok" : "disabled"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -312,6 +324,10 @@ Item {
         ? String(sendFlow.reviewBalance.reserved || "") : "",
       sendCopyAvailable: sendFlow.copyAvailable,
       sendClipboardWrites: sendFlow.clipboardWrites,
+      sendReclaimWarningVisible: sendFlow.reclaimWarningVisible,
+      sendReclaimWarning: sendFlow.reclaimWarning,
+      sendReclaimAvailable: sendFlow.reclaimAvailable,
+      sendOperationId: stateOwner ? String(stateOwner.sendOperationId || "") : "",
       sendError: sendFlow.error,
       sendErrorCode: stateOwner ? String(stateOwner.sendErrorCode || "") : "",
       receiveRecoveryState: stateOwner ? stateOwner.receiveRecoveryState : "idle",

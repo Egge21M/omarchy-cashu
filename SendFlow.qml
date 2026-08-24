@@ -20,11 +20,13 @@ Item {
   property string visibleMaxMintUrl: ""
   property string outgoingToken: ""
   property int clipboardWrites: 0
+  property bool reclaimWarningVisible: false
+  readonly property string reclaimWarning: "Reclaim may race with recipient redemption. The recipient can still win while cocod checks the Mint."
 
   readonly property string sendState: service
     ? String(service.sendState || "idle") : "idle"
-  readonly property string viewState: !opened ? "closed" : sendState === "idle"
-    ? "entry" : sendState
+  readonly property string viewState: !opened ? "closed" : reclaimWarningVisible
+    ? "reclaim-warning" : sendState === "idle" ? "entry" : sendState
   readonly property string amount: amountInput.text
   readonly property bool amountValid: /^[1-9][0-9]*$/.test(amount)
   readonly property bool inputVisible: viewState === "entry"
@@ -52,6 +54,9 @@ Item {
     && selectedMintUrl !== "" && commandsAvailable
   readonly property bool confirmEnabled: viewState === "review" && commandsAvailable
   readonly property bool copyAvailable: viewState === "result" && outgoingToken !== ""
+  readonly property bool reclaimAvailable: service
+    && service.sendCanReclaim === true
+    && ["result", "pending", "error"].indexOf(sendState) !== -1
 
   implicitHeight: content.implicitHeight
   visible: viewState !== "closed"
@@ -79,6 +84,7 @@ Item {
     visibleMaxMintUrl = ""
     outgoingToken = ""
     clipboardWrites = 0
+    reclaimWarningVisible = false
     opened = true
     updateMintSelection()
     Qt.callLater(function() {
@@ -96,6 +102,7 @@ Item {
     maxRequestMintUrl = ""
     visibleMaxMintUrl = ""
     outgoingToken = ""
+    reclaimWarningVisible = false
     opened = false
     return true
   }
@@ -103,6 +110,7 @@ Item {
   function panelClosed() {
     amountInput.focus = false
     outgoingToken = ""
+    reclaimWarningVisible = false
     if (service && !service.dismissSendFlow()) return false
     amountInput.text = ""
     selectedMintUrl = ""
@@ -204,11 +212,33 @@ Item {
     return close()
   }
 
+  function beginReclaim() {
+    if (!reclaimAvailable) return false
+    reclaimWarningVisible = true
+    return true
+  }
+
+  function confirmReclaim() {
+    if (!reclaimWarningVisible || !service
+        || typeof service.reclaimPendingSend !== "function") return false
+    reclaimWarningVisible = false
+    outgoingToken = ""
+    return service.reclaimPendingSend()
+  }
+
+  function retryPending() {
+    if (!service || !service.sendPendingOperation
+        || typeof service.retrievePendingSendResult !== "function") return false
+    return service.retrievePendingSendResult(service.sendPendingOperation.id)
+  }
+
   onMintOptionsChanged: {
     if (viewState === "entry") updateMintSelection()
   }
   onViewStateChanged: {
     if (viewState === "entry") updateMintSelection()
+    if (["result", "reclaim-warning"].indexOf(viewState) === -1)
+      outgoingToken = ""
   }
   onSelectedMintUrlChanged: {
     if (visibleMaxMintUrl !== selectedMintUrl) visibleMaxMintUrl = ""
@@ -251,12 +281,15 @@ Item {
     }
 
     Text {
-      visible: ["maxing", "preparing", "cancelling", "executing"]
+      visible: ["maxing", "preparing", "cancelling", "executing",
+        "recovering-result", "reclaiming"]
         .indexOf(root.viewState) !== -1
       width: parent.width
       text: root.viewState === "maxing" ? "Calculating Send Max with cocod…"
         : root.viewState === "preparing" ? "Preparing Send and reserving ecash…"
         : root.viewState === "cancelling" ? "Cancelling Prepared Send…"
+        : root.viewState === "recovering-result" ? "Recovering Pending Send…"
+        : root.viewState === "reclaiming" ? "Attempting Reclaim with cocod…"
         : "Creating outgoing ecash…"
       color: root.foreground
       font.family: root.fontFamily
@@ -428,7 +461,8 @@ Item {
     }
 
     Text {
-      visible: root.viewState === "error" && root.error !== ""
+      visible: ["pending", "error"].indexOf(root.viewState) !== -1
+        && root.error !== ""
       width: parent.width
       text: root.error
       color: root.urgent
@@ -436,6 +470,19 @@ Item {
       font.pixelSize: Style.font.bodySmall
       font.bold: true
       wrapMode: Text.WordWrap
+    }
+
+    Button {
+      visible: root.viewState === "pending"
+        || (root.viewState === "error" && root.service
+          && ["result_not_available", "mint_unavailable", "reclaim_inconclusive"]
+            .indexOf(String(root.service.sendErrorCode || "")) !== -1)
+      text: "Check Pending Send"
+      iconText: "󰑐"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      bordered: true
+      onClicked: root.retryPending()
     }
 
     Button {
@@ -473,8 +520,72 @@ Item {
     }
 
     Button {
-      visible: root.viewState === "result"
-      text: "Done"
+      visible: root.reclaimAvailable
+        && ["result", "pending", "error"].indexOf(root.viewState) !== -1
+      text: "Attempt Reclaim"
+      iconText: "󰑓"
+      foreground: root.urgent
+      fontFamily: root.fontFamily
+      bordered: true
+      onClicked: root.beginReclaim()
+    }
+
+    Column {
+      visible: root.viewState === "reclaim-warning"
+      width: parent.width
+      spacing: Style.spacing.labelGap
+
+      Text {
+        width: parent.width
+        text: root.reclaimWarning
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        wrapMode: Text.WordWrap
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.spacing.controlGap
+
+        Button {
+          width: (parent.width - parent.spacing) / 2
+          text: "Keep Pending"
+          iconText: "󰅖"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          onClicked: root.reclaimWarningVisible = false
+        }
+
+        Button {
+          width: (parent.width - parent.spacing) / 2
+          text: "Confirm Reclaim"
+          iconText: "󰑓"
+          foreground: root.urgent
+          fontFamily: root.fontFamily
+          bordered: true
+          onClicked: root.confirmReclaim()
+        }
+      }
+    }
+
+    Text {
+      visible: root.viewState === "reclaimed"
+      width: parent.width
+      text: "Reclaim succeeded. The reserved ecash is spendable again."
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: true
+      wrapMode: Text.WordWrap
+      horizontalAlignment: Text.AlignHCenter
+    }
+
+    Button {
+      visible: ["result", "pending", "reclaimed"].indexOf(root.viewState) !== -1
+      text: root.viewState === "pending" ? "Keep Pending" : "Done"
       iconText: "󰄬"
       foreground: root.foreground
       fontFamily: root.fontFamily
