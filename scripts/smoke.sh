@@ -7,6 +7,7 @@ plugin_id=io.github.egge21m.omarchy-cashu
 state_target="$plugin_id.state"
 
 "$project_dir/scripts/check.sh"
+"$project_dir/tests/local-cocod-launcher.sh"
 "$project_dir/tests/contract.sh"
 "$project_dir/tests/runtime.sh"
 

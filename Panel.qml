@@ -312,7 +312,8 @@ Item {
       sendPrepareEnabled: sendFlow.prepareEnabled,
       sendConfirmEnabled: sendFlow.confirmEnabled,
       sendReviewMint: sendFlow.prepared ? String(sendFlow.prepared.mintUrl || "") : "",
-      sendReviewAmount: sendFlow.prepared ? String(sendFlow.prepared.amount || "") : "",
+      sendReviewAmount: sendFlow.prepared && stateOwner
+        ? String(stateOwner.operationAmount(sendFlow.prepared) || "") : "",
       sendReviewFee: sendFlow.prepared ? String(sendFlow.prepared.fee || "") : "",
       sendReviewInputAmount: sendFlow.prepared
         ? String(sendFlow.prepared.inputAmount || "") : "",
@@ -755,6 +756,7 @@ Item {
                 bordered: true
                 enabled: root.stateOwner
                   && root.stateOwner.walletState === "unlocked"
+                  && root.stateOwner.receivePreviewAvailable === true
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
                   && sendFlow.viewState === "closed"
@@ -772,6 +774,7 @@ Item {
                 bordered: true
                 enabled: root.stateOwner
                   && root.stateOwner.walletState === "unlocked"
+                  && root.stateOwner.sendMaxAvailable === true
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
                   && sendFlow.viewState === "closed"

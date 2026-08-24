@@ -238,6 +238,8 @@ shell_pid=$!
 wait_snapshot '
   .connectionState == "connected"
   and .compatibilityState == "compatible"
+  and .receivePreviewAvailable == true
+  and .sendMaxAvailable == true
   and .walletState == "uninitialized"
   and .spendableBalance == "0"
   and .reservedBalance == "0"
@@ -261,19 +263,21 @@ wait_panel_snapshot '
 wait_mock_status '
   .authenticatedV1Requests >= 2
   and .authorizationFailures == 0
-  and .resourceRequests.capabilities >= 1
+  and .resourceRequests.openapi >= 1
   and .resourceRequests.status >= 1
   and .resourceRequests.balances == 0
 ' >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"resources":"ok","createDelayMs":250}' "$base_url/__test__/mode" >/dev/null
+  --data '{"resources":"ok","createDelayMs":250,"createSessionPolls":3}' \
+  "$base_url/__test__/mode" >/dev/null
 [[ $(panel_action createWallet) == "ok" ]] \
   || fail "explicit Create Wallet action was unavailable"
 wait_snapshot '.creating == true and .walletState == "uninitialized"' >/dev/null
 [[ $(panel_action createWallet) == "disabled" ]] \
   || fail "duplicate Create Wallet action remained available"
 wait_mock_status '.createRequests == 1' >/dev/null
+wait_mock_status '.remainingSessionStartPolls == 0' >/dev/null
 
 wait_snapshot '
   .walletState == "unlocked"
@@ -1204,7 +1208,7 @@ fund_send_fixture 100
 open_send_flow 60
 before_preparing_rotation=$(adapter_call snapshot | jq -r '.rotationCount')
 before_preparing_rotation_fetch=$(curl -fsS "$base_url/__test__/status" \
-  | jq -r '.resourceRequests.capabilities')
+  | jq -r '.resourceRequests.openapi')
 before_preparing_rotation_cancel=$(curl -fsS "$base_url/__test__/status" \
   | jq -r '.sendCancelRequests')
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -1215,7 +1219,7 @@ adapter_call rotate >/dev/null
 adapter_call reconnect >/dev/null
 sleep 0.1
 wait_panel_snapshot '.sendViewState == "preparing"' >/dev/null
-wait_mock_status ".resourceRequests.capabilities == $before_preparing_rotation_fetch
+wait_mock_status ".resourceRequests.openapi == $before_preparing_rotation_fetch
   and .sendCancelRequests == $before_preparing_rotation_cancel" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCreateDelayMs":0}' "$base_url/__test__/mode" >/dev/null
@@ -1225,7 +1229,7 @@ wait_snapshot ".connectionState == \"connected\"
   and .streamRotationScheduled == true
   and .sendState == \"review\"
   and .canonicalRefreshInProgress == false" >/dev/null
-wait_mock_status ".resourceRequests.capabilities > $before_preparing_rotation_fetch
+wait_mock_status ".resourceRequests.openapi > $before_preparing_rotation_fetch
   and .sendCancelRequests == $before_preparing_rotation_cancel" >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "entry" and .reservedBalance == "0"' >/dev/null

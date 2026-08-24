@@ -12,7 +12,6 @@ import queue
 import re
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -24,15 +23,32 @@ RECOVERY_PHRASE = (
     "abandon abandon abandon about"
 )
 FIXED_TIME = "2026-08-20T12:00:00Z"
-CAPABILITIES = [
-    "wallet.lifecycle",
-    "wallet.balances",
-    "wallet.mints",
-    "wallet.receive-preview",
-    "wallet.receive-operations",
-    "wallet.send-max",
-    "wallet.send-operations",
-    "wallet.events",
+OPENAPI_PATHS = [
+    "/v1/openapi.json",
+    "/v1/status",
+    "/v1/balances",
+    "/v1/events",
+    "/v1/mints",
+    "/v1/token-previews",
+    "/v1/operations/receive",
+    "/v1/operations/receive/{operationId}",
+    "/v1/operations/receive/prepared",
+    "/v1/operations/receive/in-flight",
+    "/v1/operations/receive/{operationId}/execute",
+    "/v1/operations/receive/{operationId}/cancel",
+    "/v1/operations/receive/{operationId}/refresh",
+    "/v1/operations/send/max",
+    "/v1/operations/send",
+    "/v1/operations/send/{operationId}",
+    "/v1/operations/send/prepared",
+    "/v1/operations/send/in-flight",
+    "/v1/operations/send/{operationId}/execute",
+    "/v1/operations/send/{operationId}/result",
+    "/v1/operations/send/{operationId}/cancel",
+    "/v1/operations/send/{operationId}/refresh",
+    "/v1/operations/send/{operationId}/reclaim",
+    "/v1/admin/wallet/initialize",
+    "/v1/admin/wallet/recovery-material",
 ]
 COLLECTION_PATHS = {
     "/v1/balances": "balances",
@@ -145,19 +161,18 @@ class MockState:
     def __init__(self, state_root: Path) -> None:
         self.lock = threading.Lock()
         self.state_root = state_root
-        self.instance_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(state_root.resolve())))
         self.wallet_configured = False
         self.status = self._status_document()
         self.resources: dict[str, dict[str, Any]] = {
             "balances": {"items": []},
             "mints": {"items": []},
-            "receivePrepared": {"items": []},
-            "receiveInFlight": {"items": []},
-            "sendPrepared": {"items": []},
-            "sendInFlight": {"items": []},
+            "receivePrepared": {"items": [], "offset": 0, "limit": 20},
+            "receiveInFlight": {"items": [], "offset": 0, "limit": 20},
+            "sendPrepared": {"items": [], "offset": 0, "limit": 20},
+            "sendInFlight": {"items": [], "offset": 0, "limit": 20},
         }
         self.resource_requests = {
-            "capabilities": 0,
+            "openapi": 0,
             "status": 0,
             **{key: 0 for key in self.resources},
         }
@@ -169,6 +184,8 @@ class MockState:
         self.stream_connections = 0
         self.create_requests = 0
         self.create_delay_ms = 0
+        self.create_session_polls = 0
+        self.remaining_session_start_polls = 0
         self.recovery_material_requests = 0
         self.recovery_material_responses = 0
         self.recovery_delay_ms = 0
@@ -324,8 +341,8 @@ class MockState:
             "wallet": {"configuredAt": FIXED_TIME},
             "seedAccess": {"state": "available", "requiresPassphrase": False},
             "cocoSession": {
-                "state": "running",
-                "startedAt": FIXED_TIME,
+                "state": "starting" if self.remaining_session_start_polls > 0 else "running",
+                "startedAt": None if self.remaining_session_start_polls > 0 else FIXED_TIME,
                 "lastFailure": None,
             },
         }
@@ -348,11 +365,11 @@ class MockState:
         if not authorization:
             with self.lock:
                 self.authorization_failures += 1
-            return False, "authentication_required"
+            return False, "unauthenticated"
         if credential is None or authorization != f"Bearer {credential}":
             with self.lock:
                 self.authorization_failures += 1
-            return False, "invalid_client_credential"
+            return False, "unauthenticated"
         with self.lock:
             self.authenticated_v1_requests += 1
         return True, ""
@@ -379,9 +396,19 @@ class MockState:
             if self.wallet_configured:
                 return False
             self.wallet_configured = True
+            self.remaining_session_start_polls = self.create_session_polls
             self.status = self._status_document()
             self._persist_locked()
         return True
+
+    def lifecycle_status(self) -> dict[str, Any]:
+        with self.lock:
+            status = copy.deepcopy(self.status)
+            if self.remaining_session_start_polls > 0:
+                self.remaining_session_start_polls -= 1
+                if self.remaining_session_start_polls == 0:
+                    self.status = self._status_document()
+            return status
 
     def recovery_material(self) -> str | None:
         with self.lock:
@@ -412,7 +439,16 @@ class MockState:
         with self.lock:
             for key in self.resources:
                 if key in value:
-                    self.resources[key] = copy.deepcopy(value[key])
+                    resource = copy.deepcopy(value[key])
+                    if key in (
+                        "receivePrepared",
+                        "receiveInFlight",
+                        "sendPrepared",
+                        "sendInFlight",
+                    ):
+                        resource.setdefault("offset", 0)
+                        resource.setdefault("limit", 20)
+                    self.resources[key] = resource
             if "status" in value:
                 self.status = copy.deepcopy(value["status"])
                 self.wallet_configured = self.status.get("wallet") is not None
@@ -1258,6 +1294,8 @@ class MockState:
                 "resourceDelayMs": self.resource_delay_ms,
                 "createRequests": self.create_requests,
                 "createDelayMs": self.create_delay_ms,
+                "createSessionPolls": self.create_session_polls,
+                "remainingSessionStartPolls": self.remaining_session_start_polls,
                 "recoveryMaterialRequests": self.recovery_material_requests,
                 "recoveryMaterialResponses": self.recovery_material_responses,
                 "recoveryDelayMs": self.recovery_delay_ms,
@@ -1323,10 +1361,7 @@ class Handler(BaseHTTPRequestHandler):
         authenticated, code = self.state.authenticate(self.headers.get("Authorization", ""))
         if authenticated:
             return True
-        if code == "authentication_required":
-            self.send_json(401, error_document(code, "A Client Credential is required"))
-        else:
-            self.send_json(401, error_document(code, "The Client Credential is invalid"))
+        self.send_json(401, error_document(code, "A valid Client Credential is required"))
         return False
 
     def wallet_required(self) -> bool:
@@ -1379,23 +1414,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self.require_authentication():
             return
 
-        if self.path == "/v1/capabilities":
+        if self.path == "/v1/openapi.json":
             with self.state.lock:
                 mode = self.state.resource_mode
             interface_version = "99" if mode == "incompatible" else "1"
             self.resource_response(
-                "capabilities",
+                "openapi",
                 {
-                    "interfaceVersion": interface_version,
-                    "daemonVersion": "0.0.17",
-                    "instanceId": self.state.instance_id,
-                    "capabilities": CAPABILITIES,
+                    "openapi": "3.1.0",
+                    "x-cocod-interface-version": interface_version,
+                    "info": {"title": "mock cocod v1", "version": "0.0.17"},
+                    "paths": {path: {} for path in OPENAPI_PATHS},
+                    "components": {},
                 },
             )
             return
         if self.path == "/v1/status":
-            with self.state.lock:
-                status = copy.deepcopy(self.state.status)
+            status = self.state.lifecycle_status()
             self.resource_response("status", status)
             return
         request_url = urlsplit(self.path)
@@ -1552,6 +1587,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.resource_delay_ms = max(0, min(5000, int(value["delayMs"])))
                 if "createDelayMs" in value:
                     self.state.create_delay_ms = max(0, min(5000, int(value["createDelayMs"])))
+                if "createSessionPolls" in value:
+                    self.state.create_session_polls = max(
+                        0, min(100, int(value["createSessionPolls"]))
+                    )
                 if "recoveryDelayMs" in value:
                     self.state.recovery_delay_ms = max(0, min(5000, int(value["recoveryDelayMs"])))
                 if "receiveDelayMs" in value:

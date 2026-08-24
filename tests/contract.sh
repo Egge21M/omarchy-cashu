@@ -89,24 +89,27 @@ jq -e '. == {status: "ok", interfaceVersion: "1"}' <<<"$health" >/dev/null \
   || fail "health leaked more than minimal process liveness"
 
 missing_auth=$(curl -sS "$base_url/v1/status")
-jq -e '.error.code == "authentication_required" and .error.retryable == false' \
+jq -e '.error.code == "unauthenticated" and .error.retryable == false' \
   <<<"$missing_auth" >/dev/null || fail "missing authentication did not use the common error document"
 
 invalid_auth=$(curl -sS -H 'Authorization: Bearer invalid' "$base_url/v1/status")
-jq -e '.error.code == "invalid_client_credential" and .error.retryable == false' \
+jq -e '.error.code == "unauthenticated" and .error.retryable == false' \
   <<<"$invalid_auth" >/dev/null || fail "invalid authentication did not use a stable error code"
 
-capabilities=$(curl -fsS "${auth[@]}" "$base_url/v1/capabilities") \
-  || fail "authenticated capability discovery failed"
+openapi=$(curl -fsS "${auth[@]}" "$base_url/v1/openapi.json") \
+  || fail "authenticated OpenAPI discovery failed"
 jq -e '
-  .interfaceVersion == "1"
-  and (.instanceId | type == "string" and length > 0)
-  and ([
-    "wallet.lifecycle", "wallet.balances", "wallet.mints",
-    "wallet.receive-preview", "wallet.receive-operations",
-    "wallet.send-max", "wallet.send-operations", "wallet.events"
-  ] - .capabilities | length == 0)
-' <<<"$capabilities" >/dev/null || fail "capability discovery does not describe the implemented slice"
+  .openapi == "3.1.0"
+  and ."x-cocod-interface-version" == "1"
+  and (.paths as $paths | all([
+    "/v1/status", "/v1/balances", "/v1/events", "/v1/mints",
+    "/v1/token-previews", "/v1/operations/receive",
+    "/v1/operations/receive/prepared", "/v1/operations/receive/in-flight",
+    "/v1/operations/send/max", "/v1/operations/send",
+    "/v1/operations/send/prepared", "/v1/operations/send/in-flight",
+    "/v1/admin/wallet/initialize", "/v1/admin/wallet/recovery-material"
+  ][]; $paths[.] != null))
+' <<<"$openapi" >/dev/null || fail "OpenAPI discovery does not describe the mock-backed slice"
 
 status=$(curl -fsS "${auth[@]}" "$base_url/v1/status") \
   || fail "authenticated lifecycle status failed"

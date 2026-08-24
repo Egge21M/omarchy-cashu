@@ -98,35 +98,25 @@ Canonical project terminology lives in [`CONTEXT.md`](./CONTEXT.md). Durable arc
 
 ## Upstream references
 
-The candidate and proposed cocod TCP resource surface is captured in the
+The accepted and implemented cocod TCP resource surface is captured in the
 [`Cocod Network Interface v1`](./docs/reference/cocod-network-interface-v1.md)
-reference. Its provenance note pins the local candidate revisions and capture
-date, while its status section distinguishes candidate implementations from the
-accepted target design. The cited revisions are not yet published in
-`cashubtc/coco`; release and package publication remain tracked by #14.
+reference. Its provenance note pins the canonical `feat/cocod-api-v1-integration`
+source revision and capture date. That branch now provides generated OpenAPI and
+the complete base v1 resource surface; release and package publication remain
+tracked by #14.
 
 ## Cocod v1 development
 
-The post-alignment roadmap is deliberately sequenced through cocod's durable Operation resources.
-Only the first issue without an open native dependency enters Wallet Client implementation:
+The mock-backed lifecycle and transfer foundation is complete in #15, #6, #5, and #7. The current
+development bridge is [#16](https://github.com/Egge21M/omarchy-cashu/issues/16), which runs that
+client against canonical cocod source without making the plugin own the daemon process. Next,
+[#14](https://github.com/Egge21M/omarchy-cashu/issues/14) publishes cocod and `cocod-bin`; #8 and
+#9 then prove packaged connectivity and real Wallet lifecycle, followed by the real Receive (#10),
+real Send/Reclaim (#11), and complete installable MVP (#12) acceptance journeys. GitHub's native
+issue dependencies remain the live implementation gates.
 
-1. [#15](https://github.com/Egge21M/omarchy-cashu/issues/15) — restore a deterministic, binding-loop-free Receive runtime baseline.
-2. [#6](https://github.com/Egge21M/omarchy-cashu/issues/6) — recover an interrupted Receive and establish reusable Operation discovery, lookup, refresh, and reconnect behavior.
-3. [#5](https://github.com/Egge21M/omarchy-cashu/issues/5) — prepare, confirm, and explicitly copy a Send using daemon-calculated Send Max.
-4. [#7](https://github.com/Egge21M/omarchy-cashu/issues/7) — recover a Pending Send, retrieve its durable result, observe redemption, and attempt Reclaim.
-5. [#14](https://github.com/Egge21M/omarchy-cashu/issues/14) — publish the compatible cocod release, standalone package, and user-service template. This external gate can progress in parallel with issues #15–#7 but must land before real-daemon integration.
-6. [#8](https://github.com/Egge21M/omarchy-cashu/issues/8) — connect the complete mock-backed client contract to the packaged TCP Wallet Instance.
-7. [#9](https://github.com/Egge21M/omarchy-cashu/issues/9) — prove real Wallet creation and Recovery Phrase access separately from transfers.
-8. [#10](https://github.com/Egge21M/omarchy-cashu/issues/10) — prove the real Receive and interruption-recovery lifecycle.
-9. [#11](https://github.com/Egge21M/omarchy-cashu/issues/11) — prove the real Send, result-recovery, redemption, and Reclaim lifecycle.
-10. [#12](https://github.com/Egge21M/omarchy-cashu/issues/12) — run the complete installable MVP acceptance journey.
-
-Generated OpenAPI, Quote, Mint/Melt Operation, Payment Request, and history resources remain
-proposed upstream and are not dependencies of this MVP sequence. GitHub's native issue dependencies
-are the live implementation gates; the numbered list records their intended execution order.
-
-The deterministic mock and Shell Adapter implement the accepted cocod v1
-resource model. Bootstrap reads compatibility and lifecycle facts, then composes
+The deterministic mock and Shell Adapter implement the Wallet Client's accepted product contract
+on top of cocod v1. Bootstrap authenticates and reads `/v1/openapi.json`, then composes
 the Wallet view from `/v1/status`, `/v1/balances`, `/v1/mints`, and the prepared
 and in-flight Receive and Send Operation collections. Amounts stay decimal
 integer strings through transport, aggregation, diagnostics, and display.
@@ -138,8 +128,8 @@ in adapter state. The mock starts without a Wallet and never initializes one on
 startup, reconnect, shell reload, or panel open. Wallet actions remain
 unavailable until the Cashu User initializes the Wallet.
 
-Receive uses the implemented cocod transfer resources without extending the
-adapter's projected state with token material. `POST /v1/token-previews`
+The mock-backed Receive design keeps token material out of the adapter's projected state.
+`POST /v1/token-previews`
 validates a pasted sat token without mutation. An unknown mint is registered
 through `POST /v1/mints` and trusted only after explicit approval through
 `POST /v1/mints/trust`. Confirmation creates a Prepared Receive through
@@ -148,6 +138,12 @@ success only after refetching the finalized Operation and `/v1/balances`.
 Encoded token text remains in the focused input and immediate authenticated
 command bodies; it is excluded from diagnostics IPC, adapter snapshots, SSE,
 logs, and persisted plugin data.
+
+The canonical cocod v1 branch currently exposes neither `/v1/token-previews` nor
+`/v1/operations/send/max`. The adapter treats both as OpenAPI-discovered product extensions and
+disables the corresponding Receive or Send entry point when absent. It never compensates by
+decoding a bearer token, estimating fees, or selecting proofs in the UI process. These gaps must be
+resolved upstream before #10 and #11 can claim real transfer acceptance.
 
 Authenticated `/v1/events` frames are safe invalidation hints. Balance, Known
 Mint, and Operation hints refetch their affected canonical resources. Bootstrap,
@@ -160,6 +156,10 @@ has provisioned `<state-root>/credentials/current/client`:
 ```bash
 python3 scripts/mock-cocod.py
 ```
+
+To replace the mock during development with a compatible local cocod source checkout, follow the
+[local cocod development guide](./docs/development/local-cocod.md). The source-backed check is
+opt-in; the deterministic mock remains the default fault-injection adapter and test dependency.
 
 Run the repeatable static check from the repository root:
 

@@ -57,6 +57,12 @@ rg -q 'new XMLHttpRequest' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not own HTTP/SSE transport"
 rg -q 'Authorization.*Bearer' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not authenticate cocod requests"
+rg -q '/v1/openapi\.json' "$project_dir/Service.qml" \
+  || fail "Shell Adapter does not discover the canonical cocod OpenAPI contract"
+if rg -n '/v1/capabilities' "$project_dir/Service.qml" \
+    "$project_dir/scripts/run-local-cocod.sh" "$project_dir/tests/local-cocod.sh"; then
+  fail "the obsolete cocod capability endpoint remains in the source integration"
+fi
 rg -q '/credentials/current/client' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not use cocod credential discovery"
 rg -q '/v1/status' "$project_dir/Service.qml" \
@@ -149,6 +155,14 @@ rg -q 'button\.triggerPress\(Qt\.LeftButton\)' "$project_dir/BarWidget.qml" \
 
 python3 "$project_dir/scripts/mock-cocod.py" --help >/dev/null \
   || fail "mock cocod is not executable Python"
+bash -n "$project_dir/scripts/run-local-cocod.sh" \
+  "$project_dir/tests/local-cocod-launcher.sh" \
+  "$project_dir/tests/local-cocod.sh" \
+  || fail "local cocod development scripts are not valid Bash"
+"$project_dir/scripts/run-local-cocod.sh" --help >/dev/null \
+  || fail "local cocod source launcher help is unavailable"
+"$project_dir/tests/local-cocod.sh" --help >/dev/null \
+  || fail "local cocod integration help is unavailable"
 
 for qml_file in "$project_dir"/*.qml; do
   qmlformat -n "$qml_file" >/dev/null \
@@ -156,5 +170,9 @@ for qml_file in "$project_dir"/*.qml; do
   qmllint "$qml_file" \
     || fail "QML lint rejected ${qml_file##*/}"
 done
+qmlformat -n "$project_dir/tests/local-cocod-shell.qml" >/dev/null \
+  || fail "QML parser rejected the local cocod Shell Adapter fixture"
+qmllint "$project_dir/tests/local-cocod-shell.qml" \
+  || fail "QML lint rejected the local cocod Shell Adapter fixture"
 
 echo "check: manifest, adapter seam, security guardrails, and QML syntax passed"

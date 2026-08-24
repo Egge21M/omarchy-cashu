@@ -28,15 +28,29 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.cocod"
   }
   readonly property string credentialPath: stateRoot + "/credentials/current/client"
-  readonly property var requiredCapabilities: [
-    "wallet.lifecycle",
-    "wallet.balances",
-    "wallet.mints",
-    "wallet.receive-preview",
-    "wallet.receive-operations",
-    "wallet.send-max",
-    "wallet.send-operations",
-    "wallet.events"
+  readonly property var requiredOpenApiPaths: [
+    "/v1/status",
+    "/v1/balances",
+    "/v1/events",
+    "/v1/mints",
+    "/v1/operations/receive",
+    "/v1/operations/receive/{operationId}",
+    "/v1/operations/receive/prepared",
+    "/v1/operations/receive/in-flight",
+    "/v1/operations/receive/{operationId}/execute",
+    "/v1/operations/receive/{operationId}/cancel",
+    "/v1/operations/receive/{operationId}/refresh",
+    "/v1/operations/send",
+    "/v1/operations/send/{operationId}",
+    "/v1/operations/send/prepared",
+    "/v1/operations/send/in-flight",
+    "/v1/operations/send/{operationId}/execute",
+    "/v1/operations/send/{operationId}/result",
+    "/v1/operations/send/{operationId}/cancel",
+    "/v1/operations/send/{operationId}/refresh",
+    "/v1/operations/send/{operationId}/reclaim",
+    "/v1/admin/wallet/initialize",
+    "/v1/admin/wallet/recovery-material"
   ]
 
   property int reconnectBaseMs: 250
@@ -45,7 +59,7 @@ Item {
   property int streamMaximumCharacters: 32768
   property int heartbeatTimeoutMs: 20000
 
-  property var capabilitiesResource: ({})
+  property var openApiResource: ({})
   property var statusResource: ({
     daemon: { version: "", interfaceVersion: "" },
     wallet: null,
@@ -89,6 +103,8 @@ Item {
   property var createRequest: null
   property bool creating: false
   property string createError: ""
+  property int createSettlementAttempts: 0
+  property int createSettlementMaximumAttempts: 80
   property var recoveryRevealRequest: null
   property var receiveRequest: null
   property var receiveReconcileRequests: []
@@ -134,7 +150,12 @@ Item {
     && sendReconcileRequests.length === 0
   readonly property bool sendCommandsAvailable: !fullFetchInProgress
     && connectionState === "connected" && compatibilityState === "compatible"
-    && walletState === "unlocked"
+    && walletState === "unlocked" && sendMaxAvailable
+  readonly property bool receiveCommandsAvailable: !fullFetchInProgress
+    && connectionState === "connected" && compatibilityState === "compatible"
+    && walletState === "unlocked" && receivePreviewAvailable
+  readonly property bool receivePreviewAvailable: openApiPathAvailable("/v1/token-previews")
+  readonly property bool sendMaxAvailable: openApiPathAvailable("/v1/operations/send/max")
 
   readonly property bool fixtureBacked: false
   readonly property string walletState: connectionState === "connected"
@@ -223,7 +244,7 @@ Item {
     }
     if (compatibilityState === "incompatible") return {
       title: "Incompatible cocod contract",
-      detail: "Install a cocod version that supports the required Wallet capabilities."
+      detail: "Install a cocod version that exposes the required v1 OpenAPI resources."
     }
     if (connectionState === "missing") return {
       title: "cocod is not available",
@@ -250,7 +271,9 @@ Item {
 
   function snapshot() {
     return {
-      apiVersion: String(capabilitiesResource.interfaceVersion || ""),
+      apiVersion: String(openApiResource["x-cocod-interface-version"] || ""),
+      receivePreviewAvailable: receivePreviewAvailable,
+      sendMaxAvailable: sendMaxAvailable,
       daemonUrlAllowed: daemonUrlAllowed,
       refreshCount: refreshCount,
       fixtureBacked: fixtureBacked,
@@ -276,8 +299,8 @@ Item {
       sendErrorCode: sendErrorCode,
       sendMaxMintUrl: sendMaxResource ? String(sendMaxResource.mintUrl || "") : "",
       sendMaxAmount: sendMaxResource ? String(sendMaxResource.maxAmount || "") : "",
-      sendPreparedOperation: sendPreparedOperation,
-      sendPendingOperation: sendPendingOperation,
+      sendPreparedOperation: projectSendOperation(sendPreparedOperation),
+      sendPendingOperation: projectSendOperation(sendPendingOperation),
       creating: creating,
       createError: createError,
       connectionState: connectionState,
@@ -555,7 +578,7 @@ Item {
           : operationStateLabel(operation),
         detail: recovering && recovery.detail
           ? String(recovery.detail) : String(operation.mintUrl || ""),
-        amount: String(operation.amount || "0"),
+        amount: operationAmount(operation) || "0",
         unit: String(operation.unit || "sat")
       })
     }
@@ -593,11 +616,19 @@ Item {
     return false
   }
 
-  function isCapabilitiesShape(value) {
-    if (!value || typeof value !== "object" || !Array.isArray(value.capabilities)) return false
-    if (typeof value.instanceId !== "string" || value.instanceId.length === 0) return false
-    for (var i = 0; i < requiredCapabilities.length; i++)
-      if (value.capabilities.indexOf(requiredCapabilities[i]) === -1) return false
+  function openApiPathAvailable(path) {
+    return !!(openApiResource && openApiResource.paths
+      && typeof openApiResource.paths[String(path || "")] === "object"
+    )
+  }
+
+  function isOpenApiShape(value) {
+    if (!value || typeof value !== "object" || value.openapi !== "3.1.0"
+        || String(value["x-cocod-interface-version"] || "") !== "1"
+        || !value.paths || typeof value.paths !== "object") return false
+    for (var i = 0; i < requiredOpenApiPaths.length; i++)
+      if (!value.paths[requiredOpenApiPaths[i]]
+          || typeof value.paths[requiredOpenApiPaths[i]] !== "object") return false
     return true
   }
 
@@ -635,11 +666,16 @@ Item {
 
   function isOperationCollection(value, type) {
     if (!value || !Array.isArray(value.items) || containsSensitiveKey(value)) return false
+    if (typeof value.offset !== "number" || Math.floor(value.offset) !== value.offset
+        || value.offset < 0 || typeof value.limit !== "number"
+        || Math.floor(value.limit) !== value.limit || value.limit < 1 || value.limit > 100)
+      return false
     for (var i = 0; i < value.items.length; i++) {
       var item = value.items[i]
       if (String(item.type || "") !== type || typeof item.id !== "string"
           || typeof item.state !== "string" || typeof item.mintUrl !== "string"
-          || typeof item.unit !== "string" || !decimalString(item.amount)) return false
+          || typeof item.unit !== "string") return false
+      if (type === "receive" && !decimalString(item.amount)) return false
       if (type === "send" && !isSendOperation(item)) return false
     }
     return true
@@ -654,11 +690,15 @@ Item {
   }
 
   function isReceiveOperation(value) {
-    if (!isOperationCollection({ items: [value] }, "receive")) return false
-    return ["init", "prepared", "executing", "finalized", "rolled_back"]
-      .indexOf(String(value.state || "")) !== -1
-      && decimalString(value.fee) && decimalString(value.netAmount)
-      && typeof value.createdAt === "string" && typeof value.updatedAt === "string"
+    if (!isOperationCollection({ items: [value], offset: 0, limit: 1 }, "receive"))
+      return false
+    var state = String(value.state || "")
+    if (["init", "prepared", "executing", "finalized", "rolled_back"]
+        .indexOf(state) === -1
+        || typeof value.createdAt !== "string" || typeof value.updatedAt !== "string")
+      return false
+    if (state === "init") return value.fee === undefined || decimalString(value.fee)
+    return decimalString(value.fee)
   }
 
   function isSendMax(value) {
@@ -680,14 +720,44 @@ Item {
     }
   }
 
+  function operationAmount(value) {
+    if (!value || typeof value !== "object") return ""
+    var requested = decimalString(value.requestedAmount)
+    var legacy = decimalString(value.amount)
+    if (requested && legacy && requested !== legacy) return ""
+    return requested || legacy
+  }
+
+  function projectSendOperation(value) {
+    if (!isSendOperation(value)) return null
+    return {
+      id: String(value.id),
+      type: "send",
+      state: String(value.state),
+      mintUrl: String(value.mintUrl),
+      unit: String(value.unit),
+      method: String(value.method || "default"),
+      requestedAmount: operationAmount(value),
+      amount: operationAmount(value),
+      fee: value.fee === undefined ? undefined : String(value.fee),
+      inputAmount: value.inputAmount === undefined
+        ? undefined : String(value.inputAmount),
+      needsSwap: value.needsSwap,
+      createdAt: String(value.createdAt),
+      updatedAt: String(value.updatedAt)
+    }
+  }
+
   function isSendOperation(value) {
     if (!value || typeof value !== "object" || containsSensitiveKey(value)
         || value.type !== "send" || typeof value.id !== "string"
         || value.id.length === 0
         || typeof value.mintUrl !== "string" || value.mintUrl.length === 0
-        || value.unit !== "sat" || !decimalString(value.amount)
+        || value.unit !== "sat" || !operationAmount(value)
         || typeof value.createdAt !== "string" || typeof value.updatedAt !== "string")
       return false
+    if (value.method !== undefined
+        && ["default", "p2pk"].indexOf(String(value.method)) === -1) return false
     var state = String(value.state || "")
     if (["init", "prepared", "executing", "pending", "finalized",
         "rolling_back", "rolled_back"].indexOf(state) === -1) return false
@@ -716,7 +786,19 @@ Item {
     if (!value || !value.error || typeof value.error.code !== "string"
         || typeof value.error.retryable !== "boolean")
       return { code: "invalid_error_document", retryable: false }
-    return { code: value.error.code, retryable: value.error.retryable }
+    return { code: normalizeNetworkErrorCode(value.error.code),
+      retryable: value.error.retryable }
+  }
+
+  function normalizeNetworkErrorCode(code) {
+    var aliases = {
+      not_found: "operation_not_found",
+      invalid_operation_state: "operation_conflict",
+      operation_in_progress: "operation_conflict",
+      operation_result_not_available: "result_not_available"
+    }
+    var value = String(code || "")
+    return aliases[value] || value
   }
 
   function sendRequest(method, path, body, callback, accept) {
@@ -927,20 +1009,19 @@ Item {
     receiveLookupTokens = ({})
     fullFetchInProgress = true
     var token = ++fullFetchToken
-    var capabilityRequest = sendRequest("GET", "/v1/capabilities", undefined,
+    var capabilityRequest = sendRequest("GET", "/v1/openapi.json", undefined,
       function(result) {
         if (token !== root.fullFetchToken) return
         if (!result.ok) {
           root.handleFetchFailure(result)
           return
         }
-        if (!root.isCapabilitiesShape(result.value)
-            || String(result.value.interfaceVersion || "") !== "1") {
+        if (!root.isOpenApiShape(result.value)) {
           root.fullFetchInProgress = false
           root.queuedReceiveInvalidations = ({})
           root.compatibilityState = "incompatible"
           root.connectionState = "error"
-          root.connectionDetail = "Required cocod v1 capabilities are unavailable"
+          root.connectionDetail = "Required cocod v1 OpenAPI resources are unavailable"
           root.lastErrorCode = "incompatible_contract"
           root.abortCanonicalRequests()
           return
@@ -954,7 +1035,7 @@ Item {
     canonicalRequests = [capabilityRequest]
   }
 
-  function fetchLifecycleForBootstrap(token, capabilities, connectAfterward) {
+  function fetchLifecycleForBootstrap(token, openApi, connectAfterward) {
     var request = sendRequest("GET", "/v1/status", undefined, function(result) {
       if (token !== root.fullFetchToken) return
       if (!result.ok) {
@@ -966,11 +1047,11 @@ Item {
         return
       }
       if (!result.value.wallet || String(result.value.cocoSession.state) !== "running") {
-        root.finishFullFetch(capabilities, result.value,
+        root.finishFullFetch(openApi, result.value,
           { items: [] }, { items: [] }, [], [], connectAfterward)
         return
       }
-      root.fetchWalletResources(token, capabilities, result.value, connectAfterward)
+      root.fetchWalletResources(token, openApi, result.value, connectAfterward)
     })
     if (!request) {
       handleCredentialUnavailable()
@@ -979,7 +1060,7 @@ Item {
     canonicalRequests.push(request)
   }
 
-  function fetchWalletResources(token, capabilities, status, connectAfterward) {
+  function fetchWalletResources(token, openApi, status, connectAfterward) {
     var specifications = [
       { key: "balances", path: "/v1/balances", type: "balances" },
       { key: "mints", path: "/v1/mints", type: "mints" },
@@ -1019,7 +1100,7 @@ Item {
               function(receives, needsFreshBalances) {
                 if (token !== root.fullFetchToken) return
                 if (!needsFreshBalances) {
-                  root.finishFullFetch(capabilities, status, values.balances,
+                  root.finishFullFetch(openApi, status, values.balances,
                     values.mints, receives, sends, connectAfterward)
                   return
                 }
@@ -1035,7 +1116,7 @@ Item {
                         "cocod returned invalid balances")
                       return
                     }
-                    root.finishFullFetch(capabilities, status, balanceResult.value,
+                    root.finishFullFetch(openApi, status, balanceResult.value,
                       values.mints, receives, sends, connectAfterward)
                   })
                 if (!balanceRequest) {
@@ -1232,13 +1313,13 @@ Item {
     }
   }
 
-  function finishFullFetch(capabilities, status, balances, mints, receives, sends,
+  function finishFullFetch(openApi, status, balances, mints, receives, sends,
       connectAfterward) {
     var queuedInvalidations = queuedReceiveInvalidations
     queuedReceiveInvalidations = ({})
     fullFetchInProgress = false
     canonicalRequests = []
-    capabilitiesResource = capabilities
+    openApiResource = openApi
     statusResource = status
     balancesResource = balances
     mintsResource = mints
@@ -1251,9 +1332,21 @@ Item {
     retryAttempt = 0
     retryDelayMs = 0
     refreshCount++
-    if (walletState !== "uninitialized") {
+    var sessionState = String(status.cocoSession.state || "")
+    if (creating && status.wallet && sessionState === "starting") {
+      createSettlementAttempts++
+      if (createSettlementAttempts < createSettlementMaximumAttempts)
+        createSettlementTimer.restart()
+      else {
+        creating = false
+        createError = "Wallet created, but its Coco Session is still starting"
+      }
+    } else if (walletState !== "uninitialized") {
+      createSettlementTimer.stop()
+      createSettlementAttempts = 0
       creating = false
-      createError = ""
+      createError = status.cocoSession.lastFailure
+        ? "Wallet created, but its Coco Session could not start" : ""
     }
     if (connectAfterward && walletState === "unlocked") startStream()
     if (receiveState === "reconciling" && receiveOperationId)
@@ -1432,7 +1525,7 @@ Item {
         || sendCommandRequest || fullFetchInProgress
         || sendState !== "idle"
         || connectionState !== "connected" || compatibilityState !== "compatible"
-        || walletState !== "unlocked") return false
+        || walletState !== "unlocked" || !sendMaxAvailable) return false
     sendMaxResource = null
     sendError = ""
     sendErrorCode = ""
@@ -1526,7 +1619,7 @@ Item {
       if (result.status !== 201 || !root.isSendOperation(result.value)
           || String(result.value.state) !== "prepared"
           || String(result.value.mintUrl) !== selectedMint
-          || String(result.value.amount) !== requestedAmount) {
+          || root.operationAmount(result.value) !== requestedAmount) {
         if (result.status === 201)
           root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
             knownOperationIds, "invalid_response")
@@ -1582,7 +1675,7 @@ Item {
       var operationId = String(operation.id || "")
       if (known[operationId] || String(operation.state || "") !== "prepared"
           || String(operation.mintUrl || "") !== String(context.mintUrl || "")
-          || String(operation.amount || "") !== String(context.amount || "")) continue
+          || root.operationAmount(operation) !== String(context.amount || "")) continue
       result.operation = operation
       result.matches++
     }
@@ -1895,7 +1988,7 @@ Item {
     var normalizedToken = String(token || "").trim()
     if (!normalizedToken || receiveRequest || receiveState !== "idle"
         || connectionState !== "connected" || compatibilityState !== "compatible"
-        || walletState !== "unlocked") return false
+        || walletState !== "unlocked" || !receiveCommandsAvailable) return false
     receivePreview = null
     receiveError = ""
     receiveState = "previewing"
@@ -2170,6 +2263,8 @@ Item {
   function createWallet() {
     if (creating || createRequest || connectionState !== "connected"
         || compatibilityState !== "compatible" || walletState !== "uninitialized") return false
+    createSettlementTimer.stop()
+    createSettlementAttempts = 0
     createError = ""
     creating = true
     var request = sendRequest("POST", "/v1/admin/wallet/initialize", {}, function(result) {
@@ -2182,6 +2277,8 @@ Item {
         return
       }
       root.creating = false
+      root.createSettlementTimer.stop()
+      root.createSettlementAttempts = 0
       root.lastErrorCode = result.error.code
       if (result.error.code === "wallet_already_configured") {
         root.createError = "A Wallet Instance already exists"
@@ -2729,6 +2826,15 @@ Item {
   }
 
   Timer {
+    id: createSettlementTimer
+    interval: 250
+    repeat: false
+    onTriggered: {
+      if (root.creating) root.fetchAllCanonicalResources(true)
+    }
+  }
+
+  Timer {
     id: rotationTimer
     interval: root.streamRotationMs
     repeat: false
@@ -2775,6 +2881,7 @@ Item {
     var command = createRequest
     createRequest = null
     creating = false
+    createSettlementTimer.stop()
     if (command) command.abort()
     cancelRecoveryPhraseReveal()
     stopStream()

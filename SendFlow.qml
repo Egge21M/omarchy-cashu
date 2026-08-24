@@ -305,7 +305,8 @@ Item {
 
       Text {
         width: parent.width
-        text: root.prepared ? String(root.prepared.amount || "0") + " sat" : ""
+        text: root.prepared && root.service
+          ? String(root.service.operationAmount(root.prepared) || "0") + " sat" : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.display
