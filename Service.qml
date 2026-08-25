@@ -132,7 +132,10 @@ Item {
   property var sendCommandRequest: null
   property var sendReconcileRequests: []
   property string activePendingCommandOperationId: ""
+  property string activePreparedCommandOperationId: ""
   property var pendingSendActions: ({})
+  property var preparedSendActions: ({})
+  property int sendPreparationIntentSequence: 0
   property int sendPresentationContextGeneration: 0
   property string privateSendCredentialContext: ""
   property string privateSendDaemonContext: ""
@@ -141,7 +144,6 @@ Item {
   property string sendError: ""
   property string sendErrorCode: ""
   property string sendOperationId: ""
-  property bool sendCancelOnPrepared: false
   property var sendAmbiguousCreation: null
   property bool sendResultReconciling: false
   property bool sendDismissAfterResult: false
@@ -486,6 +488,58 @@ Item {
       ? operation : null
   }
 
+  function preparedSendAction(operationId) {
+    var id = String(operationId || "")
+    var action = id ? preparedSendActions[id] : null
+    return action || {
+      operationId: id,
+      state: "idle",
+      errorCode: "",
+      error: "",
+      terminalState: ""
+    }
+  }
+
+  function updatePreparedSendAction(operationId, state, errorCode, terminalState) {
+    var id = String(operationId || "")
+    if (!id) return
+    var actions = ({})
+    for (var key in preparedSendActions) actions[key] = preparedSendActions[key]
+    var code = String(errorCode || "")
+    actions[id] = {
+      operationId: id,
+      state: String(state || "idle"),
+      errorCode: code,
+      error: code ? preparedSendErrorMessage(code) : "",
+      terminalState: String(terminalState || "")
+    }
+    preparedSendActions = actions
+  }
+
+  function acknowledgePreparedSendTerminal(operationId) {
+    var id = String(operationId || "")
+    var action = preparedSendActions[id]
+    if (!action || !action.terminalState) return false
+    var actions = ({})
+    for (var key in preparedSendActions)
+      if (key !== id) actions[key] = preparedSendActions[key]
+    preparedSendActions = actions
+    return true
+  }
+
+  function preparedSendErrorMessage(code) {
+    var messages = {
+      coco_error: "cocod could not complete this exact Prepared Send. Refresh, Confirm, or Cancel when available.",
+      operation_conflict: "This Prepared Send changed in cocod. Its canonical state and balances were refreshed.",
+      operation_not_found: "cocod no longer reports this exact Prepared Send Operation.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid response for this exact Prepared Send.",
+      transport_unavailable: "This Prepared Send could not reach cocod. Refresh and try again."
+    }
+    return messages[String(code || "")]
+      || "This exact Prepared Send could not be completed. Refresh and try again."
+  }
+
   function pendingSendAction(operationId) {
     var id = String(operationId || "")
     var action = id ? pendingSendActions[id] : null
@@ -542,22 +596,6 @@ Item {
     }
     return messages[String(code || "")]
       || "This exact Send could not be completed. Refresh and try again."
-  }
-
-  function firstCanonicalPreparedSend() {
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
-    for (var index = 0; index < operations.length; index++)
-      if (String(operations[index].state || "") === "prepared")
-        return operations[index]
-    return null
-  }
-
-  function firstCanonicalPendingSend() {
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
-    for (var index = 0; index < operations.length; index++)
-      if (String(operations[index].state || "") === "pending")
-        return operations[index]
-    return null
   }
 
   function reconcileFocusedPreparedSend() {
@@ -729,6 +767,10 @@ Item {
         mintUrl: String(value.mintUrl || ""),
         mintHostname: mintHostname(value.mintUrl),
         updatedAt: String(value.updatedAt || ""),
+        requestedAmount: operationAmount(value) || "0",
+        fee: value.fee === undefined ? "" : String(value.fee),
+        inputAmount: value.inputAmount === undefined ? "" : String(value.inputAmount),
+        needsSwap: value.needsSwap === true,
         reservedInput: valueState === "prepared"
           ? String(value.inputAmount || "0") : ""
       })
@@ -944,7 +986,7 @@ Item {
     return aliases[value] || value
   }
 
-  function sendRequest(method, path, body, callback, accept) {
+  function sendRequest(method, path, body, callback, accept, headers) {
     var credential = clientCredential()
     if (!credential) return null
     observeSendTransportContext(credential)
@@ -974,6 +1016,9 @@ Item {
     request.open(method, daemonBaseUrl + path, true)
     request.setRequestHeader("Accept", accept || "application/json")
     request.setRequestHeader("Authorization", "Bearer " + credential)
+    var requestHeaders = headers || ({})
+    for (var headerName in requestHeaders)
+      request.setRequestHeader(String(headerName), String(requestHeaders[headerName]))
     if (body !== undefined) request.setRequestHeader("Content-Type", "application/json")
     if (body === undefined) request.send()
     else request.send(JSON.stringify(body))
@@ -1496,13 +1541,6 @@ Item {
     for (var operationId in queuedInvalidations)
       refetchReceiveOperation(operationId)
     reconcileAmbiguousSendFromCanonical()
-    if (sendCancelOnPrepared && sendOperationId
-        && ["review", "error"].indexOf(sendState) !== -1) {
-      if (cancelPreparedSend()) sendCancelOnPrepared = false
-    } else if (sendCancelOnPrepared && !sendAmbiguousCreation) {
-      sendCancelOnPrepared = false
-      resetSend()
-    }
     resumeDeferredCanonicalReconcile()
   }
 
@@ -1612,24 +1650,12 @@ Item {
   }
 
   function resetSend() {
-    if (activePendingCommandOperationId) return true
-    if (["preparing", "cancelling", "executing", "reclaiming"]
-        .indexOf(sendState) !== -1
-        || (sendState === "review" && sendPreparedOperation)
+    if (sendCommandRequest || sendReconcileRequests.length > 0
         || sendResultReconciling) return false
-    var request = sendCommandRequest
-    sendCommandRequest = null
-    if (request) {
-      request.onreadystatechange = null
-      request.abort()
-    }
-    abortRequests(sendReconcileRequests)
-    sendReconcileRequests = []
     sendState = "idle"
     sendError = ""
     sendErrorCode = ""
     sendOperationId = ""
-    sendCancelOnPrepared = false
     sendAmbiguousCreation = null
     sendDismissAfterResult = false
     resumeDeferredCanonicalReconcile()
@@ -1637,71 +1663,44 @@ Item {
   }
 
   function beginSendFlow() {
-    if (["preparing", "cancelling", "executing", "reclaiming"]
-        .indexOf(sendState) !== -1 || sendResultReconciling) return false
-    sendCancelOnPrepared = false
-    var pending = sendPendingOperation || firstCanonicalPendingSend()
-    if (pending) {
-      sendOperationId = String(pending.id)
-      sendError = ""
-      sendErrorCode = ""
-      return retrievePendingSendResult(sendOperationId)
-    }
-    var prepared = sendPreparedOperation || firstCanonicalPreparedSend()
-    if (prepared) {
-      sendOperationId = String(prepared.id)
-      sendError = ""
-      sendErrorCode = ""
-      sendState = "review"
-      return true
-    }
-    if (sendState === "error"
-        && (sendOperationId !== "" || sendAmbiguousCreation)) return true
-    return resetSend()
+    if (sendCommandRequest || sendReconcileRequests.length > 0
+        || sendResultReconciling) return false
+    // Opening Send is a new preparation intent. Durable Prepared and Pending
+    // Sends are only selected by their exact IDs from Active Sends.
+    sendState = "idle"
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendAmbiguousCreation = null
+    sendDismissAfterResult = false
+    return true
   }
 
   function dismissSendFlow() {
-    if (activePendingCommandOperationId) return true
-    if (sendState === "preparing") {
-      sendCancelOnPrepared = true
-      return true
-    }
-    if (["executing", "reclaiming"].indexOf(sendState) !== -1) return false
-    if (sendState === "cancelling") return true
-    if (sendState === "result" && sendResultReconciling) {
+    // Leaving presentation never mutates a durable Send. An in-flight command
+    // keeps its captured intent and finishes in the shared mutation lane.
+    if (sendResultReconciling) {
       sendDismissAfterResult = true
       return true
     }
-    if (sendAmbiguousCreation) {
-      sendCancelOnPrepared = true
-      beginReconcile("send-ambiguous-dismiss")
-      return true
+    if (!sendCommandRequest && sendReconcileRequests.length === 0
+        && !sendResultReconciling) {
+      sendState = "idle"
+      sendError = ""
+      sendErrorCode = ""
+      sendOperationId = ""
+      sendAmbiguousCreation = null
+      sendDismissAfterResult = false
     }
-    if (sendCanCancelReservation) {
-      if (fullFetchInProgress) {
-        sendCancelOnPrepared = true
-        return true
-      }
-      sendCancelOnPrepared = false
-      return cancelPreparedSend()
-    }
-    return resetSend()
+    return true
   }
 
   function cancelSendFlow() {
-    if (sendCanCancelReservation) {
-      if (fullFetchInProgress) {
-        sendCancelOnPrepared = true
-        return "dismissed"
-      }
+    // This is the explicit Cancel action inside a Prepared Send review. It is
+    // deliberately separate from panel close/back navigation.
+    if (sendCanCancelReservation)
       return cancelPreparedSend() ? "cancelling" : ""
-    }
-    if (sendAmbiguousCreation) {
-      sendCancelOnPrepared = true
-      beginReconcile("send-ambiguous-dismiss")
-      return "dismissed"
-    }
-    return resetSend() ? "dismissed" : ""
+    return dismissSendFlow() ? "dismissed" : ""
   }
 
   function reconcileFailedReclaim(code, operationId) {
@@ -1731,31 +1730,51 @@ Item {
     for (var index = 0; index < eligible.length; index++)
       if (String(eligible[index].mintUrl || "") === selectedMint) canFund = true
     if (!canFund) return false
-    var knownOperationIds = ({})
-    for (var operationIndex = 0; operationIndex < sendOperations.length;
-        operationIndex++)
-      knownOperationIds[String(sendOperations[operationIndex].id || "")] = true
     sendError = ""
     sendErrorCode = ""
     sendOperationId = ""
-    sendCancelOnPrepared = false
     sendAmbiguousCreation = null
+    var context = {
+      idempotencyKey: newSendIdempotencyKey(),
+      requestBody: {
+        mintUrl: selectedMint,
+        unit: "sat",
+        amount: requestedAmount
+      },
+      failureCode: ""
+    }
+    return submitSendPreparation(context)
+  }
+
+  function newSendIdempotencyKey() {
+    sendPreparationIntentSequence++
+    return "send-" + Date.now().toString(36) + "-"
+      + sendPreparationIntentSequence.toString(36) + "-"
+      + Math.floor(Math.random() * 0x100000000).toString(36)
+  }
+
+  function submitSendPreparation(context) {
+    if (!context || !context.idempotencyKey || !context.requestBody
+        || fullFetchInProgress || sendCommandRequest
+        || sendReconcileRequests.length > 0) return false
+    var selectedMint = String(context.requestBody.mintUrl || "")
+    var requestedAmount = String(context.requestBody.amount || "")
     abortIncrementalSendFetches()
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
     sendState = "preparing"
-    var request = root.sendRequest("POST", "/v1/operations/send", {
-      mintUrl: selectedMint,
-      unit: "sat",
-      amount: requestedAmount
-    }, function(result) {
+    var request = root.sendRequest("POST", "/v1/operations/send", context.requestBody,
+      function(result) {
       if (request !== root.sendCommandRequest) return
       root.sendCommandRequest = null
       if (!result.ok) {
         if (result.status === 0
             || (result.status === 201 && result.error.code === "invalid_response")) {
-          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
-            knownOperationIds, result.error.code)
+          root.reconcileAmbiguousSendCreation(context, result.error.code)
           return
         }
+        root.sendAmbiguousCreation = null
         if (result.error.code === "coco_error") {
           root.reconcileSendResources(function() {
             root.failSend("coco_error")
@@ -1772,8 +1791,7 @@ Item {
           || String(result.value.mintUrl) !== selectedMint
           || root.operationAmount(result.value) !== requestedAmount) {
         if (result.status === 201)
-          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
-            knownOperationIds, "invalid_response")
+          root.reconcileAmbiguousSendCreation(context, "invalid_response")
         else root.failSend("invalid_response")
         return
       }
@@ -1784,7 +1802,7 @@ Item {
       }, function(code) {
         root.finishPreparedSendReconciliation(code)
       })
-    })
+    }, undefined, { "Idempotency-Key": String(context.idempotencyKey) })
     if (!request) {
       failSend("credential_unavailable")
       return false
@@ -1793,78 +1811,149 @@ Item {
     return true
   }
 
-  function reconcileAmbiguousSendCreation(mintUrl, amount, knownOperationIds,
-      failureCode) {
-    sendAmbiguousCreation = {
-      mintUrl: String(mintUrl),
-      amount: String(amount),
-      knownOperationIds: knownOperationIds,
-      failureCode: String(failureCode || "transport_unavailable")
-    }
+  function retryAmbiguousSendCreation() {
+    if (!sendAmbiguousCreation || sendState !== "error") return false
+    return submitSendPreparation(sendAmbiguousCreation)
+  }
+
+  function reconcileAmbiguousSendCreation(context, failureCode) {
+    context.failureCode = String(failureCode || "transport_unavailable")
+    sendAmbiguousCreation = context
     sendState = "preparing"
     reconcileSendResources(function() {
-      var match = root.matchAmbiguousSendCreation(root.sendAmbiguousCreation)
-      if (match.matches !== 1) {
-        if (match.matches === 0) root.sendAmbiguousCreation = null
-        root.failSend(match.matches > 1 ? "invalid_response" : failureCode)
-        return
-      }
-      root.sendAmbiguousCreation = null
-      root.sendOperationId = String(match.operation.id)
-      root.finishPreparedSendReconciliation("")
+      // The Idempotency-Key is the only safe identity for this create intent.
+      // Canonical mint/amount matches may belong to another client.
+      root.failSend(context.failureCode)
     }, function() {
-      root.failSend(failureCode)
+      root.failSend(context.failureCode)
     })
   }
 
-  function matchAmbiguousSendCreation(context) {
-    var result = { operation: null, matches: 0 }
-    if (!context) return result
-    var known = context.knownOperationIds || ({})
-    for (var index = 0; index < sendOperations.length; index++) {
-      var operation = sendOperations[index]
-      var operationId = String(operation.id || "")
-      if (known[operationId] || String(operation.state || "") !== "prepared"
-          || String(operation.mintUrl || "") !== String(context.mintUrl || "")
-          || root.operationAmount(operation) !== String(context.amount || "")) continue
-      result.operation = operation
-      result.matches++
-    }
-    return result
-  }
-
   function reconcileAmbiguousSendFromCanonical() {
-    if (!sendAmbiguousCreation) return
-    var context = sendAmbiguousCreation
-    var match = matchAmbiguousSendCreation(context)
-    if (match.matches === 1) {
-      sendAmbiguousCreation = null
-      sendOperationId = String(match.operation.id)
-      finishPreparedSendReconciliation("")
-      return
-    }
-    if (match.matches > 1) {
-      failSend("invalid_response")
-      return
-    }
-    sendAmbiguousCreation = null
-    if (sendCancelOnPrepared) {
-      sendCancelOnPrepared = false
-      resetSend()
-    } else if (sendState === "preparing") {
-      failSend(String(context.failureCode || "transport_unavailable"))
-    }
+    // Never infer the identity of an ambiguous Send from collection contents.
+    // A user retry replays the exact body with the retained Idempotency-Key.
   }
 
   function finishPreparedSendReconciliation(code) {
     if (code) failSend(code)
     else if (!sendPreparedOperation) failSend("invalid_response")
     else sendState = "review"
-    if (sendCancelOnPrepared && sendOperationId && cancelPreparedSend()) {
-      sendCancelOnPrepared = false
-      return
-    }
     resumeDeferredCanonicalReconcile()
+  }
+
+  function reconcileActivePreparedSend(operationId, expectedTerminal, outcomeCode) {
+    var id = String(operationId || "")
+    var expected = String(expectedTerminal || "")
+    reconcileSendResources(function() {
+      root.activePreparedCommandOperationId = ""
+      var canonical = root.canonicalSendOperation(id)
+      var state = canonical ? String(canonical.state || "") : ""
+      if (expected === "pending" && state === "pending")
+        root.updatePreparedSendAction(id, "terminal", "", "pending")
+      else if (expected === "cancelled" && !canonical)
+        root.updatePreparedSendAction(id, "terminal", "", "cancelled")
+      else if (state === "prepared")
+        root.updatePreparedSendAction(id, outcomeCode ? "error" : "idle",
+          outcomeCode, "")
+      else if (state === "pending")
+        root.updatePreparedSendAction(id, "terminal", "", "pending")
+      else root.updatePreparedSendAction(id, "terminal",
+        outcomeCode || "operation_not_found", "unavailable")
+      root.resumeDeferredCanonicalReconcile()
+    }, function(code) {
+      root.activePreparedCommandOperationId = ""
+      root.updatePreparedSendAction(id, "error",
+        code || outcomeCode || "transport_unavailable", "")
+      root.resumeDeferredCanonicalReconcile()
+    })
+  }
+
+  function executeActivePreparedSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "prepared"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    abortIncrementalSendFetches()
+    activePreparedCommandOperationId = id
+    updatePreparedSendAction(id, "executing", "", "")
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/execute", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePreparedSend(id, "", result.error.code)
+          return
+        }
+        var exact = result.value && result.value.operation
+          ? result.value.operation : null
+        var resultDocument = result.value && result.value.result
+          ? result.value.result : null
+        if (result.status !== 200 || !root.isSendOperation(exact)
+            || String(exact.id || "") !== id
+            || String(exact.state || "") !== "pending"
+            || !root.isSendResult(resultDocument)) {
+          root.reconcileActivePreparedSend(id, "", "invalid_response")
+          return
+        }
+        // Confirmation from Active Sends does not reveal bearer material.
+        resultDocument.token = ""
+        root.reconcileActivePreparedSend(id, "pending", "")
+      })
+    if (!request) {
+      activePreparedCommandOperationId = ""
+      updatePreparedSendAction(id, "error", "credential_unavailable", "")
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function cancelActivePreparedSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "prepared"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    abortIncrementalSendFetches()
+    activePreparedCommandOperationId = id
+    updatePreparedSendAction(id, "cancelling", "", "")
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/cancel", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePreparedSend(id, "", result.error.code)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id
+            || String(result.value.state || "") !== "rolled_back") {
+          root.reconcileActivePreparedSend(id, "", "invalid_response")
+          return
+        }
+        root.reconcileActivePreparedSend(id, "cancelled", "")
+      })
+    if (!request) {
+      activePreparedCommandOperationId = ""
+      updatePreparedSendAction(id, "error", "credential_unavailable", "")
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function refreshActivePreparedSend(operationId) {
+    var id = String(operationId || "")
+    if (!id || !canonicalSendOperation(id) || !sendCommandsAvailable
+        || sendCommandRequest || sendReconcileRequests.length > 0
+        || sendResultReconciling) return false
+    activePreparedCommandOperationId = id
+    updatePreparedSendAction(id, "refreshing", "", "")
+    reconcileActivePreparedSend(id, "", "")
+    return true
   }
 
   function cancelPreparedSend() {

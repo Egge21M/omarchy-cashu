@@ -47,6 +47,24 @@ Item {
     })
   readonly property string selectedPendingSendTerminalState: String(
     selectedPendingSendAction.terminalState || "")
+  readonly property var selectedPreparedSendAction: stateOwner
+    && selectedActiveSendOperationId
+    && typeof stateOwner.preparedSendAction === "function"
+    ? stateOwner.preparedSendAction(selectedActiveSendOperationId) : ({
+      state: "idle", errorCode: "", error: "", terminalState: ""
+    })
+  readonly property string selectedPreparedSendTerminalState: String(
+    selectedPreparedSendAction.terminalState || "")
+  readonly property var selectedPreparedSendBalance: stateOwner && selectedActiveSend
+    && selectedActiveSend.state === "prepared"
+    && typeof stateOwner.sendBalanceForMint === "function"
+    ? stateOwner.sendBalanceForMint(selectedActiveSend.mintUrl) : null
+  readonly property bool selectedPreparedSendBusy: ["executing", "cancelling", "refreshing"]
+    .indexOf(String(selectedPreparedSendAction.state || "")) !== -1
+  readonly property bool selectedPreparedSendCommandsAvailable: !!selectedActiveSend
+    && selectedActiveSend.state === "prepared" && stateOwner
+    && stateOwner.sendCommandsAvailable !== false && !stateOwner.sendCommandRequest
+    && stateOwner.sendReconcileRequests.length === 0
 
   readonly property color foreground: shell && shell.bar
     ? shell.bar.foreground : Color.foreground
@@ -181,6 +199,8 @@ Item {
       activePendingSendFlow.leavePendingDetail()
       if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
         stateOwner.acknowledgePendingSendTerminal(selected)
+      if (stateOwner && typeof stateOwner.acknowledgePreparedSendTerminal === "function")
+        stateOwner.acknowledgePreparedSendTerminal(selected)
       selectedActiveSendOperationId = ""
       activeSendsViewState = "list"
       panelFlick.contentY = 0
@@ -199,6 +219,8 @@ Item {
     activePendingSendFlow.leavePendingDetail()
     if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
       stateOwner.acknowledgePendingSendTerminal(selected)
+    if (stateOwner && typeof stateOwner.acknowledgePreparedSendTerminal === "function")
+      stateOwner.acknowledgePreparedSendTerminal(selected)
     selectedActiveSendOperationId = ""
     activeSendsViewState = "closed"
   }
@@ -381,6 +403,27 @@ Item {
     return activePendingSendFlow.confirmActivePendingReclaim() ? "ok" : "disabled"
   }
 
+  function smokeConfirmActivePreparedSend() {
+    if (!selectedPreparedSendCommandsAvailable || !stateOwner
+        || typeof stateOwner.executeActivePreparedSend !== "function") return "disabled"
+    return stateOwner.executeActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
+  function smokeCancelActivePreparedSend() {
+    if (!selectedPreparedSendCommandsAvailable || !stateOwner
+        || typeof stateOwner.cancelActivePreparedSend !== "function") return "disabled"
+    return stateOwner.cancelActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
+  function smokeRefreshActivePreparedSend() {
+    if (!selectedActiveSend || selectedActiveSend.state !== "prepared" || !stateOwner
+        || typeof stateOwner.refreshActivePreparedSend !== "function") return "disabled"
+    return stateOwner.refreshActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -462,9 +505,24 @@ Item {
       selectedActiveSendOperationId: selectedActiveSendOperationId,
       selectedActiveSend: selectedActiveSend,
       activeSendDetailReadOnly: activeSendsViewState === "detail"
-        && !(selectedActiveSend && selectedActiveSend.state === "pending"),
+        && !(selectedActiveSend && ["prepared", "pending"]
+          .indexOf(selectedActiveSend.state) !== -1),
       activeSendMutationActionCount: activeSendsViewState === "detail"
-        && selectedActiveSend && selectedActiveSend.state === "pending" ? 4 : 0,
+        && selectedActiveSend && selectedActiveSend.state === "pending" ? 4
+        : activeSendsViewState === "detail" && selectedActiveSend
+          && selectedActiveSend.state === "prepared" ? 3 : 0,
+      activePreparedActionState: String(selectedPreparedSendAction.state || "idle"),
+      activePreparedErrorCode: String(selectedPreparedSendAction.errorCode || ""),
+      activePreparedError: String(selectedPreparedSendAction.error || ""),
+      activePreparedTerminalState: selectedPreparedSendTerminalState,
+      activePreparedConfirmAvailable: selectedPreparedSendCommandsAvailable,
+      activePreparedCancelAvailable: selectedPreparedSendCommandsAvailable,
+      activePreparedRefreshAvailable: !!selectedActiveSend
+        && selectedActiveSend.state === "prepared" && !selectedPreparedSendBusy,
+      activePreparedBalanceSpendable: selectedPreparedSendBalance
+        ? String(selectedPreparedSendBalance.spendable || "") : "",
+      activePreparedBalanceReserved: selectedPreparedSendBalance
+        ? String(selectedPreparedSendBalance.reserved || "") : "",
       activePendingActionState: activePendingSendFlow.pendingActionState,
       activePendingErrorCode: activePendingSendFlow.pendingErrorCode,
       activePendingError: activePendingSendFlow.pendingError,
@@ -488,6 +546,14 @@ Item {
       receiveFlow.panelClosed()
       sendFlow.panelClosed()
     }
+  }
+
+  onSelectedActiveSendChanged: {
+    if (activeSendsViewState === "detail" && selectedActiveSend
+        && selectedActiveSend.state === "pending"
+        && activePendingSendFlow.pendingOperationId !== selectedActiveSendOperationId)
+      activePendingSendFlow.focusPendingDetail(selectedActiveSendOperationId,
+        String(selectedActiveSend.amount || ""))
   }
 
   Component.onDestruction: clearRecoveryPhrase()
@@ -1153,6 +1219,7 @@ Item {
               Text {
                 visible: !root.selectedActiveSend
                   && root.selectedPendingSendTerminalState === ""
+                  && root.selectedPreparedSendTerminalState === ""
                 width: parent.width
                 text: "This Send is no longer active in cocod. Return to Active Sends."
                 color: root.dim
@@ -1182,8 +1249,18 @@ Item {
                   && root.selectedActiveSend.state === "prepared"
                 width: parent.width
                 text: root.selectedActiveSend
-                  ? "RESERVED INPUT\n"
-                    + root.amountText(root.selectedActiveSend.reservedInput) : ""
+                  ? "TRANSFER PREVIEW\nRequested · "
+                    + root.amountText(root.selectedActiveSend.requestedAmount)
+                    + "\nFee · " + root.amountText(root.selectedActiveSend.fee)
+                    + "\nInput · " + root.amountText(root.selectedActiveSend.inputAmount)
+                    + "\nSwap required · "
+                    + (root.selectedActiveSend.needsSwap ? "Yes" : "No")
+                    + (root.selectedPreparedSendBalance
+                      ? "\n\nCANONICAL MINT BALANCE\nSpendable · "
+                        + root.amountText(root.selectedPreparedSendBalance.spendable)
+                        + "\nReserved · "
+                        + root.amountText(root.selectedPreparedSendBalance.reserved)
+                      : "") : ""
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1192,12 +1269,98 @@ Item {
 
               Text {
                 visible: !!root.selectedActiveSend
+                  && ["prepared", "pending"].indexOf(root.selectedActiveSend.state) === -1
                 width: parent.width
                 text: "Read-only canonical Send details"
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 horizontalAlignment: Text.AlignHCenter
+              }
+
+              Text {
+                visible: root.selectedPreparedSendBusy
+                width: parent.width
+                text: root.selectedPreparedSendAction.state === "executing"
+                  ? "Confirming this exact Prepared Send…"
+                  : root.selectedPreparedSendAction.state === "cancelling"
+                    ? "Cancelling this exact Prepared Send…"
+                    : "Refreshing this exact Prepared Send…"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: String(root.selectedPreparedSendAction.error || "") !== ""
+                  && root.selectedPreparedSendTerminalState === ""
+                width: parent.width
+                text: String(root.selectedPreparedSendAction.error || "")
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: root.selectedPreparedSendTerminalState === "cancelled"
+                width: parent.width
+                text: "This exact Prepared Send was cancelled. Its reservation was released after canonical balance reconciliation."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+
+              Row {
+                visible: root.selectedActiveSend
+                  && root.selectedActiveSend.state === "prepared"
+                width: parent.width
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: "Confirm"
+                  iconText: "󰄬"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  enabled: root.selectedPreparedSendCommandsAvailable
+                  opacity: enabled ? 1 : 0.5
+                  onClicked: root.smokeConfirmActivePreparedSend()
+                }
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: "Cancel"
+                  iconText: "󰅖"
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  enabled: root.selectedPreparedSendCommandsAvailable
+                  opacity: enabled ? 1 : 0.5
+                  onClicked: root.smokeCancelActivePreparedSend()
+                }
+              }
+
+              Button {
+                visible: root.selectedActiveSend
+                  && root.selectedActiveSend.state === "prepared"
+                width: parent.width
+                text: "Refresh"
+                iconText: "󰑐"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !root.selectedPreparedSendBusy
+                  && root.stateOwner && !root.stateOwner.sendCommandRequest
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.smokeRefreshActivePreparedSend()
               }
 
               SendFlow {

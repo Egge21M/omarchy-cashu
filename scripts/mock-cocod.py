@@ -176,7 +176,7 @@ def operation_error(
 
 class MockState:
     def __init__(self, state_root: Path) -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.state_root = state_root
         self.wallet_configured = False
         self.status = self._status_document()
@@ -229,6 +229,10 @@ class MockState:
         self.receive_create_dropped_responses = 0
         self.receive_refresh_error = ""
         self.send_create_requests = 0
+        self.send_idempotency_unique_keys = 0
+        self.send_idempotency_replays = 0
+        self.send_idempotency_conflicts = 0
+        self.send_idempotency_cache: dict[str, dict[str, Any]] = {}
         self.send_create_delay_ms = 0
         self.send_execute_requests = 0
         self.send_cancel_requests = 0
@@ -599,31 +603,68 @@ class MockState:
             return 200, {"token": token}
 
     def create_send(
-        self, value: object
+        self, value: object, idempotency_key: str | None = None
     ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
         mint_url = value.get("mintUrl") if isinstance(value, dict) else None
         unit = value.get("unit") if isinstance(value, dict) else None
         amount = value.get("amount") if isinstance(value, dict) else None
+        canonical_request = json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+        def respond(
+            status: int, response: dict[str, Any], events: list[dict[str, Any]]
+        ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+            if idempotency_key:
+                with self.lock:
+                    self.send_idempotency_cache.setdefault(
+                        idempotency_key,
+                        {
+                            "request": canonical_request,
+                            "status": status,
+                            "response": copy.deepcopy(response),
+                        },
+                    )
+            return status, response, events
+
         with self.lock:
             self.send_create_requests += 1
+            if idempotency_key:
+                cached = self.send_idempotency_cache.get(idempotency_key)
+                if cached is not None:
+                    if cached["request"] != canonical_request:
+                        self.send_idempotency_conflicts += 1
+                        return 409, error_document(
+                            "idempotency_key_conflict",
+                            "The Idempotency-Key was already used for another request",
+                        ), []
+                    self.send_idempotency_replays += 1
+                    return int(cached["status"]), copy.deepcopy(cached["response"]), []
+                self.send_idempotency_unique_keys += 1
             mints = copy.deepcopy(self.resources["mints"]["items"])
         if not isinstance(mint_url, str) or not mint_url:
-            return 400, error_document("invalid_request", "A Mint URL is required"), []
+            return respond(
+                400, error_document("invalid_request", "A Mint URL is required"), []
+            )
         if unit != "sat":
-            return 400, error_document("invalid_request", "Only sat is supported"), []
+            return respond(
+                400, error_document("invalid_request", "Only sat is supported"), []
+            )
         if not isinstance(amount, str) or not re.fullmatch(r"[1-9][0-9]*", amount):
-            return 400, error_document("invalid_request", "A positive decimal amount is required"), []
+            return respond(
+                400,
+                error_document("invalid_request", "A positive decimal amount is required"),
+                [],
+            )
         mint = next((item for item in mints if item.get("mintUrl") == mint_url), None)
         if mint is None:
             status, response = operation_error(
                 "coco_error", "Coco could not prepare the Send Operation"
             )
-            return status, response, []
+            return respond(status, response, [])
         if mint.get("trusted") is not True:
             status, response = operation_error(
                 "coco_error", "Coco could not prepare the Send Operation"
             )
-            return status, response, []
+            return respond(status, response, [])
         with self.lock:
             forced_error = self.send_create_error
             self.send_create_error = ""
@@ -631,10 +672,10 @@ class MockState:
                 status, response = operation_error(
                     forced_error, "Coco could not prepare the Send Operation"
                 )
-                return status, response, []
+                return respond(status, response, [])
             if self.send_create_empty_id:
                 self.send_create_empty_id = False
-                return 201, {
+                return respond(201, {
                     "id": "",
                     "type": "send",
                     "state": "prepared",
@@ -647,7 +688,7 @@ class MockState:
                     "needsSwap": False,
                     "createdAt": FIXED_TIME,
                     "updatedAt": FIXED_TIME,
-                }, []
+                }, [])
             balance = next(
                 (
                     item
@@ -664,7 +705,7 @@ class MockState:
                 status, response = operation_error(
                     "coco_error", "Coco could not prepare the Send Operation"
                 )
-                return status, response, []
+                return respond(status, response, [])
             self.send_operation_sequence += 1
             operation_id = f"send-{self.send_operation_sequence}"
             operation = {
@@ -686,6 +727,12 @@ class MockState:
             balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
             self.send_operations[operation_id] = operation
             self.resources["sendPrepared"]["items"].append(copy.deepcopy(operation))
+            if idempotency_key:
+                self.send_idempotency_cache[idempotency_key] = {
+                    "request": canonical_request,
+                    "status": 201,
+                    "response": copy.deepcopy(operation),
+                }
             self._persist_locked()
         events = [
             self.safe_event(
@@ -1303,6 +1350,9 @@ class MockState:
                 "receivePrepareReconcileFailures": self.receive_prepare_reconcile_failures,
                 "receiveOperationCount": len(self.receive_operations),
                 "sendCreateRequests": self.send_create_requests,
+                "sendIdempotencyUniqueKeys": self.send_idempotency_unique_keys,
+                "sendIdempotencyReplays": self.send_idempotency_replays,
+                "sendIdempotencyConflicts": self.send_idempotency_conflicts,
                 "sendCreateDelayMs": self.send_create_delay_ms,
                 "sendExecuteRequests": self.send_execute_requests,
                 "sendCancelRequests": self.send_cancel_requests,
@@ -1873,7 +1923,8 @@ class Handler(BaseHTTPRequestHandler):
                 send_create_delay_ms = self.state.send_create_delay_ms
             if send_create_delay_ms > 0:
                 time.sleep(send_create_delay_ms / 1000)
-            status, response, events = self.state.create_send(value)
+            idempotency_key = self.headers.get("Idempotency-Key")
+            status, response, events = self.state.create_send(value, idempotency_key)
             if status == 0:
                 self.close_connection = True
                 return

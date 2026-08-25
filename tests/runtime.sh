@@ -1614,6 +1614,10 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":0,"sendCreateInterruption":"malformed_after_commit"}' \
   "$base_url/__test__/mode" >/dev/null
 panel_action prepareSend >/dev/null
+wait_panel_snapshot '.sendViewState == "error" and .sendErrorCode == "invalid_response"
+  and .activeSendsCount == 1' >/dev/null
+[[ $(panel_action retrySend) == "ok" ]] \
+  || fail "ambiguous malformed Send could not retry its exact intent"
 wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"' >/dev/null
 wait_mock_status '.resourceRequestsActive == 0' >/dev/null
 wait_panel_snapshot '
@@ -1645,6 +1649,8 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   }}' "$base_url/__test__/resources" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCreateDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_panel_snapshot '.sendViewState == "error" and .sendErrorCode == "invalid_response"' >/dev/null
+panel_action retrySend >/dev/null
 wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"' >/dev/null
 wait_mock_status ".resourceRequests.sendPrepared >= $((before_queued_send_event + 2))" >/dev/null
 panel_action cancelSend >/dev/null
@@ -1716,18 +1722,108 @@ wait_snapshot ".activeTransfers[0].id == \"$reloaded_send_id\"
   and .activeTransfers[0].state == \"prepared\"" >/dev/null
 panel_action openPanel >/dev/null
 [[ $(panel_action openSend) == "ok" ]] \
-  || fail "canonical Prepared Send could not be reopened"
+  || fail "fresh Send entry did not open beside a canonical Prepared Send"
+wait_panel_snapshot ".sendViewState == \"entry\"
+  and .sendAmount == \"\"
+  and .sendReviewAmount == \"\"
+  and .reservedBalance == \"70\"
+  and .activeSendsCount == 1
+  and .sendInputFocused == true" >/dev/null
+panel_action setSendAmount 20 >/dev/null
+[[ $(panel_action prepareSend) == "ok" ]] \
+  || fail "existing Prepared Send blocked a fundable fresh Send"
 wait_panel_snapshot ".sendViewState == \"review\"
-  and .sendReviewAmount == \"60\"
-  and .sendReviewReserved == \"70\"
-  and .sendInputFocused == false
-  and .keyCatcherBlocked == false" >/dev/null
+  and .sendReviewAmount == \"20\"
+  and .sendOperationId != \"$reloaded_send_id\"
+  and .activeSendsCount == 2
+  and .spendableBalance == \"0\" and .reservedBalance == \"100\"" >/dev/null
 panel_action cancelSend >/dev/null
-wait_panel_snapshot '.sendViewState == "entry" and .reservedBalance == "0"' >/dev/null
+wait_panel_snapshot '.sendViewState == "entry" and .activeSendsCount == 1
+  and .spendableBalance == "30" and .reservedBalance == "70"' >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+before_explicit_prepared_cancel=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendCancelRequests')
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$reloaded_send_id" >/dev/null
+wait_panel_snapshot ".activeSendsViewState == \"detail\"
+  and .selectedActiveSend.id == \"$reloaded_send_id\"
+  and .selectedActiveSend.state == \"prepared\"
+  and .selectedActiveSend.requestedAmount == \"60\"
+  and .selectedActiveSend.fee == \"2\"
+  and .selectedActiveSend.inputAmount == \"70\"
+  and .selectedActiveSend.needsSwap == true
+  and .activePreparedBalanceSpendable == \"30\"
+  and .activePreparedBalanceReserved == \"70\"
+  and .activePreparedConfirmAvailable == true
+  and .activePreparedCancelAvailable == true" >/dev/null
+[[ $(panel_action cancelActivePreparedSend) == "ok" ]] \
+  || fail "exact Prepared Send Cancel was unavailable"
+wait_panel_snapshot '.activePreparedTerminalState == "cancelled"
+  and .spendableBalance == "100" and .reservedBalance == "0"' >/dev/null
+wait_mock_status ".sendCancelRequests == $((before_explicit_prepared_cancel + 1))" >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
 
-echo "runtime: canonical Prepared Send reattaches after reconnect"
+echo "runtime: primary Send stays fresh and Prepared detail cancels exact Operation"
+
+fund_send_fixture 300
+first_prepared=$(curl -fsS -H "Authorization: Bearer $credential" \
+  -H 'Idempotency-Key: runtime-prepared-one' -H 'Content-Type: application/json' \
+  -X POST --data '{"mintUrl":"https://mint.one","unit":"sat","amount":"60"}' \
+  "$base_url/v1/operations/send")
+first_prepared_id=$(jq -er '.id' <<<"$first_prepared")
+second_prepared=$(curl -fsS -H "Authorization: Bearer $credential" \
+  -H 'Idempotency-Key: runtime-prepared-two' -H 'Content-Type: application/json' \
+  -X POST --data '{"mintUrl":"https://mint.one","unit":"sat","amount":"60"}' \
+  "$base_url/v1/operations/send")
+second_prepared_id=$(jq -er '.id' <<<"$second_prepared")
+adapter_call reconnect >/dev/null
+wait_snapshot "(.activeSends | length) == 2
+  and ([.activeSends[].id] | index(\"$first_prepared_id\") != null)
+  and ([.activeSends[].id] | index(\"$second_prepared_id\") != null)
+  and .spendableBalance == \"160\" and .reservedBalance == \"140\"" >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$first_prepared_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":800}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action confirmActivePreparedSend) == "ok" ]] \
+  || fail "first exact Prepared Send could not be confirmed"
+wait_panel_snapshot ".activePreparedActionState == \"executing\"
+  and .selectedActiveSendOperationId == \"$first_prepared_id\"" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "navigation was blocked during Prepared Send confirmation"
+[[ $(panel_action selectActiveSend "$second_prepared_id") == "ok" ]] \
+  || fail "unrelated Prepared Send was not browseable during confirmation"
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$second_prepared_id\"
+  and .activePreparedConfirmAvailable == false
+  and .activePreparedCancelAvailable == false" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_snapshot "(.activeSends | any(.id == \"$first_prepared_id\" and .state == \"pending\"))
+  and (.activeSends | any(.id == \"$second_prepared_id\" and .state == \"prepared\"))" >/dev/null
+wait_panel_snapshot '.activePreparedCancelAvailable == true' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":800}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action cancelActivePreparedSend) == "ok" ]] \
+  || fail "second exact Prepared Send could not be cancelled"
+wait_panel_snapshot '.activePreparedActionState == "cancelling"' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "navigation was blocked during Prepared Send cancellation"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_snapshot "(.activeSends | length) == 1
+  and .activeSends[0].id == \"$first_prepared_id\"
+  and .activeSends[0].state == \"pending\"
+  and .spendableBalance == \"230\" and .reservedBalance == \"70\"" >/dev/null
+panel_action backActiveSends >/dev/null
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$first_prepared_id/reclaim" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.activeSends == [] and .reservedBalance == "0"' >/dev/null
+
+echo "runtime: multiple Prepared Sends mutate exactly and remain browseable in one lane"
 
 for external_send_state in removed pending; do
   fund_send_fixture 100
@@ -1764,11 +1860,14 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$base_url/__test__/mode" >/dev/null
 panel_action prepareSend >/dev/null
 wait_panel_snapshot '
-  .sendViewState == "review"
-  and .sendReviewAmount == "60"
-  and .sendReviewReserved == "70"
-  and .activeTransferCount == 1
+  .sendViewState == "error"
+  and .sendErrorCode == "invalid_response"
+  and .activeSendsCount == 1
+  and .sendReviewAmount == ""
 ' >/dev/null
+panel_action retrySend >/dev/null
+wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"
+  and .sendReviewReserved == "70"' >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '
   .sendViewState == "entry"
@@ -1778,25 +1877,34 @@ wait_panel_snapshot '
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: malformed committed Send creation reconciles its reservation"
+echo "runtime: malformed committed Send retries by Idempotency-Key"
 
 fund_send_fixture 100
 open_send_flow 60
-before_ambiguous_create=$(curl -fsS "$base_url/__test__/status" \
-  | jq -r '.sendCreateRequests')
+before_ambiguous_status=$(curl -fsS "$base_url/__test__/status")
+before_ambiguous_create=$(jq -r '.sendCreateRequests' <<<"$before_ambiguous_status")
+before_ambiguous_unique=$(jq -r '.sendIdempotencyUniqueKeys' <<<"$before_ambiguous_status")
+before_ambiguous_replays=$(jq -r '.sendIdempotencyReplays' <<<"$before_ambiguous_status")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCreateInterruption":"after_commit"}' \
   "$base_url/__test__/mode" >/dev/null
 panel_action prepareSend >/dev/null
 wait_panel_snapshot '
-  .sendViewState == "review"
-  and .sendReviewAmount == "60"
-  and .sendReviewReserved == "70"
-  and .activeTransferCount == 1
+  .sendViewState == "error"
+  and .sendErrorCode == "transport_unavailable"
+  and .sendReviewAmount == ""
+  and .activeSendsCount == 1
 ' >/dev/null
 wait_mock_status ".sendCreateRequests == $((before_ambiguous_create + 1))" >/dev/null
 [[ $(panel_action prepareSend) == "disabled" ]] \
-  || fail "ambiguous Send creation allowed a duplicate retry"
+  || fail "ambiguous Send creation allowed an unkeyed duplicate preparation"
+[[ $(panel_action retrySend) == "ok" ]] \
+  || fail "ambiguous Send creation did not expose Retry"
+wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"
+  and .sendReviewReserved == "70"' >/dev/null
+wait_mock_status ".sendCreateRequests == $((before_ambiguous_create + 2))
+  and .sendIdempotencyUniqueKeys == $((before_ambiguous_unique + 1))
+  and .sendIdempotencyReplays == $((before_ambiguous_replays + 1))" >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '
   .sendViewState == "entry"
@@ -1806,7 +1914,7 @@ wait_panel_snapshot '
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: ambiguous Send creation reconciles its committed reservation"
+echo "runtime: ambiguous Send retry reuses one Idempotency-Key and reservation"
 
 fund_send_fixture 100
 open_send_flow 60
@@ -1828,16 +1936,22 @@ wait_snapshot '
   and .activeTransfers == []
 ' >/dev/null
 adapter_call reconnect >/dev/null
-wait_mock_status ".sendCancelRequests > $before_deferred_ambiguous_cancel" >/dev/null
+wait_mock_status ".sendCancelRequests == $before_deferred_ambiguous_cancel" >/dev/null
 wait_snapshot '
   .connectionState == "connected"
-  and .sendState == "idle"
-  and .spendableBalance == "100"
-  and .reservedBalance == "0"
-  and .activeTransfers == []
+  and .sendState == "error"
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1
 ' >/dev/null
+deferred_ambiguous_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$deferred_ambiguous_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
-echo "runtime: deferred ambiguous Send cancellation survives failed reconciliation"
+echo "runtime: closing an ambiguous Send never cancels its durable reservation"
 
 fund_send_fixture 100
 open_send_flow 60
@@ -1879,15 +1993,21 @@ wait_panel_snapshot '.sendViewState == "preparing"' >/dev/null
   || fail "panel could not close while Send preparation was reconciling"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":0}' "$base_url/__test__/mode" >/dev/null
-wait_mock_status ".sendCancelRequests > $before_deferred_cancel" >/dev/null
+wait_mock_status ".sendCancelRequests == $before_deferred_cancel" >/dev/null
+adapter_call reconnect >/dev/null
 wait_snapshot '
-  .sendState == "idle"
-  and .spendableBalance == "100"
-  and .reservedBalance == "0"
-  and .activeTransfers == []
+  .spendableBalance == "30"
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1
 ' >/dev/null
+deferred_prepared_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$deferred_prepared_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
-echo "runtime: hidden preparation releases its reservation after reconciliation failure"
+echo "runtime: hidden preparation remains durable after reconciliation failure"
 
 prepare_send_flow 60 https://mint.one
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -1899,8 +2019,8 @@ panel_action closePanel >/dev/null
 sleep 0.25
 after_hidden_cancel=$(curl -fsS "$base_url/__test__/status" \
   | jq -r '.sendCancelRequests')
-[[ $after_hidden_cancel -eq $((before_hidden_cancel + 1)) ]] \
-  || fail "panel dismissal retried Prepared Send cancellation without user intent"
+[[ $after_hidden_cancel -eq $before_hidden_cancel ]] \
+  || fail "panel dismissal signalled Prepared Send cancellation"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCancelError":""}' "$base_url/__test__/mode" >/dev/null
 hidden_prepared_id=$(curl -fsS -H "Authorization: Bearer $credential" \
@@ -1910,7 +2030,7 @@ curl -fsS -H "Authorization: Bearer $credential" -X POST \
 adapter_call reconnect >/dev/null
 wait_snapshot '.activeTransfers == [] and .reservedBalance == "0"' >/dev/null
 
-echo "runtime: panel dismissal makes one Prepared Send cancellation attempt"
+echo "runtime: panel dismissal never cancels a Prepared Send"
 
 prepare_send_flow 60 https://mint.one
 wait_panel_snapshot '.sendReviewAmount == "60"' >/dev/null
@@ -1924,9 +2044,6 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 [[ $(panel_action confirmSend) == "ok" ]] \
   || fail "Prepared Send could not be explicitly confirmed"
 wait_panel_snapshot '.sendViewState == "executing"' >/dev/null
-[[ $(panel_action closePanel) == "disabled" ]] \
-  || fail "panel closed while the one-shot Send result was still in flight"
-wait_panel_snapshot '.opened == true and .sendViewState == "executing"' >/dev/null
 wait_mock_status ".sendExecuteRequests > $before_send_execute_count" >/dev/null
 sleep 0.1
 canonical_execute_snapshot=$(panel_call)
@@ -2100,8 +2217,15 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 wait_snapshot '.connectionState == "connected"
   and .canonicalRefreshInProgress == false
   and .sendState == "idle"
-  and .reservedBalance == "0"' >/dev/null
-wait_mock_status ".sendCancelRequests > $before_refresh_dismiss_cancel" >/dev/null
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1' >/dev/null
+wait_mock_status ".sendCancelRequests == $before_refresh_dismiss_cancel" >/dev/null
+refresh_dismissed_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$refresh_dismissed_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
 echo "runtime: Send commands wait for full canonical fetch completion"
 
@@ -2246,33 +2370,38 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendResultUnavailableResponses":1}' \
   "$base_url/__test__/mode" >/dev/null
 [[ $(panel_action openSend) == "ok" ]] \
-  || fail "reloaded Pending Send could not be reopened"
-wait_panel_snapshot '.sendViewState == "pending"
-  and .sendErrorCode == "result_not_available"
-  and .sendError != ""
-  and .sendCopyAvailable == false
+  || fail "fresh Send entry did not open beside a reloaded Pending Send"
+wait_panel_snapshot '.sendViewState == "entry" and .sendAmount == ""
   and .activeTransferStateLabel == "Pending Send"' >/dev/null
-[[ $(panel_action retrySend) == "ok" ]] \
-  || fail "retryable Pending Send result could not be requested again"
-wait_panel_snapshot '.sendViewState == "result"
-  and .sendCopyAvailable == true' >/dev/null
+panel_action cancelSend >/dev/null
+reloaded_pending_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$reloaded_pending_id" >/dev/null
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "exact reloaded Pending Send result could not be requested"
+wait_panel_snapshot '.activePendingActionState == "error"
+  and .activePendingErrorCode == "result_not_available"
+  and .activePendingError != ""
+  and .activePendingCopyAvailable == true' >/dev/null
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "retryable exact Pending Send result could not be requested again"
+wait_panel_snapshot '.activePendingActionState == "idle"' >/dev/null
 wait_mock_status ".sendCreateRequests == $before_dropped_send_creates
   and .sendExecuteRequests == $((before_dropped_send_executes + 1))
   and .sendResultRequests >= 3" >/dev/null
-[[ $(panel_action beginReclaimSend) == "ok" ]] \
+[[ $(panel_action beginActivePendingReclaim) == "ok" ]] \
   || fail "Pending Send did not offer Reclaim"
-wait_panel_snapshot '.sendViewState == "reclaim-warning"
-  and .sendReclaimWarningVisible == true
-  and (.sendReclaimWarning | test("race"; "i"))' >/dev/null
-[[ $(panel_action confirmReclaimSend) == "ok" ]] \
+wait_panel_snapshot '.activePendingReclaimWarningVisible == true
+  and (.activePendingReclaimWarning | test("race"; "i"))' >/dev/null
+[[ $(panel_action confirmActivePendingReclaim) == "ok" ]] \
   || fail "warned Pending Send Reclaim could not begin"
-wait_panel_snapshot '.sendViewState == "reclaimed"
+wait_panel_snapshot '.activePendingTerminalState == "reclaimed"
   and .spendableBalance == "100"
   and .reservedBalance == "0"
-  and .activeTransferCount == 0
-  and .sendCopyAvailable == false' >/dev/null
-panel_action doneSend >/dev/null
-wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+  and .activeTransferCount == 0' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
 panel_action closePanel >/dev/null
 
 echo "runtime: dropped Send recovery, reload, explicit result, and warned Reclaim passed"

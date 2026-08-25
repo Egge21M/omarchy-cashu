@@ -228,5 +228,17 @@ ShellRoot {
     function confirmActivePendingReclaim(): string {
       return walletPanel.smokeConfirmActivePendingReclaim()
     }
+
+    function confirmActivePreparedSend(): string {
+      return walletPanel.smokeConfirmActivePreparedSend()
+    }
+
+    function cancelActivePreparedSend(): string {
+      return walletPanel.smokeCancelActivePreparedSend()
+    }
+
+    function refreshActivePreparedSend(): string {
+      return walletPanel.smokeRefreshActivePreparedSend()
+    }
   }
 }

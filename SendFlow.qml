@@ -67,6 +67,8 @@ Item {
     && typeof service.sendBalanceForMint === "function"
     ? service.sendBalanceForMint(prepared.mintUrl) : null
   readonly property string error: service ? String(service.sendError || "") : ""
+  readonly property bool ambiguousPreparation: service
+    && !!service.sendAmbiguousCreation
   readonly property bool commandsAvailable: service
     && service.sendCommandsAvailable !== false
   readonly property bool prepareEnabled: viewState === "entry" && amountValid
@@ -275,6 +277,9 @@ Item {
   }
 
   function retryPending() {
+    if (ambiguousPreparation && service
+        && typeof service.retryAmbiguousSendCreation === "function")
+      return service.retryAmbiguousSendCreation()
     if (!service || !service.sendPendingOperation
         || typeof service.retrievePendingSendResult !== "function") return false
     return service.retrievePendingSendResult(service.sendPendingOperation.id)
@@ -526,8 +531,8 @@ Item {
     Button {
       visible: root.viewState === "pending"
         || (root.viewState === "error" && root.service
-          && !!root.service.sendPendingOperation)
-      text: "Check Pending Send"
+          && (!!root.service.sendPendingOperation || root.ambiguousPreparation))
+      text: root.ambiguousPreparation ? "Retry preparation" : "Check Pending Send"
       iconText: "󰑐"
       foreground: root.foreground
       fontFamily: root.fontFamily
@@ -635,9 +640,10 @@ Item {
 
     Button {
       visible: root.viewState === "entry" || root.viewState === "review"
-        || root.viewState === "error"
-      text: root.viewState === "error" ? "Back"
-        : root.viewState === "review" ? "Back and release reservation" : "Cancel"
+        || root.viewState === "error" || ["preparing", "cancelling", "executing",
+          "recovering-result", "reclaiming"].indexOf(root.viewState) !== -1
+      text: root.viewState === "entry" ? "Cancel"
+        : root.viewState === "review" ? "Cancel Prepared Send" : "Back"
       iconText: root.viewState === "error" ? "󰁍" : "󰅖"
       foreground: root.foreground
       fontFamily: root.fontFamily
