@@ -87,6 +87,10 @@ _Avoid_: Draft Send, Pending Send
 A Send whose encoded Cashu token has been created but whose proofs have not all been observed as spent. cocod retains the token so the Wallet Client can present it again after interruption.
 _Avoid_: Failed Send, history entry
 
+**Active Send**:
+A Send whose Operation has not reached a terminal outcome. Active Sends are managed explicitly and never replace or redirect the Wallet Client's action for beginning a new Send.
+_Avoid_: Pending Send, Send history
+
 **Reclaim**:
 An attempt to return the ecash from a Pending Send to the Wallet before the recipient redeems it. A Reclaim can race with redemption and is not guaranteed to succeed.
 _Avoid_: Cancel, refund
