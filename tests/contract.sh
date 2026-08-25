@@ -186,6 +186,61 @@ jq -e '.items[0].method == "default" and .items[0].requestedAmount == "60"
   <<<"$send_prepared" >/dev/null || fail "Send Operation collection is invalid"
 jq -e '.items == []' <<<"$send_in_flight" >/dev/null || fail "Send in-flight collection is invalid"
 
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "sendPrepared":{"items":[{
+      "id":"send-browse-prepared","type":"send","state":"prepared",
+      "mintUrl":"https://mint.prepared.test","unit":"sat","method":"default",
+      "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+      "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:01:00.000Z"
+    }]},
+    "sendInFlight":{"items":[
+      {"id":"send-browse-executing","type":"send","state":"executing",
+       "mintUrl":"https://mint.executing.test","unit":"sat","method":"default",
+       "requestedAmount":"21","fee":"1","inputAmount":"22","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:02:00.000Z"},
+      {"id":"send-browse-pending","type":"send","state":"pending",
+       "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+       "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:03:00.000Z"},
+      {"id":"send-browse-reclaiming","type":"send","state":"rolling_back",
+       "mintUrl":"https://mint.reclaiming.test","unit":"sat","method":"default",
+       "requestedAmount":"41","fee":"1","inputAmount":"42","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:04:00.000Z"}
+    ]}
+  }' "$base_url/__test__/resources" >/dev/null \
+  || fail "could not establish mixed-state Active Sends"
+mixed_send_prepared=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/prepared")
+mixed_send_in_flight=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/in-flight")
+jq -e '
+  .items == [{
+    id:"send-browse-prepared",type:"send",state:"prepared",
+    mintUrl:"https://mint.prepared.test",unit:"sat",method:"default",
+    requestedAmount:"11",fee:"1",inputAmount:"12",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:01:00.000Z"
+  }]
+' <<<"$mixed_send_prepared" >/dev/null \
+  || fail "Prepared Active Send collection lost its authoritative fields"
+jq -e '
+  [.items[] | {id,state,requestedAmount,mintUrl,updatedAt}] == [
+    {id:"send-browse-executing",state:"executing",requestedAmount:"21",mintUrl:"https://mint.executing.test",updatedAt:"2026-08-20T12:02:00.000Z"},
+    {id:"send-browse-pending",state:"pending",requestedAmount:"31",mintUrl:"https://mint.pending.test",updatedAt:"2026-08-20T12:03:00.000Z"},
+    {id:"send-browse-reclaiming",state:"rolling_back",requestedAmount:"41",mintUrl:"https://mint.reclaiming.test",updatedAt:"2026-08-20T12:04:00.000Z"}
+  ]
+' <<<"$mixed_send_in_flight" >/dev/null \
+  || fail "mixed-state Active Send collection is not canonical"
+jq -e '
+  [.items[] | select(.id == "send-browse-pending")] == [{
+    id:"send-browse-pending",type:"send",state:"pending",
+    mintUrl:"https://mint.pending.test",unit:"sat",method:"default",
+    requestedAmount:"31",fee:"1",inputAmount:"32",needsSwap:false,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:03:00.000Z"
+  }]
+' <<<"$mixed_send_in_flight" >/dev/null \
+  || fail "Active Send collection could not address exactly one Operation"
+
 send_mint='https://mint.send.test'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
@@ -251,6 +306,69 @@ jq -e --arg mint "$send_mint" '
 jq -e '.items == []' \
   <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/prepared")" >/dev/null \
   || fail "cancelled Send remained in the Prepared Send collection"
+
+idempotency_before=$(curl -fsS "$base_url/__test__/status")
+idempotency_attempts_before=$(jq -r '.sendCreateRequests' <<<"$idempotency_before")
+idempotency_unique_before=$(jq -r '.sendIdempotencyUniqueKeys' <<<"$idempotency_before")
+idempotency_replays_before=$(jq -r '.sendIdempotencyReplays' <<<"$idempotency_before")
+idempotency_conflicts_before=$(jq -r '.sendIdempotencyConflicts' <<<"$idempotency_before")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"300","reserved":"0","total":"300"}]},"sendPrepared":{"items":[]},"sendInFlight":{"items":[]}}' \
+  "$base_url/__test__/resources" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCreateInterruption":"after_commit"}' \
+  "$base_url/__test__/mode" >/dev/null
+idempotent_body=$(jq -cn --arg mint "$send_mint" \
+  '{mintUrl:$mint,unit:"sat",amount:"60"}')
+curl -fsS "${auth[@]}" -H 'Idempotency-Key: contract-send-intent-1' \
+  -H 'Content-Type: application/json' -X POST --data "$idempotent_body" \
+  "$base_url/v1/operations/send" >/dev/null 2>&1 || true
+idempotent_replay=$(curl -fsS "${auth[@]}" \
+  -H 'Idempotency-Key: contract-send-intent-1' \
+  -H 'Content-Type: application/json' -X POST --data "$idempotent_body" \
+  "$base_url/v1/operations/send")
+idempotent_send_id=$(jq -er '.id' <<<"$idempotent_replay")
+jq -e --arg mint "$send_mint" '
+  .items == [{mintUrl:$mint,unit:"sat",spendable:"230",reserved:"70",total:"300"}]
+' <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/balances")" >/dev/null \
+  || fail "same-key Send replay reserved inputs twice"
+idempotency_conflict=$(curl -sS "${auth[@]}" \
+  -H 'Idempotency-Key: contract-send-intent-1' \
+  -H 'Content-Type: application/json' -X POST \
+  --data "$(jq -cn --arg mint "$send_mint" '{mintUrl:$mint,unit:"sat",amount:"61"}')" \
+  -w $'\n%{http_code}' "$base_url/v1/operations/send")
+[[ ${idempotency_conflict##*$'\n'} == 409 ]] \
+  || fail "same Idempotency-Key accepted a different Send body"
+jq -e '.error.code == "idempotency_key_conflict"' \
+  <<<"${idempotency_conflict%$'\n'*}" >/dev/null \
+  || fail "Idempotency-Key conflict used the wrong error code"
+second_identical_send=$(curl -fsS "${auth[@]}" \
+  -H 'Idempotency-Key: contract-send-intent-2' \
+  -H 'Content-Type: application/json' -X POST --data "$idempotent_body" \
+  "$base_url/v1/operations/send")
+second_identical_send_id=$(jq -er '.id' <<<"$second_identical_send")
+[[ $second_identical_send_id != "$idempotent_send_id" ]] \
+  || fail "a new Send intent reused an earlier Operation"
+jq -e --arg first "$idempotent_send_id" --arg second "$second_identical_send_id" '
+  ([.items[].id] | sort) == ([$first,$second] | sort)
+' <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/prepared")" >/dev/null \
+  || fail "identical Prepared Sends did not coexist by Operation ID"
+idempotency_after=$(curl -fsS "$base_url/__test__/status")
+jq -e \
+  --argjson attempts "$((idempotency_attempts_before + 4))" \
+  --argjson unique "$((idempotency_unique_before + 2))" \
+  --argjson replays "$((idempotency_replays_before + 1))" \
+  --argjson conflicts "$((idempotency_conflicts_before + 1))" '
+  .sendCreateRequests == $attempts
+  and .sendIdempotencyUniqueKeys == $unique
+  and .sendIdempotencyReplays == $replays
+  and .sendIdempotencyConflicts == $conflicts
+' <<<"$idempotency_after" >/dev/null \
+  || fail "Send idempotency diagnostics did not distinguish attempts and replays"
+curl -fsS "${auth[@]}" -X POST \
+  "$base_url/v1/operations/send/$idempotent_send_id/cancel" >/dev/null
+curl -fsS "${auth[@]}" -X POST \
+  "$base_url/v1/operations/send/$second_identical_send_id/cancel" >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"50","reserved":"0","total":"50"}]}}' \

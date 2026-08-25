@@ -19,7 +19,37 @@ Item {
   property string outgoingToken: ""
   property int clipboardWrites: 0
   property bool reclaimWarningVisible: false
-  readonly property string reclaimWarning: "Reclaim may race with recipient redemption. The recipient can still win while cocod checks the Mint."
+  property bool pendingDetailMode: false
+  property bool pendingDetailFocused: false
+  property string pendingOperationId: ""
+  property string pendingAmount: ""
+  property int pendingPresentationGeneration: 0
+  property bool pendingTokenRevealed: false
+  readonly property var pendingDescriptor: service
+    && typeof service.sendOperationDescriptor === "function"
+    ? service.sendOperationDescriptor(pendingOperationId, pendingDetailFocused) : ({
+      operation: null, isPending: false, pendingBusy: false,
+      pendingCommandsAvailable: false, pendingResultAvailable: false,
+      terminalMessage: "", terminalPositive: false,
+      pendingAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+      })
+    })
+  readonly property var pendingAction: pendingDescriptor.pendingAction
+  readonly property string pendingActionState: String(pendingAction.state || "idle")
+  readonly property string pendingErrorCode: String(pendingAction.errorCode || "")
+  readonly property string pendingError: String(pendingAction.error || "")
+  readonly property string pendingTerminalState: String(pendingAction.terminalState || "")
+  readonly property var pendingCanonicalOperation: pendingDescriptor.operation
+  readonly property bool pendingCanonical: pendingDescriptor.isPending
+  readonly property bool pendingBusy: pendingDescriptor.pendingBusy
+  readonly property bool pendingCommandsAvailable:
+    pendingDescriptor.pendingCommandsAvailable
+  readonly property bool pendingResultAvailable: pendingDescriptor.pendingResultAvailable
+  readonly property bool pendingReclaimAvailable: pendingResultAvailable
+  readonly property string reclaimWarning: pendingDetailMode
+    ? "Reclaim " + pendingAmount + " sat from this exact Pending Send? Reclaim races recipient redemption; the recipient can still win while cocod checks the Mint."
+    : "Reclaim may race with recipient redemption. The recipient can still win while cocod checks the Mint."
 
   readonly property string sendState: service
     ? String(service.sendState || "idle") : "idle"
@@ -37,6 +67,8 @@ Item {
     && typeof service.sendBalanceForMint === "function"
     ? service.sendBalanceForMint(prepared.mintUrl) : null
   readonly property string error: service ? String(service.sendError || "") : ""
+  readonly property bool ambiguousPreparation: service
+    && !!service.sendAmbiguousCreation
   readonly property bool commandsAvailable: service
     && service.sendCommandsAvailable !== false
   readonly property bool prepareEnabled: viewState === "entry" && amountValid
@@ -45,10 +77,11 @@ Item {
   readonly property bool copyAvailable: viewState === "result" && outgoingToken !== ""
   readonly property bool reclaimAvailable: service
     && service.sendCanReclaim === true
+    && commandsAvailable
     && ["result", "pending", "error"].indexOf(sendState) !== -1
 
-  implicitHeight: content.implicitHeight
-  visible: viewState !== "closed"
+  implicitHeight: pendingDetailMode ? pendingContent.implicitHeight : content.implicitHeight
+  visible: pendingDetailMode ? pendingDetailFocused : viewState !== "closed"
 
   function updateMintSelection() {
     var selectedStillEligible = false
@@ -143,9 +176,87 @@ Item {
 
   function copyToken() {
     if (!copyAvailable) return false
+    writeOutgoingTokenToClipboard()
+    return true
+  }
+
+  function writeOutgoingTokenToClipboard() {
     Quickshell.clipboardText = outgoingToken
     clipboardWrites++
+  }
+
+  function clearPendingToken() {
+    outgoingToken = ""
+    pendingTokenRevealed = false
+    reclaimWarningVisible = false
+  }
+
+  function focusPendingDetail(operationId, amount) {
+    if (!pendingDetailMode) return false
+    pendingPresentationGeneration++
+    clearPendingToken()
+    pendingOperationId = String(operationId || "")
+    pendingAmount = String(amount || "")
+    pendingDetailFocused = pendingOperationId !== ""
+    return pendingDetailFocused
+  }
+
+  function leavePendingDetail() {
+    pendingPresentationGeneration++
+    clearPendingToken()
+    pendingDetailFocused = false
+    pendingOperationId = ""
+    pendingAmount = ""
+  }
+
+  function requestPendingResult(intent) {
+    var requestedIntent = String(intent || "")
+    if (!pendingResultAvailable || ["copy", "reveal"].indexOf(requestedIntent) === -1
+        || !service || typeof service.requestActivePendingSendResult !== "function")
+      return false
+    pendingPresentationGeneration++
+    clearPendingToken()
+    return service.requestActivePendingSendResult(pendingOperationId,
+      pendingPresentationGeneration, requestedIntent)
+  }
+
+  function copyPendingToken() {
+    return requestPendingResult("copy")
+  }
+
+  function revealPendingToken() {
+    return requestPendingResult("reveal")
+  }
+
+  function hidePendingToken() {
+    if (!pendingTokenRevealed) return false
+    pendingPresentationGeneration++
+    clearPendingToken()
     return true
+  }
+
+  function refreshPending() {
+    if (!pendingResultAvailable || !service
+        || typeof service.refreshActivePendingSend !== "function") return false
+    pendingPresentationGeneration++
+    clearPendingToken()
+    return service.refreshActivePendingSend(pendingOperationId)
+  }
+
+  function beginActivePendingReclaim() {
+    if (!pendingReclaimAvailable) return false
+    pendingPresentationGeneration++
+    clearPendingToken()
+    reclaimWarningVisible = true
+    return true
+  }
+
+  function confirmActivePendingReclaim() {
+    if (!reclaimWarningVisible || !pendingCanonical || !service
+        || typeof service.reclaimActivePendingSend !== "function") return false
+    reclaimWarningVisible = false
+    outgoingToken = ""
+    return service.reclaimActivePendingSend(pendingOperationId)
   }
 
   function done() {
@@ -167,6 +278,9 @@ Item {
   }
 
   function retryPending() {
+    if (ambiguousPreparation && service
+        && typeof service.retryAmbiguousSendCreation === "function")
+      return service.retryAmbiguousSendCreation()
     if (!service || !service.sendPendingOperation
         || typeof service.retrievePendingSendResult !== "function") return false
     return service.retrievePendingSendResult(service.sendPendingOperation.id)
@@ -176,9 +290,13 @@ Item {
     if (viewState === "entry") updateMintSelection()
   }
   onViewStateChanged: {
+    if (pendingDetailMode) return
     if (viewState === "entry") updateMintSelection()
     if (["result", "reclaim-warning"].indexOf(viewState) === -1)
       outgoingToken = ""
+  }
+  onPendingActionStateChanged: {
+    if (pendingDetailMode && pendingActionState !== "idle") clearPendingToken()
   }
   onInputVisibleChanged: {
     if (!inputVisible) amountInput.focus = false
@@ -188,13 +306,45 @@ Item {
     ignoreUnknownSignals: true
 
     function onSendExecuted(token) {
+      if (root.pendingDetailMode) return
       if (!root.opened || root.viewState !== "result") return
       root.outgoingToken = String(token || "")
+    }
+
+    function onPendingSendResultDelivered(operationId, presentationGeneration,
+        intent, token) {
+      if (!root.pendingDetailMode || !root.pendingDetailFocused
+          || String(operationId || "") !== root.pendingOperationId
+          || presentationGeneration !== root.pendingPresentationGeneration) return
+      var value = String(token || "")
+      if (String(intent || "") === "copy") {
+        root.outgoingToken = value
+        root.writeOutgoingTokenToClipboard()
+        root.outgoingToken = ""
+        root.pendingTokenRevealed = false
+      } else if (String(intent || "") === "reveal") {
+        root.outgoingToken = value
+        root.pendingTokenRevealed = value !== ""
+      }
+      value = ""
+    }
+
+    function onSendPresentationInvalidated() {
+      if (root.pendingDetailMode) root.pendingPresentationGeneration++
+      root.clearPendingToken()
+    }
+
+    function onConnectionStateChanged() {
+      if (!root.pendingDetailMode || !root.service
+          || root.service.connectionState === "connected") return
+      root.pendingPresentationGeneration++
+      root.clearPendingToken()
     }
   }
 
   Column {
     id: content
+    visible: !root.pendingDetailMode
     width: parent.width
     spacing: Style.space(10)
 
@@ -381,8 +531,8 @@ Item {
     Button {
       visible: root.viewState === "pending"
         || (root.viewState === "error" && root.service
-          && !!root.service.sendPendingOperation)
-      text: "Check Pending Send"
+          && (!!root.service.sendPendingOperation || root.ambiguousPreparation))
+      text: root.ambiguousPreparation ? "Retry preparation" : "Check Pending Send"
       iconText: "󰑐"
       foreground: root.foreground
       fontFamily: root.fontFamily
@@ -490,14 +640,181 @@ Item {
 
     Button {
       visible: root.viewState === "entry" || root.viewState === "review"
-        || root.viewState === "error"
-      text: root.viewState === "error" ? "Back"
-        : root.viewState === "review" ? "Back and release reservation" : "Cancel"
+        || root.viewState === "error" || ["preparing", "cancelling", "executing",
+          "recovering-result", "reclaiming"].indexOf(root.viewState) !== -1
+      text: root.viewState === "entry" ? "Cancel"
+        : root.viewState === "review" ? "Cancel Prepared Send" : "Back"
       iconText: root.viewState === "error" ? "󰁍" : "󰅖"
       foreground: root.foreground
       fontFamily: root.fontFamily
       bordered: true
       onClicked: root.cancel()
+    }
+  }
+
+  Column {
+    id: pendingContent
+    visible: root.pendingDetailMode && root.pendingDetailFocused
+    width: parent.width
+    spacing: Style.space(10)
+
+    Text {
+      visible: root.pendingBusy
+      width: parent.width
+      text: root.pendingDescriptor.pendingBusyMessage
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: true
+      horizontalAlignment: Text.AlignHCenter
+      wrapMode: Text.WordWrap
+    }
+
+    Text {
+      visible: root.pendingError !== "" && root.pendingTerminalState === ""
+      width: parent.width
+      text: root.pendingError
+      color: root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      font.bold: true
+      wrapMode: Text.WordWrap
+    }
+
+    Text {
+      visible: root.pendingTokenRevealed
+      width: parent.width
+      text: root.outgoingToken
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.WrapAnywhere
+    }
+
+    Button {
+      visible: root.pendingTokenRevealed
+      width: parent.width
+      text: "Hide Cashu token"
+      iconText: "󰈉"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      bordered: true
+      onClicked: root.hidePendingToken()
+    }
+
+    Row {
+      visible: root.pendingCanonical && !root.reclaimWarningVisible
+        && root.pendingTerminalState === ""
+      width: parent.width
+      spacing: Style.spacing.controlGap
+
+      Button {
+        width: (parent.width - parent.spacing) / 2
+        text: "Copy token"
+        iconText: "󰆏"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: root.pendingResultAvailable
+        opacity: enabled ? 1 : 0.5
+        onClicked: root.copyPendingToken()
+      }
+
+      Button {
+        width: (parent.width - parent.spacing) / 2
+        text: "Reveal token"
+        iconText: "󰈈"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        bordered: true
+        enabled: root.pendingResultAvailable
+        opacity: enabled ? 1 : 0.5
+        onClicked: root.revealPendingToken()
+      }
+    }
+
+    Button {
+      visible: root.pendingCanonical && !root.reclaimWarningVisible
+        && root.pendingTerminalState === ""
+      width: parent.width
+      text: "Refresh Pending Send"
+      iconText: "󰑐"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      bordered: true
+      enabled: root.pendingResultAvailable
+      opacity: enabled ? 1 : 0.5
+      onClicked: root.refreshPending()
+    }
+
+    Button {
+      visible: root.pendingCanonical && !root.reclaimWarningVisible
+        && root.pendingTerminalState === ""
+      width: parent.width
+      text: "Attempt Reclaim"
+      iconText: "󰑓"
+      foreground: root.urgent
+      fontFamily: root.fontFamily
+      bordered: true
+      enabled: root.pendingReclaimAvailable
+      opacity: enabled ? 1 : 0.5
+      onClicked: root.beginActivePendingReclaim()
+    }
+
+    Column {
+      visible: root.reclaimWarningVisible
+      width: parent.width
+      spacing: Style.spacing.labelGap
+
+      Text {
+        width: parent.width
+        text: root.reclaimWarning
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        wrapMode: Text.WordWrap
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.spacing.controlGap
+
+        Button {
+          width: (parent.width - parent.spacing) / 2
+          text: "Keep Pending"
+          iconText: "󰅖"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          onClicked: root.reclaimWarningVisible = false
+        }
+
+        Button {
+          width: (parent.width - parent.spacing) / 2
+          text: "Confirm Reclaim"
+          iconText: "󰑓"
+          foreground: root.urgent
+          fontFamily: root.fontFamily
+          bordered: true
+          enabled: root.pendingReclaimAvailable
+          opacity: enabled ? 1 : 0.5
+          onClicked: root.confirmActivePendingReclaim()
+        }
+      }
+    }
+
+    Text {
+      visible: root.pendingTerminalState !== ""
+      width: parent.width
+      text: root.pendingDescriptor.terminalMessage
+      color: root.pendingDescriptor.terminalPositive
+        ? root.foreground : root.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      font.bold: true
+      horizontalAlignment: Text.AlignHCenter
+      wrapMode: Text.WordWrap
     }
   }
 }

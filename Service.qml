@@ -11,6 +11,9 @@ Item {
   signal recoveryPhraseRevealed(string phrase)
   signal recoveryPhraseRevealFailed(string detail)
   signal sendExecuted(string token)
+  signal pendingSendResultDelivered(string operationId,
+    int presentationGeneration, string intent, string token)
+  signal sendPresentationInvalidated()
 
   property var shell: null
   property var manifest: null
@@ -58,6 +61,7 @@ Item {
   property int streamRotationMs: 30000
   property int streamMaximumCharacters: 32768
   property int heartbeatTimeoutMs: 20000
+  property int activeSendsPollIntervalMs: 15000
 
   property var openApiResource: ({})
   property var statusResource: ({
@@ -70,6 +74,8 @@ Item {
   property var mintsResource: ({ items: [] })
   property var receiveOperations: []
   property var sendOperations: []
+  property bool sendCanonicalSynchronized: false
+  property int activeSendsCanonicalRefreshCount: 0
   property int refreshCount: 0
 
   property string connectionState: "connecting"
@@ -128,11 +134,22 @@ Item {
   readonly property string receiveRecoveryError: String(receiveRecovery.error || "")
   property var sendCommandRequest: null
   property var sendReconcileRequests: []
+  property string activePendingCommandOperationId: ""
+  property string activePreparedCommandOperationId: ""
+  property var pendingSendActions: ({})
+  property var preparedSendActions: ({})
+  property int sendPreparationIntentSequence: 0
+  property int sendPresentationContextGeneration: 0
+  property string privateSendCredentialContext: ""
+  property string privateSendDaemonContext: ""
+  property string privateSendWalletContext: ""
+  property string privateFullFetchCredentialContext: ""
+  property string privateFullFetchDaemonContext: ""
+  property int sendSecurityContextGeneration: 0
   property string sendState: "idle"
   property string sendError: ""
   property string sendErrorCode: ""
   property string sendOperationId: ""
-  property bool sendCancelOnPrepared: false
   property var sendAmbiguousCreation: null
   property bool sendResultReconciling: false
   property bool sendDismissAfterResult: false
@@ -150,6 +167,7 @@ Item {
     && !sendCommandRequest && !sendResultReconciling
     && sendReconcileRequests.length === 0
   readonly property bool sendCommandsAvailable: !fullFetchInProgress
+    && sendCanonicalSynchronized
     && connectionState === "connected" && compatibilityState === "compatible"
     && walletState === "unlocked" && sendAvailable
   readonly property bool receiveCommandsAvailable: !fullFetchInProgress
@@ -192,6 +210,7 @@ Item {
   readonly property string unit: "sat"
   readonly property var activeTransfers: composeActiveTransfers(
     receiveOperations, sendOperations, receiveRecoveries)
+  readonly property var activeSends: composeActiveSends(sendOperations)
   readonly property var trustedMints: trustedKnownMints(mintsResource)
   readonly property bool hasActiveTransfers: activeTransfers.length > 0
   readonly property bool needsAttention: compatibilityState === "incompatible"
@@ -232,6 +251,79 @@ Item {
     var value = String(credentialFile.text() || "")
     if (!/^[A-Za-z0-9_-]{43}\n$/.test(value)) return ""
     return value.slice(0, -1)
+  }
+
+  function invalidateSendPresentationContext() {
+    sendPresentationContextGeneration++
+    sendPresentationInvalidated()
+  }
+
+  function clearSendSecurityContextState() {
+    sendSecurityContextGeneration++
+    invalidateSendPresentationContext()
+    if (fullFetchInProgress) {
+      fullFetchToken++
+      fullFetchInProgress = false
+      abortCanonicalRequests()
+    }
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
+    heartbeatTimer.stop()
+    rotationTimer.stop()
+    stopStream()
+    var command = sendCommandRequest
+    sendCommandRequest = null
+    if (command) {
+      command.onreadystatechange = null
+      command.abort()
+    }
+    abortIncrementalSendFetches()
+    abortRequests(sendReconcileRequests)
+    sendReconcileRequests = []
+    sendResultReconciling = false
+    activePendingCommandOperationId = ""
+    activePreparedCommandOperationId = ""
+    pendingSendActions = ({})
+    preparedSendActions = ({})
+    sendOperations = []
+    sendCanonicalSynchronized = false
+    queuedSendInvalidation = false
+    queuedBalanceInvalidation = false
+    deferredReconcileReason = ""
+    sendState = "idle"
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendAmbiguousCreation = null
+    sendDismissAfterResult = false
+  }
+
+  function observeSendTransportContext(credential) {
+    var daemon = String(daemonBaseUrl || "")
+    var value = String(credential || "")
+    var changed = (privateSendDaemonContext !== ""
+        && privateSendDaemonContext !== daemon)
+      || (privateSendCredentialContext !== ""
+        && privateSendCredentialContext !== value)
+    if (changed) clearSendSecurityContextState()
+    return changed
+  }
+
+  function acceptSendTransportContext(credential, daemon) {
+    privateSendDaemonContext = String(daemon || daemonBaseUrl || "")
+    privateSendCredentialContext = String(credential || "")
+  }
+
+  function observeSendWalletContext(status) {
+    var wallet = status && status.wallet ? status.wallet : null
+    var configuredAt = wallet ? String(wallet.configuredAt || "") : ""
+    var context = String(daemonBaseUrl || "") + "\n" + configuredAt
+    var changed = privateSendWalletContext !== ""
+      && privateSendWalletContext !== context
+    if (changed)
+      clearSendSecurityContextState()
+    privateSendWalletContext = context
+    return changed
   }
 
   function setupView() {
@@ -287,6 +379,13 @@ Item {
       reservedBalance: reservedBalance,
       unit: unit,
       activeTransfers: activeTransfers,
+      activeSends: activeSends,
+      sendCanonicalSynchronized: sendCanonicalSynchronized,
+      activeSendsCanonicalRefreshCount: activeSendsCanonicalRefreshCount,
+      sendOperationErrorCount: sendOperationErrorCount(),
+      sendSecurityContextGeneration: sendSecurityContextGeneration,
+      sendTransportContextCurrent: privateSendDaemonContext === String(daemonBaseUrl || "")
+        && privateSendCredentialContext === clientCredential(),
       trustedMintCount: trustedMints.length,
       receiveState: receiveState,
       receiveError: receiveError,
@@ -434,9 +533,29 @@ Item {
     return null
   }
 
+  function authoritativeSendOperations(values) {
+    var source = Array.isArray(values) ? values : []
+    var byId = ({})
+    var order = []
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation && operation.id || "")
+      if (!id) continue
+      if (!byId[id]) order.push(id)
+      var previous = byId[id]
+      if (previous && updateTimestampValue(previous.updatedAt)
+          > updateTimestampValue(operation.updatedAt)) continue
+      byId[id] = operation
+    }
+    var result = []
+    for (var orderIndex = 0; orderIndex < order.length; orderIndex++)
+      result.push(byId[order[orderIndex]])
+    return result
+  }
+
   function canonicalSendOperation(operationId) {
     var selected = String(operationId || "")
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    var operations = authoritativeSendOperations(sendOperations)
     for (var index = 0; selected && index < operations.length; index++)
       if (String(operations[index].id || "") === selected)
         return operations[index]
@@ -449,20 +568,257 @@ Item {
       ? operation : null
   }
 
-  function firstCanonicalPreparedSend() {
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
-    for (var index = 0; index < operations.length; index++)
-      if (String(operations[index].state || "") === "prepared")
-        return operations[index]
-    return null
+  function actionStoreGet(store, operationId, fallback) {
+    var id = String(operationId || "")
+    var action = id && store ? store[id] : null
+    return action || fallback
   }
 
-  function firstCanonicalPendingSend() {
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
-    for (var index = 0; index < operations.length; index++)
-      if (String(operations[index].state || "") === "pending")
-        return operations[index]
-    return null
+  function actionStoreCopyUpdate(store, operationId, action) {
+    var id = String(operationId || "")
+    var next = ({})
+    for (var key in store) next[key] = store[key]
+    if (id) next[id] = action
+    return next
+  }
+
+  function actionStoreRemove(store, operationId) {
+    var id = String(operationId || "")
+    var next = ({})
+    for (var key in store) if (key !== id) next[key] = store[key]
+    return next
+  }
+
+  function actionStoreAcknowledge(store, operationId) {
+    var id = String(operationId || "")
+    var action = id && store ? store[id] : null
+    return action && action.terminalState
+      ? actionStoreRemove(store, id) : null
+  }
+
+  function emptyPreparedSendAction(operationId) {
+    return {
+      operationId: String(operationId || ""),
+      state: "idle",
+      errorCode: "",
+      error: "",
+      terminalState: ""
+    }
+  }
+
+  function preparedSendAction(operationId) {
+    var id = String(operationId || "")
+    return actionStoreGet(preparedSendActions, id, emptyPreparedSendAction(id))
+  }
+
+  function emptyPendingSendAction(operationId) {
+    return {
+      operationId: String(operationId || ""),
+      state: "idle",
+      errorCode: "",
+      error: "",
+      terminalState: "",
+      amount: ""
+    }
+  }
+
+  function sendOperationErrorCount() {
+    var count = 0
+    for (var preparedId in preparedSendActions)
+      if (String(preparedSendActions[preparedId].error || "") !== "") count++
+    for (var pendingId in pendingSendActions)
+      if (String(pendingSendActions[pendingId].error || "") !== "") count++
+    return count
+  }
+
+  function updatePreparedSendAction(operationId, state, errorCode, terminalState) {
+    var id = String(operationId || "")
+    if (!id) return
+    var code = String(errorCode || "")
+    preparedSendActions = actionStoreCopyUpdate(preparedSendActions, id, {
+      operationId: id,
+      state: String(state || "idle"),
+      errorCode: code,
+      error: code ? preparedSendErrorMessage(code) : "",
+      terminalState: String(terminalState || "")
+    })
+  }
+
+  function acknowledgePreparedSendTerminal(operationId) {
+    var actions = actionStoreAcknowledge(preparedSendActions, operationId)
+    if (!actions) return false
+    preparedSendActions = actions
+    return true
+  }
+
+  function preparedSendErrorMessage(code) {
+    var messages = {
+      coco_error: "cocod could not complete this exact Prepared Send. Refresh, Confirm, or Cancel when available.",
+      operation_conflict: "This Prepared Send changed in cocod. Its canonical state and balances were refreshed.",
+      operation_not_found: "cocod no longer reports this exact Prepared Send Operation.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid response for this exact Prepared Send.",
+      transport_unavailable: "This Prepared Send could not reach cocod. Refresh and try again."
+    }
+    return messages[String(code || "")]
+      || "This exact Prepared Send could not be completed. Refresh and try again."
+  }
+
+  function pendingSendAction(operationId) {
+    var id = String(operationId || "")
+    return actionStoreGet(pendingSendActions, id, emptyPendingSendAction(id))
+  }
+
+  function updatePendingSendAction(operationId, state, errorCode,
+      terminalState, amount) {
+    var id = String(operationId || "")
+    if (!id) return
+    var code = String(errorCode || "")
+    pendingSendActions = actionStoreCopyUpdate(pendingSendActions, id, {
+      operationId: id,
+      state: String(state || "idle"),
+      errorCode: code,
+      error: code ? pendingSendErrorMessage(code) : "",
+      terminalState: String(terminalState || ""),
+      amount: decimalString(amount) || ""
+    })
+  }
+
+  function acknowledgePendingSendTerminal(operationId) {
+    var actions = actionStoreAcknowledge(pendingSendActions, operationId)
+    if (!actions) return false
+    pendingSendActions = actions
+    return true
+  }
+
+  function sendOperationDescriptor(operationId, detailFocused) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    var state = operation ? String(operation.state || "") : ""
+    var prepared = state === "prepared"
+    var pending = state === "pending"
+    var preparedAction = preparedSendAction(id)
+    var pendingAction = pendingSendAction(id)
+    var preparedActionState = String(preparedAction.state || "idle")
+    var pendingActionState = String(pendingAction.state || "idle")
+    var preparedBusy = ["executing", "cancelling", "refreshing"]
+      .indexOf(preparedActionState) !== -1
+    var pendingBusy = ["copying", "revealing", "refreshing", "reclaiming"]
+      .indexOf(pendingActionState) !== -1
+    var mutationLaneAvailable = sendCommandsAvailable && !sendCommandRequest
+      && !sendResultReconciling && sendReconcileRequests.length === 0
+    var pendingTerminal = String(pendingAction.terminalState || "")
+    var preparedTerminal = String(preparedAction.terminalState || "")
+    var terminalState = pendingTerminal || preparedTerminal
+    var terminalMessages = {
+      reclaimed: "Reclaim succeeded. The reserved ecash is spendable again.",
+      recipient_won: "The recipient redeemed this Send before Reclaim completed.",
+      cancelled: "This exact Prepared Send was cancelled. Its reservation was released after canonical balance reconciliation.",
+      completed: "This Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
+    }
+    var pendingBusyMessages = {
+      copying: "Retrieving this Send for Copy…",
+      revealing: "Retrieving this Send for Reveal…",
+      refreshing: "Refreshing this exact Pending Send…",
+      reclaiming: "Attempting Reclaim with cocod…"
+    }
+    var preparedBusyMessages = {
+      executing: "Confirming this exact Prepared Send…",
+      cancelling: "Cancelling this exact Prepared Send…",
+      refreshing: "Refreshing this exact Prepared Send…"
+    }
+    return {
+      operationId: id,
+      operation: operation,
+      state: state,
+      isPrepared: prepared,
+      isPending: pending,
+      readOnly: !!operation && !prepared && !pending,
+      mutationActionCount: pending ? 4 : prepared ? 3 : 0,
+      preparedAction: preparedAction,
+      pendingAction: pendingAction,
+      preparedBusy: preparedBusy,
+      pendingBusy: pendingBusy,
+      preparedBusyMessage: preparedBusyMessages[preparedActionState] || "",
+      pendingBusyMessage: pendingBusyMessages[pendingActionState] || "",
+      preparedCommandsAvailable: prepared && mutationLaneAvailable && !preparedBusy,
+      pendingCommandsAvailable: pending && mutationLaneAvailable && !pendingBusy,
+      pendingResultAvailable: detailFocused === true && pending
+        && mutationLaneAvailable && !pendingBusy,
+      terminalState: terminalState,
+      terminalMessage: terminalMessages[terminalState]
+        || String(pendingAction.error || preparedAction.error || ""),
+      terminalPositive: ["reclaimed", "cancelled", "completed"]
+        .indexOf(terminalState) !== -1
+    }
+  }
+
+  function annotateMissingCanonicalSends(previous, next) {
+    var retained = ({})
+    var previousById = ({})
+    var source = Array.isArray(previous) ? previous : []
+    for (var previousIndex = 0; previousIndex < source.length; previousIndex++)
+      previousById[String(source[previousIndex].id || "")] = source[previousIndex]
+    var current = Array.isArray(next) ? next : []
+    for (var currentIndex = 0; currentIndex < current.length; currentIndex++) {
+      var currentOperation = current[currentIndex]
+      var currentId = String(currentOperation.id || "")
+      var currentState = String(currentOperation.state || "")
+      if (["init", "prepared", "executing", "pending", "rolling_back"]
+          .indexOf(currentState) !== -1) {
+        retained[currentId] = true
+        continue
+      }
+      var prior = previousById[currentId]
+      var priorState = prior ? String(prior.state || "") : ""
+      if (currentState === "rolled_back" && priorState === "prepared")
+        updatePreparedSendAction(currentId, "terminal", "", "cancelled")
+      else if (currentState === "rolled_back")
+        updatePendingSendAction(currentId, "terminal", "", "reclaimed",
+          prior ? operationAmount(prior) : operationAmount(currentOperation))
+      else if (currentState === "finalized")
+        updatePendingSendAction(currentId, "terminal", "", "recipient_won",
+          prior ? operationAmount(prior) : operationAmount(currentOperation))
+    }
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation.id || "")
+      if (!id || retained[id]) continue
+      var state = String(operation.state || "")
+      if (state === "prepared") {
+        var preparedAction = preparedSendAction(id)
+        if (!preparedAction.terminalState)
+          updatePreparedSendAction(id, "terminal", "", "completed")
+      } else if (["executing", "pending", "rolling_back"].indexOf(state) !== -1) {
+        var pendingAction = pendingSendAction(id)
+        if (!pendingAction.terminalState)
+          updatePendingSendAction(id, "terminal", "", "completed",
+            operationAmount(operation) || "")
+      }
+    }
+  }
+
+  function replaceCanonicalSendOperations(values, annotateMissing) {
+    var next = authoritativeSendOperations(values)
+    if (annotateMissing !== false)
+      annotateMissingCanonicalSends(sendOperations, next)
+    sendOperations = next
+  }
+
+  function pendingSendErrorMessage(code) {
+    var messages = {
+      coco_error: "Reclaim was inconclusive. This Send remains Pending; Refresh or try Reclaim again.",
+      operation_conflict: "This Send changed while cocod attempted the request. Its exact canonical state is shown; Refresh or try again.",
+      operation_not_found: "cocod no longer reports this exact Send Operation.",
+      result_not_available: "The outgoing token is temporarily unavailable. This Send remains Pending; Refresh and try again.",
+      mint_unavailable: "The Mint is temporarily unavailable. This Send remains Pending; Refresh or try Reclaim again later.",
+      refresh_unavailable: "Canonical refresh is temporarily unavailable. This Send remains Pending; Refresh or try Reclaim again later.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid response for this exact Send.",
+      transport_unavailable: "This Send could not reach cocod. It remains unchanged until canonical reconciliation succeeds."
+    }
+    return messages[String(code || "")]
+      || "This exact Send could not be completed. Refresh and try again."
   }
 
   function reconcileFocusedPreparedSend() {
@@ -582,6 +938,86 @@ Item {
       })
     }
     return result
+  }
+
+  function sendStateLabel(state) {
+    var labels = {
+      prepared: "Prepared",
+      executing: "Executing",
+      pending: "Pending",
+      rolling_back: "Reclaiming"
+    }
+    return labels[String(state || "")] || ""
+  }
+
+  function mintHostname(mintUrl) {
+    var match = /^https?:\/\/(\[[^\]]+\]|[^\/:?#]+)(?::[0-9]+)?(?:[\/?#]|$)/
+      .exec(String(mintUrl || ""))
+    return match ? String(match[1]) : String(mintUrl || "")
+  }
+
+  function updateTimestampValue(timestamp) {
+    var value = Date.parse(String(timestamp || ""))
+    return isNaN(value) ? 0 : value
+  }
+
+  function composeActiveSends(sends) {
+    var activeStates = ["prepared", "executing", "pending", "rolling_back"]
+    var byId = ({})
+    var source = authoritativeSendOperations(sends)
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation.id || "")
+      var state = String(operation.state || "")
+      if (!id || activeStates.indexOf(state) === -1) continue
+      var previous = byId[id]
+      if (previous && updateTimestampValue(previous.updatedAt)
+          > updateTimestampValue(operation.updatedAt)) continue
+      byId[id] = operation
+    }
+
+    var result = []
+    for (var operationId in byId) {
+      var value = byId[operationId]
+      var valueState = String(value.state || "")
+      result.push({
+        id: operationId,
+        type: "send",
+        state: valueState,
+        stateLabel: sendStateLabel(valueState),
+        amount: operationAmount(value) || "0",
+        unit: String(value.unit || "sat"),
+        mintUrl: String(value.mintUrl || ""),
+        mintHostname: mintHostname(value.mintUrl),
+        updatedAt: String(value.updatedAt || ""),
+        requestedAmount: operationAmount(value) || "0",
+        fee: value.fee === undefined ? "" : String(value.fee),
+        inputAmount: value.inputAmount === undefined ? "" : String(value.inputAmount),
+        needsSwap: value.needsSwap === true,
+        reservedInput: valueState === "prepared"
+          ? String(value.inputAmount || "0") : ""
+      })
+    }
+    result.sort(function(left, right) {
+      var timestampOrder = updateTimestampValue(right.updatedAt)
+        - updateTimestampValue(left.updatedAt)
+      return timestampOrder !== 0 ? timestampOrder
+        : String(left.id).localeCompare(String(right.id))
+    })
+    return result
+  }
+
+  function relativeUpdateTime(timestamp, nowMs) {
+    var updatedMs = Date.parse(String(timestamp || ""))
+    var referenceMs = Number(nowMs)
+    if (isNaN(updatedMs) || isNaN(referenceMs)) return "Update time unavailable"
+    var elapsedSeconds = Math.max(0, Math.floor((referenceMs - updatedMs) / 1000))
+    if (elapsedSeconds < 45) return "Updated just now"
+    if (elapsedSeconds < 3600)
+      return "Updated " + Math.floor(elapsedSeconds / 60) + "m ago"
+    if (elapsedSeconds < 86400)
+      return "Updated " + Math.floor(elapsedSeconds / 3600) + "h ago"
+    return "Updated " + Math.floor(elapsedSeconds / 86400) + "d ago"
   }
 
   function projectWalletState(status) {
@@ -773,9 +1209,13 @@ Item {
     return aliases[value] || value
   }
 
-  function sendRequest(method, path, body, callback, accept) {
+  function sendRequest(method, path, body, callback, accept, headers) {
     var credential = clientCredential()
     if (!credential) return null
+    var protectsSendState = String(path || "").indexOf("/v1/operations/send") === 0
+    var contextChanged = protectsSendState && !fullFetchInProgress
+      ? observeSendTransportContext(credential) : false
+    if (protectsSendState && contextChanged) return null
     var request = new XMLHttpRequest()
     request.onreadystatechange = function() {
       if (request.readyState !== XMLHttpRequest.DONE) return
@@ -802,6 +1242,9 @@ Item {
     request.open(method, daemonBaseUrl + path, true)
     request.setRequestHeader("Accept", accept || "application/json")
     request.setRequestHeader("Authorization", "Bearer " + credential)
+    var requestHeaders = headers || ({})
+    for (var headerName in requestHeaders)
+      request.setRequestHeader(String(headerName), String(requestHeaders[headerName]))
     if (body !== undefined) request.setRequestHeader("Content-Type", "application/json")
     if (body === undefined) request.send()
     else request.send(JSON.stringify(body))
@@ -814,6 +1257,68 @@ Item {
       values[i].onreadystatechange = null
       values[i].abort()
     }
+  }
+
+  function paginatedOperationPath(path, offset) {
+    return String(path || "") + "?offset=" + Number(offset || 0) + "&limit=100"
+  }
+
+  function fetchAllOperationPages(path, type, trackRequest, requestIsCurrent,
+      callback) {
+    var items = []
+    var finished = false
+
+    function complete(result) {
+      if (finished) return
+      finished = true
+      callback(result)
+    }
+
+    function fetchPage(offset) {
+      var request = root.sendRequest("GET", root.paginatedOperationPath(path, offset),
+        undefined, function(result) {
+          if (finished || (typeof requestIsCurrent === "function"
+              && !requestIsCurrent(request))) return
+          if (!result.ok) {
+            complete({
+              ok: false,
+              status: result.status,
+              code: result.error.code,
+              error: result.error
+            })
+            return
+          }
+          var page = result.value
+          if (result.status !== 200 || !root.isOperationCollection(page, type)
+              || page.offset !== offset || page.items.length > page.limit) {
+            complete({ ok: false, code: "invalid_response" })
+            return
+          }
+          items = items.concat(page.items)
+          if (page.items.length < page.limit) {
+            complete({ ok: true, items: items })
+            return
+          }
+          var nextOffset = page.offset + page.items.length
+          if (nextOffset <= offset) {
+            complete({ ok: false, code: "invalid_response" })
+            return
+          }
+          fetchPage(nextOffset)
+        })
+      if (!request) {
+        complete({
+          ok: false,
+          status: 0,
+          code: "credential_unavailable",
+          error: { code: "credential_unavailable", retryable: false }
+        })
+        return
+      }
+      if (typeof trackRequest === "function") trackRequest(request)
+    }
+
+    fetchPage(0)
   }
 
   function abortIncrementalSendFetches() {
@@ -842,8 +1347,10 @@ Item {
     var refreshBalances = queuedBalanceInvalidation
     queuedSendInvalidation = false
     queuedBalanceInvalidation = false
-    if (refreshSends) fetchOperationGroup("send")
-    if (refreshBalances) fetchBalances()
+    if (refreshSends || refreshBalances) {
+      refreshActiveSends("queued-invalidation")
+      return
+    }
     var queuedOperations = queuedSendOperationInvalidations
     queuedSendOperationInvalidations = ({})
     for (var operationId in queuedOperations) refetchSendOperation(operationId)
@@ -867,8 +1374,37 @@ Item {
       else root.failSend(code)
     }
 
+    function accept(specification, value) {
+      if (failed) return
+      values[specification.key] = value
+      pending--
+      if (pending !== 0) return
+      root.sendReconcileRequests = []
+      callback(values)
+    }
+
+    function track(request) {
+      requests.push(request)
+      root.sendReconcileRequests = requests
+    }
+
+    function current(request) {
+      return !failed && requests.indexOf(request) !== -1
+    }
+
     for (var index = 0; index < specifications.length; index++) {
       (function(specification) {
+        if (specification.type === "send") {
+          root.fetchAllOperationPages(specification.path, "send", track, current,
+            function(result) {
+              if (!result.ok) {
+                reject(result.code)
+                return
+              }
+              accept(specification, { items: result.items, offset: 0, limit: 100 })
+            })
+          return
+        }
         var request = root.sendRequest("GET", specification.path, undefined,
           function(result) {
             if (failed || requests.indexOf(request) === -1) return
@@ -876,27 +1412,21 @@ Item {
               reject(result.error.code)
               return
             }
-            var valid = specification.type === "balances"
-              ? root.isBalanceCollection(result.value)
-              : root.isOperationCollection(result.value, "send")
+            var valid = root.isBalanceCollection(result.value)
             if (result.status !== 200 || !valid) {
               reject("invalid_response")
               return
             }
-            values[specification.key] = result.value
-            pending--
-            if (pending !== 0) return
-            root.sendReconcileRequests = []
-            callback(values)
+            accept(specification, result.value)
           })
         if (!request) {
           reject("credential_unavailable")
           return
         }
-        requests.push(request)
+        track(request)
       })(specifications[index])
     }
-    sendReconcileRequests = requests
+    if (!failed) sendReconcileRequests = requests
     return !failed
   }
 
@@ -927,6 +1457,30 @@ Item {
 
   function beginReconcile(reason) {
     var requestedReason = String(reason || "manual")
+    if (!daemonUrlAllowed) {
+      compatibilityState = "unknown"
+      connectionState = "error"
+      connectionDetail = "cocod URL must use HTTP on loopback"
+      lastErrorCode = "invalid_daemon_url"
+      retryAttempt = 0
+      retryDelayMs = 0
+      sendCanonicalSynchronized = false
+      return
+    }
+    var credential = clientCredential()
+    if (!credential) {
+      if (privateSendCredentialContext !== "")
+        observeSendTransportContext("")
+      compatibilityState = "unknown"
+      connectionState = "error"
+      connectionDetail = "The cocod Client Credential is unavailable"
+      lastErrorCode = "credential_unavailable"
+      retryAttempt = 0
+      retryDelayMs = 0
+      sendCanonicalSynchronized = false
+      return
+    }
+    observeSendTransportContext(credential)
     if (fullFetchInProgress || sendCanonicalMutationBusy()) {
       if (deferredReconcileReason !== "rotation" || requestedReason === "rotation")
         deferredReconcileReason = requestedReason
@@ -942,24 +1496,6 @@ Item {
       stopStream()
     }
     abortCanonicalRequests()
-    if (!daemonUrlAllowed) {
-      compatibilityState = "unknown"
-      connectionState = "error"
-      connectionDetail = "cocod URL must use HTTP on loopback"
-      lastErrorCode = "invalid_daemon_url"
-      retryAttempt = 0
-      retryDelayMs = 0
-      return
-    }
-    if (!clientCredential()) {
-      compatibilityState = "unknown"
-      connectionState = "error"
-      connectionDetail = "The cocod Client Credential is unavailable"
-      lastErrorCode = "credential_unavailable"
-      retryAttempt = 0
-      retryDelayMs = 0
-      return
-    }
     if (requestedReason === "startup") {
       connectionState = "connecting"
       connectionDetail = "Connecting to cocod on loopback"
@@ -979,6 +1515,9 @@ Item {
     receiveResourceGeneration++
     receiveLookupTokens = ({})
     fullFetchInProgress = true
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = clientCredential()
+    privateFullFetchDaemonContext = String(daemonBaseUrl || "")
     var token = ++fullFetchToken
     var capabilityRequest = sendRequest("GET", "/v1/openapi.json", undefined,
       function(result) {
@@ -1043,8 +1582,79 @@ Item {
     var values = ({})
     var pending = specifications.length
     var failed = false
+
+    function accept(specification, value) {
+      if (failed || token !== root.fullFetchToken) return
+      values[specification.key] = value
+      pending--
+      if (pending !== 0) return
+      var receiveSummaries = values.receivePrepared.items.concat(
+        values.receiveInFlight.items)
+      var sends = values.sendPrepared.items.concat(values.sendInFlight.items)
+      root.inspectReceivesForFullFetch(token, receiveSummaries,
+        function(receives, needsFreshBalances) {
+          if (token !== root.fullFetchToken) return
+          if (!needsFreshBalances) {
+            root.finishFullFetch(openApi, status, values.balances,
+              values.mints, receives, sends, connectAfterward)
+            return
+          }
+          var balanceRequest = root.sendRequest("GET", "/v1/balances", undefined,
+            function(balanceResult) {
+              if (token !== root.fullFetchToken) return
+              if (!balanceResult.ok) {
+                root.handleFetchFailure(balanceResult)
+                return
+              }
+              if (!root.isBalanceCollection(balanceResult.value)) {
+                root.handleContractFailure("invalid_balances",
+                  "cocod returned invalid balances")
+                return
+              }
+              root.finishFullFetch(openApi, status, balanceResult.value,
+                values.mints, receives, sends, connectAfterward)
+            })
+          if (!balanceRequest) {
+            root.handleCredentialUnavailable()
+            return
+          }
+          root.canonicalRequests.push(balanceRequest)
+        })
+    }
+
+    function track(request) {
+      root.canonicalRequests.push(request)
+    }
+
+    function current(request) {
+      return !failed && token === root.fullFetchToken
+        && root.canonicalRequests.indexOf(request) !== -1
+    }
+
     for (var i = 0; i < specifications.length; i++) {
       (function(specification) {
+        if (specification.type === "receive" || specification.type === "send") {
+          root.fetchAllOperationPages(specification.path, specification.type,
+            track, current, function(pageResult) {
+              if (failed || token !== root.fullFetchToken) return
+              if (!pageResult.ok) {
+                failed = true
+                if (pageResult.code === "invalid_response")
+                  root.handleContractFailure("invalid_" + specification.key,
+                    "cocod returned an invalid canonical resource")
+                else if (pageResult.code === "credential_unavailable")
+                  root.handleCredentialUnavailable()
+                else root.handleFetchFailure({
+                  status: Number(pageResult.status || 0),
+                  error: pageResult.error || { code: pageResult.code }
+                })
+                return
+              }
+              accept(specification,
+                { items: pageResult.items, offset: 0, limit: 100 })
+            })
+          return
+        }
         var request = root.sendRequest("GET", specification.path, undefined, function(result) {
           if (token !== root.fullFetchToken || failed) return
           if (!result.ok) {
@@ -1053,57 +1663,21 @@ Item {
             return
           }
           var valid = specification.type === "balances" ? root.isBalanceCollection(result.value)
-            : specification.type === "mints" ? root.isMintCollection(result.value)
-            : root.isOperationCollection(result.value, specification.type)
+            : root.isMintCollection(result.value)
           if (!valid) {
             failed = true
             root.handleContractFailure("invalid_" + specification.key,
               "cocod returned an invalid canonical resource")
             return
           }
-          values[specification.key] = result.value
-          pending--
-          if (pending === 0) {
-            var receiveSummaries = values.receivePrepared.items.concat(
-              values.receiveInFlight.items)
-            var sends = values.sendPrepared.items.concat(values.sendInFlight.items)
-            root.inspectReceivesForFullFetch(token, receiveSummaries,
-              function(receives, needsFreshBalances) {
-                if (token !== root.fullFetchToken) return
-                if (!needsFreshBalances) {
-                  root.finishFullFetch(openApi, status, values.balances,
-                    values.mints, receives, sends, connectAfterward)
-                  return
-                }
-                var balanceRequest = root.sendRequest("GET", "/v1/balances", undefined,
-                  function(balanceResult) {
-                    if (token !== root.fullFetchToken) return
-                    if (!balanceResult.ok) {
-                      root.handleFetchFailure(balanceResult)
-                      return
-                    }
-                    if (!root.isBalanceCollection(balanceResult.value)) {
-                      root.handleContractFailure("invalid_balances",
-                        "cocod returned invalid balances")
-                      return
-                    }
-                    root.finishFullFetch(openApi, status, balanceResult.value,
-                      values.mints, receives, sends, connectAfterward)
-                  })
-                if (!balanceRequest) {
-                  root.handleCredentialUnavailable()
-                  return
-                }
-                root.canonicalRequests.push(balanceRequest)
-              })
-          }
+          accept(specification, result.value)
         })
         if (!request) {
           failed = true
           root.handleCredentialUnavailable()
           return
         }
-        root.canonicalRequests.push(request)
+        track(request)
       })(specifications[i])
     }
   }
@@ -1287,12 +1861,19 @@ Item {
     queuedReceiveInvalidations = ({})
     fullFetchInProgress = false
     canonicalRequests = []
+    var acceptedCredential = privateFullFetchCredentialContext
+    var acceptedDaemon = privateFullFetchDaemonContext
+    var walletContextChanged = observeSendWalletContext(status)
+    acceptSendTransportContext(acceptedCredential, acceptedDaemon)
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     openApiResource = openApi
     statusResource = status
     balancesResource = balances
     mintsResource = mints
     receiveOperations = receives
-    sendOperations = sends
+    replaceCanonicalSendOperations(sends, true)
+    sendCanonicalSynchronized = true
     compatibilityState = "compatible"
     connectionState = "connected"
     connectionDetail = "Connected to cocod"
@@ -1316,25 +1897,22 @@ Item {
       createError = status.cocoSession.lastFailure
         ? "Wallet created, but its Coco Session could not start" : ""
     }
-    if (connectAfterward && walletState === "unlocked") startStream()
+    if ((connectAfterward || walletContextChanged) && walletState === "unlocked")
+      startStream()
     if (receiveState === "reconciling" && receiveOperationId)
       reconcileReceiveOperation(receiveOperationId)
     reconcileAmbiguousReceiveFromCanonical()
     for (var operationId in queuedInvalidations)
       refetchReceiveOperation(operationId)
     reconcileAmbiguousSendFromCanonical()
-    if (sendCancelOnPrepared && sendOperationId
-        && ["review", "error"].indexOf(sendState) !== -1) {
-      if (cancelPreparedSend()) sendCancelOnPrepared = false
-    } else if (sendCancelOnPrepared && !sendAmbiguousCreation) {
-      sendCancelOnPrepared = false
-      resetSend()
-    }
     resumeDeferredCanonicalReconcile()
   }
 
   function handleCredentialUnavailable() {
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     connectionState = "error"
     compatibilityState = "unknown"
@@ -1345,7 +1923,14 @@ Item {
   }
 
   function handleFetchFailure(result) {
+    if (result && result.error
+        && ["unauthenticated", "forbidden"].indexOf(
+          String(result.error.code || "")) !== -1)
+      clearSendSecurityContextState()
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
@@ -1366,6 +1951,9 @@ Item {
 
   function handleContractFailure(code, detail) {
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
@@ -1439,23 +2027,12 @@ Item {
   }
 
   function resetSend() {
-    if (["preparing", "cancelling", "executing", "reclaiming"]
-        .indexOf(sendState) !== -1
-        || (sendState === "review" && sendPreparedOperation)
+    if (sendCommandRequest || sendReconcileRequests.length > 0
         || sendResultReconciling) return false
-    var request = sendCommandRequest
-    sendCommandRequest = null
-    if (request) {
-      request.onreadystatechange = null
-      request.abort()
-    }
-    abortRequests(sendReconcileRequests)
-    sendReconcileRequests = []
     sendState = "idle"
     sendError = ""
     sendErrorCode = ""
     sendOperationId = ""
-    sendCancelOnPrepared = false
     sendAmbiguousCreation = null
     sendDismissAfterResult = false
     resumeDeferredCanonicalReconcile()
@@ -1463,70 +2040,44 @@ Item {
   }
 
   function beginSendFlow() {
-    if (["preparing", "cancelling", "executing", "reclaiming"]
-        .indexOf(sendState) !== -1 || sendResultReconciling) return false
-    sendCancelOnPrepared = false
-    var pending = sendPendingOperation || firstCanonicalPendingSend()
-    if (pending) {
-      sendOperationId = String(pending.id)
-      sendError = ""
-      sendErrorCode = ""
-      return retrievePendingSendResult(sendOperationId)
-    }
-    var prepared = sendPreparedOperation || firstCanonicalPreparedSend()
-    if (prepared) {
-      sendOperationId = String(prepared.id)
-      sendError = ""
-      sendErrorCode = ""
-      sendState = "review"
-      return true
-    }
-    if (sendState === "error"
-        && (sendOperationId !== "" || sendAmbiguousCreation)) return true
-    return resetSend()
+    if (sendCommandRequest || sendReconcileRequests.length > 0
+        || sendResultReconciling) return false
+    // Opening Send is a new preparation intent. Durable Prepared and Pending
+    // Sends are only selected by their exact IDs from Active Sends.
+    sendState = "idle"
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendAmbiguousCreation = null
+    sendDismissAfterResult = false
+    return true
   }
 
   function dismissSendFlow() {
-    if (sendState === "preparing") {
-      sendCancelOnPrepared = true
-      return true
-    }
-    if (["executing", "reclaiming"].indexOf(sendState) !== -1) return false
-    if (sendState === "cancelling") return true
-    if (sendState === "result" && sendResultReconciling) {
+    // Leaving presentation never mutates a durable Send. An in-flight command
+    // keeps its captured intent and finishes in the shared mutation lane.
+    if (sendResultReconciling) {
       sendDismissAfterResult = true
       return true
     }
-    if (sendAmbiguousCreation) {
-      sendCancelOnPrepared = true
-      beginReconcile("send-ambiguous-dismiss")
-      return true
+    if (!sendCommandRequest && sendReconcileRequests.length === 0
+        && !sendResultReconciling) {
+      sendState = "idle"
+      sendError = ""
+      sendErrorCode = ""
+      sendOperationId = ""
+      sendAmbiguousCreation = null
+      sendDismissAfterResult = false
     }
-    if (sendCanCancelReservation) {
-      if (fullFetchInProgress) {
-        sendCancelOnPrepared = true
-        return true
-      }
-      sendCancelOnPrepared = false
-      return cancelPreparedSend()
-    }
-    return resetSend()
+    return true
   }
 
   function cancelSendFlow() {
-    if (sendCanCancelReservation) {
-      if (fullFetchInProgress) {
-        sendCancelOnPrepared = true
-        return "dismissed"
-      }
+    // This is the explicit Cancel action inside a Prepared Send review. It is
+    // deliberately separate from panel close/back navigation.
+    if (sendCanCancelReservation)
       return cancelPreparedSend() ? "cancelling" : ""
-    }
-    if (sendAmbiguousCreation) {
-      sendCancelOnPrepared = true
-      beginReconcile("send-ambiguous-dismiss")
-      return "dismissed"
-    }
-    return resetSend() ? "dismissed" : ""
+    return dismissSendFlow() ? "dismissed" : ""
   }
 
   function reconcileFailedReclaim(code, operationId) {
@@ -1556,31 +2107,51 @@ Item {
     for (var index = 0; index < eligible.length; index++)
       if (String(eligible[index].mintUrl || "") === selectedMint) canFund = true
     if (!canFund) return false
-    var knownOperationIds = ({})
-    for (var operationIndex = 0; operationIndex < sendOperations.length;
-        operationIndex++)
-      knownOperationIds[String(sendOperations[operationIndex].id || "")] = true
     sendError = ""
     sendErrorCode = ""
     sendOperationId = ""
-    sendCancelOnPrepared = false
     sendAmbiguousCreation = null
+    var context = {
+      idempotencyKey: newSendIdempotencyKey(),
+      requestBody: {
+        mintUrl: selectedMint,
+        unit: "sat",
+        amount: requestedAmount
+      },
+      failureCode: ""
+    }
+    return submitSendPreparation(context)
+  }
+
+  function newSendIdempotencyKey() {
+    sendPreparationIntentSequence++
+    return "send-" + Date.now().toString(36) + "-"
+      + sendPreparationIntentSequence.toString(36) + "-"
+      + Math.floor(Math.random() * 0x100000000).toString(36)
+  }
+
+  function submitSendPreparation(context) {
+    if (!context || !context.idempotencyKey || !context.requestBody
+        || fullFetchInProgress || sendCommandRequest
+        || sendReconcileRequests.length > 0) return false
+    var selectedMint = String(context.requestBody.mintUrl || "")
+    var requestedAmount = String(context.requestBody.amount || "")
     abortIncrementalSendFetches()
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
     sendState = "preparing"
-    var request = root.sendRequest("POST", "/v1/operations/send", {
-      mintUrl: selectedMint,
-      unit: "sat",
-      amount: requestedAmount
-    }, function(result) {
+    var request = root.sendRequest("POST", "/v1/operations/send", context.requestBody,
+      function(result) {
       if (request !== root.sendCommandRequest) return
       root.sendCommandRequest = null
       if (!result.ok) {
         if (result.status === 0
             || (result.status === 201 && result.error.code === "invalid_response")) {
-          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
-            knownOperationIds, result.error.code)
+          root.reconcileAmbiguousSendCreation(context, result.error.code)
           return
         }
+        root.sendAmbiguousCreation = null
         if (result.error.code === "coco_error") {
           root.reconcileSendResources(function() {
             root.failSend("coco_error")
@@ -1597,8 +2168,7 @@ Item {
           || String(result.value.mintUrl) !== selectedMint
           || root.operationAmount(result.value) !== requestedAmount) {
         if (result.status === 201)
-          root.reconcileAmbiguousSendCreation(selectedMint, requestedAmount,
-            knownOperationIds, "invalid_response")
+          root.reconcileAmbiguousSendCreation(context, "invalid_response")
         else root.failSend("invalid_response")
         return
       }
@@ -1609,7 +2179,7 @@ Item {
       }, function(code) {
         root.finishPreparedSendReconciliation(code)
       })
-    })
+    }, undefined, { "Idempotency-Key": String(context.idempotencyKey) })
     if (!request) {
       failSend("credential_unavailable")
       return false
@@ -1618,78 +2188,129 @@ Item {
     return true
   }
 
-  function reconcileAmbiguousSendCreation(mintUrl, amount, knownOperationIds,
-      failureCode) {
-    sendAmbiguousCreation = {
-      mintUrl: String(mintUrl),
-      amount: String(amount),
-      knownOperationIds: knownOperationIds,
-      failureCode: String(failureCode || "transport_unavailable")
-    }
+  function retryAmbiguousSendCreation() {
+    if (!sendAmbiguousCreation || sendState !== "error") return false
+    return submitSendPreparation(sendAmbiguousCreation)
+  }
+
+  function reconcileAmbiguousSendCreation(context, failureCode) {
+    context.failureCode = String(failureCode || "transport_unavailable")
+    sendAmbiguousCreation = context
     sendState = "preparing"
     reconcileSendResources(function() {
-      var match = root.matchAmbiguousSendCreation(root.sendAmbiguousCreation)
-      if (match.matches !== 1) {
-        if (match.matches === 0) root.sendAmbiguousCreation = null
-        root.failSend(match.matches > 1 ? "invalid_response" : failureCode)
-        return
-      }
-      root.sendAmbiguousCreation = null
-      root.sendOperationId = String(match.operation.id)
-      root.finishPreparedSendReconciliation("")
+      // The Idempotency-Key is the only safe identity for this create intent.
+      // Canonical mint/amount matches may belong to another client.
+      root.failSend(context.failureCode)
     }, function() {
-      root.failSend(failureCode)
+      root.failSend(context.failureCode)
     })
   }
 
-  function matchAmbiguousSendCreation(context) {
-    var result = { operation: null, matches: 0 }
-    if (!context) return result
-    var known = context.knownOperationIds || ({})
-    for (var index = 0; index < sendOperations.length; index++) {
-      var operation = sendOperations[index]
-      var operationId = String(operation.id || "")
-      if (known[operationId] || String(operation.state || "") !== "prepared"
-          || String(operation.mintUrl || "") !== String(context.mintUrl || "")
-          || root.operationAmount(operation) !== String(context.amount || "")) continue
-      result.operation = operation
-      result.matches++
-    }
-    return result
-  }
-
   function reconcileAmbiguousSendFromCanonical() {
-    if (!sendAmbiguousCreation) return
-    var context = sendAmbiguousCreation
-    var match = matchAmbiguousSendCreation(context)
-    if (match.matches === 1) {
-      sendAmbiguousCreation = null
-      sendOperationId = String(match.operation.id)
-      finishPreparedSendReconciliation("")
-      return
-    }
-    if (match.matches > 1) {
-      failSend("invalid_response")
-      return
-    }
-    sendAmbiguousCreation = null
-    if (sendCancelOnPrepared) {
-      sendCancelOnPrepared = false
-      resetSend()
-    } else if (sendState === "preparing") {
-      failSend(String(context.failureCode || "transport_unavailable"))
-    }
+    // Never infer the identity of an ambiguous Send from collection contents.
+    // A user retry replays the exact body with the retained Idempotency-Key.
   }
 
   function finishPreparedSendReconciliation(code) {
     if (code) failSend(code)
     else if (!sendPreparedOperation) failSend("invalid_response")
     else sendState = "review"
-    if (sendCancelOnPrepared && sendOperationId && cancelPreparedSend()) {
-      sendCancelOnPrepared = false
-      return
-    }
     resumeDeferredCanonicalReconcile()
+  }
+
+  function reconcileActivePreparedSend(operationId, expectedTerminal, outcomeCode) {
+    var id = String(operationId || "")
+    var expected = String(expectedTerminal || "")
+    reconcileSendResources(function() {
+      root.activePreparedCommandOperationId = ""
+      var canonical = root.canonicalSendOperation(id)
+      var state = canonical ? String(canonical.state || "") : ""
+      if (expected === "pending" && state === "pending")
+        root.updatePreparedSendAction(id, "terminal", "", "pending")
+      else if (expected === "cancelled" && !canonical)
+        root.updatePreparedSendAction(id, "terminal", "", "cancelled")
+      else if (state === "prepared")
+        root.updatePreparedSendAction(id, outcomeCode ? "error" : "idle",
+          outcomeCode, "")
+      else if (state === "pending")
+        root.updatePreparedSendAction(id, "terminal", "", "pending")
+      else root.updatePreparedSendAction(id, "terminal",
+        outcomeCode || "operation_not_found", "unavailable")
+      root.resumeDeferredCanonicalReconcile()
+    }, function(code) {
+      root.activePreparedCommandOperationId = ""
+      root.updatePreparedSendAction(id, "error",
+        code || outcomeCode || "transport_unavailable", "")
+      root.resumeDeferredCanonicalReconcile()
+    })
+  }
+
+  function runActivePreparedSendCommand(operationId, command) {
+    var id = String(operationId || "")
+    var requestedCommand = String(command || "")
+    var executing = requestedCommand === "execute"
+    if (!executing && requestedCommand !== "cancel") return false
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "prepared"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    abortIncrementalSendFetches()
+    activePreparedCommandOperationId = id
+    updatePreparedSendAction(id, executing ? "executing" : "cancelling", "", "")
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/" + requestedCommand, undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePreparedSend(id, "", result.error.code)
+          return
+        }
+        var exact = executing && result.value && result.value.operation
+          ? result.value.operation : result.value
+        var resultDocument = executing && result.value && result.value.result
+          ? result.value.result : null
+        var expectedState = executing ? "pending" : "rolled_back"
+        if (result.status !== 200 || !root.isSendOperation(exact)
+            || String(exact.id || "") !== id
+            || String(exact.state || "") !== expectedState
+            || (executing && !root.isSendResult(resultDocument))) {
+          root.reconcileActivePreparedSend(id, "", "invalid_response")
+          return
+        }
+        if (executing) {
+          // Confirmation from Active Sends does not reveal bearer material.
+          resultDocument.token = ""
+        }
+        root.reconcileActivePreparedSend(id,
+          executing ? "pending" : "cancelled", "")
+      })
+    if (!request) {
+      activePreparedCommandOperationId = ""
+      updatePreparedSendAction(id, "error", "credential_unavailable", "")
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function executeActivePreparedSend(operationId) {
+    return runActivePreparedSendCommand(operationId, "execute")
+  }
+
+  function cancelActivePreparedSend(operationId) {
+    return runActivePreparedSendCommand(operationId, "cancel")
+  }
+
+  function refreshActivePreparedSend(operationId) {
+    var id = String(operationId || "")
+    if (!id || !canonicalSendOperation(id) || !sendCommandsAvailable
+        || sendCommandRequest || sendReconcileRequests.length > 0
+        || sendResultReconciling) return false
+    activePreparedCommandOperationId = id
+    updatePreparedSendAction(id, "refreshing", "", "")
+    reconcileActivePreparedSend(id, "", "")
+    return true
   }
 
   function cancelPreparedSend() {
@@ -1803,6 +2424,264 @@ Item {
     return true
   }
 
+  function activePendingSendAmount(operationId, fallback) {
+    var operation = fallback || canonicalSendOperation(operationId)
+    if (!operation) {
+      var action = pendingSendAction(operationId)
+      return String(action.amount || "")
+    }
+    return String(operationAmount(operation) || "")
+  }
+
+  function finishActivePendingReconciliation(operationId, exactOperation,
+      exactMissing, outcomeCode, values) {
+    sendReconcileRequests = []
+    sendResultReconciling = false
+    if (activePendingCommandOperationId === String(operationId || ""))
+      activePendingCommandOperationId = ""
+    if (values) {
+      replaceCanonicalSendOperations(values.prepared.items.concat(values.inFlight.items), true)
+      balancesResource = values.balances
+      refreshCount++
+    } else if (exactOperation) {
+      replaceCanonicalSendOperations(withSendOperation(sendOperations, exactOperation), true)
+    } else if (exactMissing) {
+      replaceCanonicalSendOperations(withoutSendOperation(sendOperations, operationId), true)
+    }
+
+    var amount = activePendingSendAmount(operationId, exactOperation)
+    var state = exactOperation ? String(exactOperation.state || "") : ""
+    if (state === "rolled_back") {
+      updatePendingSendAction(operationId, "terminal", "", "reclaimed", amount)
+    } else if (state === "finalized") {
+      updatePendingSendAction(operationId, "terminal", "", "recipient_won", amount)
+    } else if (exactMissing) {
+      updatePendingSendAction(operationId, "terminal", "operation_not_found",
+        "unavailable", amount)
+    } else {
+      var code = String(outcomeCode || "")
+      if (state && state !== "pending" && !code) code = "operation_conflict"
+      updatePendingSendAction(operationId, code ? "error" : "idle", code, "", amount)
+    }
+    resumeDeferredCanonicalReconcile()
+  }
+
+  function reconcileActivePendingCollections(operationId, exactOperation,
+      exactMissing, outcomeCode) {
+    var specifications = [
+      { key: "prepared", path: "/v1/operations/send/prepared", type: "send" },
+      { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
+      { key: "balances", path: "/v1/balances", type: "balances" }
+    ]
+    collectSendResources(specifications, function(values) {
+      root.finishActivePendingReconciliation(operationId, exactOperation,
+        exactMissing, outcomeCode, values)
+    }, function(code) {
+      root.finishActivePendingReconciliation(operationId, exactOperation,
+        exactMissing, code || outcomeCode || "transport_unavailable", null)
+    })
+  }
+
+  function reconcileActivePendingSend(operationId, outcomeCode, fallbackOperation) {
+    var id = String(operationId || "")
+    if (!id) return
+    activePendingCommandOperationId = id
+    sendResultReconciling = true
+    var lookup = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id), undefined, function(result) {
+        if (root.sendReconcileRequests.indexOf(lookup) === -1) return
+        root.sendReconcileRequests = []
+        if (!result.ok) {
+          if (result.error.code === "operation_not_found") {
+            root.reconcileActivePendingCollections(id, null, true,
+              outcomeCode || "operation_not_found")
+            return
+          }
+          root.reconcileActivePendingCollections(id, fallbackOperation || null,
+            false, result.error.code || outcomeCode)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id) {
+          root.reconcileActivePendingCollections(id, fallbackOperation || null,
+            false, "invalid_response")
+          return
+        }
+        var exact = result.value
+        if (String(exact.state || "") !== "pending") {
+          root.reconcileActivePendingCollections(id, exact, false, outcomeCode)
+          return
+        }
+        var refresh = root.sendRequest("POST", "/v1/operations/send/"
+          + encodeURIComponent(id) + "/refresh", undefined, function(refreshResult) {
+            if (root.sendReconcileRequests.indexOf(refresh) === -1) return
+            root.sendReconcileRequests = []
+            if (!refreshResult.ok) {
+              if (refreshResult.error.code === "operation_not_found")
+                root.reconcileActivePendingCollections(id, null, true,
+                  outcomeCode || "operation_not_found")
+              else root.reconcileActivePendingCollections(id, exact, false,
+                refreshResult.error.code === "coco_error"
+                  ? "refresh_unavailable" : refreshResult.error.code || outcomeCode)
+              return
+            }
+            if (refreshResult.status !== 200
+                || !root.isSendOperation(refreshResult.value)
+                || String(refreshResult.value.id || "") !== id) {
+              root.reconcileActivePendingCollections(id, exact, false,
+                "invalid_response")
+              return
+            }
+            root.reconcileActivePendingCollections(id, refreshResult.value,
+              false, outcomeCode)
+          })
+        if (!refresh) {
+          root.reconcileActivePendingCollections(id, exact, false,
+            "credential_unavailable")
+          return
+        }
+        root.sendReconcileRequests = [refresh]
+      })
+    if (!lookup) {
+      sendResultReconciling = false
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "",
+        activePendingSendAmount(id, fallbackOperation))
+      resumeDeferredCanonicalReconcile()
+      return
+    }
+    sendReconcileRequests = [lookup]
+  }
+
+  function requestActivePendingSendResult(operationId, presentationGeneration,
+      intent) {
+    var id = String(operationId || "")
+    var requestedIntent = String(intent || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || ["copy", "reveal"].indexOf(requestedIntent) === -1
+        || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id,
+      requestedIntent === "copy" ? "copying" : "revealing", "", "", amount)
+    var contextGeneration = sendPresentationContextGeneration
+    var request = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/result", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (contextGeneration !== root.sendPresentationContextGeneration) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "idle", "", "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        if (!result.ok) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "error", result.error.code, "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        if (result.status !== 200 || !root.isSendResult(result.value)) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "error", "invalid_response", "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        var outgoingToken = String(result.value.token)
+        result.value.token = ""
+        root.updatePendingSendAction(id, "idle", "", "", amount)
+        root.activePendingCommandOperationId = ""
+        root.pendingSendResultDelivered(id, presentationGeneration,
+          requestedIntent, outgoingToken)
+        outgoingToken = ""
+        root.resumeDeferredCanonicalReconcile()
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function refreshActivePendingSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id, "refreshing", "", "", amount)
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/refresh", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePendingSend(id,
+            result.error.code === "coco_error"
+              ? "refresh_unavailable" : result.error.code, operation)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id) {
+          root.reconcileActivePendingSend(id, "invalid_response", operation)
+          return
+        }
+        root.reconcileActivePendingCollections(id, result.value, false, "")
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function reclaimActivePendingSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id, "reclaiming", "", "", amount)
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/reclaim", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePendingSend(id, result.error.code, operation)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id
+            || String(result.value.state || "") !== "rolled_back") {
+          root.reconcileActivePendingSend(id, "invalid_response", operation)
+          return
+        }
+        root.reconcileActivePendingSend(id, "", result.value)
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
   function retrievePendingSendResult(operationId) {
     var id = String(operationId || "")
     var operation = canonicalSendOperation(id)
@@ -1896,17 +2775,47 @@ Item {
   }
 
   function reconcileSendResources(callback, failureCallback) {
+    sendCanonicalSynchronized = false
     var specifications = [
       { key: "prepared", path: "/v1/operations/send/prepared", type: "send" },
       { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
       { key: "balances", path: "/v1/balances", type: "balances" }
     ]
     collectSendResources(specifications, function(values) {
-      root.sendOperations = values.prepared.items.concat(values.inFlight.items)
+      root.replaceCanonicalSendOperations(
+        values.prepared.items.concat(values.inFlight.items), true)
       root.balancesResource = values.balances
       root.refreshCount++
+      root.sendCanonicalSynchronized = true
       callback()
-    }, failureCallback)
+    }, function(code) {
+      root.sendCanonicalSynchronized = false
+      if (typeof failureCallback === "function") failureCallback(code)
+    })
+  }
+
+  function refreshActiveSends(reason) {
+    if (connectionState !== "connected" || compatibilityState !== "compatible"
+        || walletState !== "unlocked") {
+      sendCanonicalSynchronized = false
+      return false
+    }
+    activeSendsCanonicalRefreshCount++
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+      queuedSendInvalidation = true
+      queuedBalanceInvalidation = true
+      sendCanonicalSynchronized = false
+      return true
+    }
+    reconcileSendResources(function() {
+      root.resumeQueuedSendInvalidations()
+    }, function(code) {
+      root.lastErrorCode = String(code || "transport_unavailable")
+      root.connectionState = "unavailable"
+      root.connectionDetail = "Active Sends canonical refresh failed"
+      root.scheduleReconnect(false, !!root.streamRequest)
+    })
+    return true
   }
 
   function failSend(code) {
@@ -2405,7 +3314,20 @@ Item {
     if (request) request.abort()
   }
 
-  function fetchBalances() {
+  function hasSendLookupRequests() {
+    for (var operationId in sendLookupRequestsById) return true
+    return false
+  }
+
+  function maybeMarkSendCanonicalSynchronized() {
+    if (fullFetchInProgress || sendCanonicalMutationBusy() || balanceRequest
+        || sendRequests.length > 0 || hasSendLookupRequests()
+        || queuedSendInvalidation || queuedBalanceInvalidation) return
+    sendCanonicalSynchronized = connectionState === "connected"
+      && compatibilityState === "compatible" && walletState === "unlocked"
+  }
+
+  function fetchBalances(successCallback) {
     if (fullFetchInProgress || sendCanonicalMutationBusy()) {
       queuedBalanceInvalidation = true
       return
@@ -2426,6 +3348,8 @@ Item {
       }
       root.balancesResource = result.value
       root.refreshCount++
+      if (typeof successCallback === "function") successCallback()
+      root.maybeMarkSendCanonicalSynchronized()
     })
     if (!request) {
       handleCredentialUnavailable()
@@ -2467,7 +3391,10 @@ Item {
     var existing = type === "receive" ? receiveRequests : sendRequests
     abortRequests(existing)
     if (type === "receive") receiveRequests = []
-    else sendRequests = []
+    else {
+      sendRequests = []
+      sendCanonicalSynchronized = false
+    }
     var paths = [
       "/v1/operations/" + type + "/prepared",
       "/v1/operations/" + type + "/in-flight"
@@ -2475,20 +3402,46 @@ Item {
     var values = []
     var pending = paths.length
     var requests = []
+    var failed = false
+
+    function track(request) {
+      requests.push(request)
+      if (type === "receive") root.receiveRequests = requests
+      else root.sendRequests = requests
+    }
+
+    function current(request) {
+      return !failed && requests.indexOf(request) !== -1
+    }
+
+    function reject(code) {
+      if (failed) return
+      failed = true
+      root.abortRequests(requests)
+      if (type === "receive") root.receiveRequests = []
+      else root.sendRequests = []
+      if (code === "credential_unavailable") {
+        root.handleCredentialUnavailable()
+      } else if (code === "invalid_response") {
+        root.handleContractFailure("invalid_" + type + "_operations",
+          "cocod returned invalid Operation resources")
+      } else {
+        root.handleFetchFailure({
+          status: code === "transport_unavailable" ? 0 : 500,
+          error: { code: code }
+        })
+      }
+    }
+
     for (var i = 0; i < paths.length; i++) {
       (function(index) {
-        var request = root.sendRequest("GET", paths[index], undefined, function(result) {
-          if (requests.indexOf(request) === -1) return
+        root.fetchAllOperationPages(paths[index], type, track, current,
+          function(result) {
           if (!result.ok) {
-            root.handleFetchFailure(result)
+            reject(result.code)
             return
           }
-          if (!root.isOperationCollection(result.value, type)) {
-            root.handleContractFailure("invalid_" + type + "_operations",
-              "cocod returned invalid Operation resources")
-            return
-          }
-          values[index] = result.value.items
+          values[index] = result.items
           pending--
           if (pending === 0) {
             if (type === "receive") {
@@ -2496,20 +3449,18 @@ Item {
               root.receiveOperations = values[0].concat(values[1])
             } else {
               root.sendRequests = []
-              root.sendOperations = values[0].concat(values[1])
+              root.replaceCanonicalSendOperations(values[0].concat(values[1]), true)
+              root.maybeMarkSendCanonicalSynchronized()
             }
             root.refreshCount++
           }
         })
-        if (!request) {
-          root.handleCredentialUnavailable()
-          return
-        }
-        requests.push(request)
       })(i)
     }
-    if (type === "receive") receiveRequests = requests
-    else sendRequests = requests
+    if (!failed) {
+      if (type === "receive") receiveRequests = requests
+      else sendRequests = requests
+    }
   }
 
   function withSendOperation(values, operation) {
@@ -2558,17 +3509,20 @@ Item {
       queueSendOperationInvalidation(id)
       return
     }
+    sendCanonicalSynchronized = false
 
     function complete(operation, remove) {
       var requests = ({})
       for (var key in root.sendLookupRequestsById)
         if (key !== id) requests[key] = root.sendLookupRequestsById[key]
       root.sendLookupRequestsById = requests
-      if (operation) root.sendOperations = root.withSendOperation(
-        root.sendOperations, operation)
-      else if (remove) root.sendOperations = root.withoutSendOperation(
-        root.sendOperations, id)
-      root.fetchBalances()
+      if (operation) root.replaceCanonicalSendOperations(root.withSendOperation(
+        root.sendOperations, operation), true)
+      else if (remove) root.replaceCanonicalSendOperations(root.withoutSendOperation(
+        root.sendOperations, id), true)
+      root.fetchBalances(function() {
+        root.maybeMarkSendCanonicalSynchronized()
+      })
       root.refreshCount++
       if (root.queuedSendOperationInvalidations[id]) {
         var queued = ({})
@@ -2576,7 +3530,7 @@ Item {
           if (queuedId !== id) queued[queuedId] = true
         root.queuedSendOperationInvalidations = queued
         Qt.callLater(function() { root.refetchSendOperation(id) })
-      }
+      } else root.maybeMarkSendCanonicalSynchronized()
     }
 
     var lookup = sendRequest("GET", "/v1/operations/send/"
@@ -2592,37 +3546,7 @@ Item {
             "cocod returned an invalid Send Operation")
           return
         }
-        var canonical = result.value
-        var refresh = root.sendRequest("POST", "/v1/operations/send/"
-          + encodeURIComponent(id) + "/refresh", undefined, function(refreshResult) {
-            if (root.sendLookupRequestsById[id] !== refresh) return
-            if (!refreshResult.ok) {
-              if (refreshResult.error.code === "operation_not_found")
-                complete(null, true)
-              else complete(canonical)
-              if (String(root.sendOperationId || "") === id)
-                root.failSend(refreshResult.error.code)
-              return
-            }
-            if (refreshResult.status !== 200
-                || !root.isSendOperation(refreshResult.value)) {
-              complete(canonical)
-              root.handleContractFailure("invalid_send_operation",
-                "cocod returned an invalid refreshed Send Operation")
-              return
-            }
-            complete(refreshResult.value)
-          })
-        if (!refresh) {
-          complete(canonical)
-          root.handleCredentialUnavailable()
-          return
-        }
-        var requests = ({})
-        for (var key in root.sendLookupRequestsById)
-          requests[key] = root.sendLookupRequestsById[key]
-        requests[id] = refresh
-        root.sendLookupRequestsById = requests
+        complete(result.value)
       })
     if (!lookup) {
       handleCredentialUnavailable()
@@ -2784,7 +3708,8 @@ Item {
       return
     }
     if (event.type === "balance.updated") {
-      fetchBalances()
+      sendCanonicalSynchronized = false
+      fetchBalances(function() { root.maybeMarkSendCanonicalSynchronized() })
       refetchPendingSendOperations()
     }
     else if (event.type === "mint.updated") fetchMints()
@@ -2802,6 +3727,7 @@ Item {
       } else if (operationType === "send") {
         var sendOperationId = String(event.data.operationId || "")
         if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+          sendCanonicalSynchronized = false
           queueSendOperationInvalidation(sendOperationId)
           queuedSendInvalidation = true
           queuedBalanceInvalidation = true
@@ -2829,6 +3755,7 @@ Item {
     heartbeatTimer.stop()
     rotationTimer.stop()
     connectionState = "unavailable"
+    sendCanonicalSynchronized = false
     connectionDetail = status > 0
       ? "cocod event stream closed with HTTP " + status
       : "cocod event stream disconnected"
@@ -2921,6 +3848,7 @@ Item {
     repeat: false
     onTriggered: {
       root.connectionState = "unavailable"
+      root.sendCanonicalSynchronized = false
       root.connectionDetail = "cocod event stream heartbeat timed out"
       root.lastErrorCode = "event_stream_timeout"
       root.scheduleReconnect(true)

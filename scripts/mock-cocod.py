@@ -176,7 +176,7 @@ def operation_error(
 
 class MockState:
     def __init__(self, state_root: Path) -> None:
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.state_root = state_root
         self.wallet_configured = False
         self.status = self._status_document()
@@ -229,13 +229,20 @@ class MockState:
         self.receive_create_dropped_responses = 0
         self.receive_refresh_error = ""
         self.send_create_requests = 0
+        self.send_idempotency_unique_keys = 0
+        self.send_idempotency_replays = 0
+        self.send_idempotency_conflicts = 0
+        self.send_idempotency_cache: dict[str, dict[str, Any]] = {}
         self.send_create_delay_ms = 0
         self.send_execute_requests = 0
         self.send_cancel_requests = 0
         self.send_reclaim_requests = 0
+        self.send_reclaim_operation_ids: list[str] = []
         self.send_refresh_requests = 0
         self.send_lookup_requests = 0
         self.send_result_requests = 0
+        self.send_result_operation_ids: list[str] = []
+        self.send_result_delay_ms = 0
         self.send_result_unavailable_responses = 0
         self.send_operation_sequence = 0
         self.send_operations: dict[str, dict[str, Any]] = {}
@@ -247,6 +254,7 @@ class MockState:
         self.send_cancel_error = ""
         self.send_reclaim_outcome = "success"
         self.send_refresh_error = ""
+        self.send_refresh_unavailable_responses = 0
         self.send_execute_interruption = "none"
         self.send_command_delay_ms = 0
         self.send_prepared_failures = 0
@@ -570,6 +578,11 @@ class MockState:
     def send_result(self, operation_id: str) -> tuple[int, dict[str, Any]]:
         with self.lock:
             self.send_result_requests += 1
+            self.send_result_operation_ids.append(operation_id)
+            delay_ms = self.send_result_delay_ms
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+        with self.lock:
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 return operation_error("not_found", "The Send does not exist")
@@ -590,31 +603,68 @@ class MockState:
             return 200, {"token": token}
 
     def create_send(
-        self, value: object
+        self, value: object, idempotency_key: str | None = None
     ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
         mint_url = value.get("mintUrl") if isinstance(value, dict) else None
         unit = value.get("unit") if isinstance(value, dict) else None
         amount = value.get("amount") if isinstance(value, dict) else None
+        canonical_request = json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+        def respond(
+            status: int, response: dict[str, Any], events: list[dict[str, Any]]
+        ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+            if idempotency_key:
+                with self.lock:
+                    self.send_idempotency_cache.setdefault(
+                        idempotency_key,
+                        {
+                            "request": canonical_request,
+                            "status": status,
+                            "response": copy.deepcopy(response),
+                        },
+                    )
+            return status, response, events
+
         with self.lock:
             self.send_create_requests += 1
+            if idempotency_key:
+                cached = self.send_idempotency_cache.get(idempotency_key)
+                if cached is not None:
+                    if cached["request"] != canonical_request:
+                        self.send_idempotency_conflicts += 1
+                        return 409, error_document(
+                            "idempotency_key_conflict",
+                            "The Idempotency-Key was already used for another request",
+                        ), []
+                    self.send_idempotency_replays += 1
+                    return int(cached["status"]), copy.deepcopy(cached["response"]), []
+                self.send_idempotency_unique_keys += 1
             mints = copy.deepcopy(self.resources["mints"]["items"])
         if not isinstance(mint_url, str) or not mint_url:
-            return 400, error_document("invalid_request", "A Mint URL is required"), []
+            return respond(
+                400, error_document("invalid_request", "A Mint URL is required"), []
+            )
         if unit != "sat":
-            return 400, error_document("invalid_request", "Only sat is supported"), []
+            return respond(
+                400, error_document("invalid_request", "Only sat is supported"), []
+            )
         if not isinstance(amount, str) or not re.fullmatch(r"[1-9][0-9]*", amount):
-            return 400, error_document("invalid_request", "A positive decimal amount is required"), []
+            return respond(
+                400,
+                error_document("invalid_request", "A positive decimal amount is required"),
+                [],
+            )
         mint = next((item for item in mints if item.get("mintUrl") == mint_url), None)
         if mint is None:
             status, response = operation_error(
                 "coco_error", "Coco could not prepare the Send Operation"
             )
-            return status, response, []
+            return respond(status, response, [])
         if mint.get("trusted") is not True:
             status, response = operation_error(
                 "coco_error", "Coco could not prepare the Send Operation"
             )
-            return status, response, []
+            return respond(status, response, [])
         with self.lock:
             forced_error = self.send_create_error
             self.send_create_error = ""
@@ -622,10 +672,10 @@ class MockState:
                 status, response = operation_error(
                     forced_error, "Coco could not prepare the Send Operation"
                 )
-                return status, response, []
+                return respond(status, response, [])
             if self.send_create_empty_id:
                 self.send_create_empty_id = False
-                return 201, {
+                return respond(201, {
                     "id": "",
                     "type": "send",
                     "state": "prepared",
@@ -638,7 +688,7 @@ class MockState:
                     "needsSwap": False,
                     "createdAt": FIXED_TIME,
                     "updatedAt": FIXED_TIME,
-                }, []
+                }, [])
             balance = next(
                 (
                     item
@@ -655,7 +705,7 @@ class MockState:
                 status, response = operation_error(
                     "coco_error", "Coco could not prepare the Send Operation"
                 )
-                return status, response, []
+                return respond(status, response, [])
             self.send_operation_sequence += 1
             operation_id = f"send-{self.send_operation_sequence}"
             operation = {
@@ -677,6 +727,12 @@ class MockState:
             balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
             self.send_operations[operation_id] = operation
             self.resources["sendPrepared"]["items"].append(copy.deepcopy(operation))
+            if idempotency_key:
+                self.send_idempotency_cache[idempotency_key] = {
+                    "request": canonical_request,
+                    "status": 201,
+                    "response": copy.deepcopy(operation),
+                }
             self._persist_locked()
         events = [
             self.safe_event(
@@ -706,6 +762,7 @@ class MockState:
                 self.send_cancel_requests += 1
             elif command == "reclaim":
                 self.send_reclaim_requests += 1
+                self.send_reclaim_operation_ids.append(operation_id)
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 status, response = operation_error(
@@ -896,6 +953,9 @@ class MockState:
                 return status, response, []
             forced_error = self.send_refresh_error
             self.send_refresh_error = ""
+            if self.send_refresh_unavailable_responses > 0:
+                self.send_refresh_unavailable_responses -= 1
+                forced_error = "mint_unavailable"
             if forced_error:
                 status, response = operation_error(
                     forced_error, "Coco could not reconcile the Send Operation"
@@ -1290,13 +1350,20 @@ class MockState:
                 "receivePrepareReconcileFailures": self.receive_prepare_reconcile_failures,
                 "receiveOperationCount": len(self.receive_operations),
                 "sendCreateRequests": self.send_create_requests,
+                "sendIdempotencyUniqueKeys": self.send_idempotency_unique_keys,
+                "sendIdempotencyReplays": self.send_idempotency_replays,
+                "sendIdempotencyConflicts": self.send_idempotency_conflicts,
                 "sendCreateDelayMs": self.send_create_delay_ms,
                 "sendExecuteRequests": self.send_execute_requests,
                 "sendCancelRequests": self.send_cancel_requests,
                 "sendReclaimRequests": self.send_reclaim_requests,
+                "sendReclaimOperationIds": list(self.send_reclaim_operation_ids),
                 "sendRefreshRequests": self.send_refresh_requests,
                 "sendLookupRequests": self.send_lookup_requests,
                 "sendResultRequests": self.send_result_requests,
+                "sendResultOperationIds": list(self.send_result_operation_ids),
+                "sendResultDelayMs": self.send_result_delay_ms,
+                "sendRefreshUnavailableResponses": self.send_refresh_unavailable_responses,
                 "sendOperationCount": len(self.send_operations),
                 "sendCommandDelayMs": self.send_command_delay_ms,
             }
@@ -1443,12 +1510,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, mint)
             return
-        if self.path in COLLECTION_PATHS:
+        if request_url.path in COLLECTION_PATHS:
             if not self.wallet_required():
                 return
-            name = COLLECTION_PATHS[self.path]
+            name = COLLECTION_PATHS[request_url.path]
             with self.state.lock:
                 value = copy.deepcopy(self.state.resources[name])
+            if name in (
+                "receivePrepared",
+                "receiveInFlight",
+                "sendPrepared",
+                "sendInFlight",
+            ):
+                query = parse_qs(request_url.query)
+                try:
+                    offset = int(query.get("offset", ["0"])[0])
+                    limit = int(query.get("limit", ["20"])[0])
+                except (TypeError, ValueError):
+                    self.send_json(
+                        400,
+                        error_document("invalid_request", "Invalid pagination"),
+                    )
+                    return
+                if offset < 0 or limit < 1 or limit > 100:
+                    self.send_json(
+                        400,
+                        error_document("invalid_request", "Invalid pagination"),
+                    )
+                    return
+                items = value.get("items", [])
+                value = {
+                    "items": items[offset : offset + limit],
+                    "offset": offset,
+                    "limit": limit,
+                }
             self.resource_response(name, value)
             return
         match = re.fullmatch(r"/v1/operations/send/([^/]+)/result", self.path)
@@ -1717,6 +1812,22 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.send_refresh_error = refresh_error
+                if "sendRefreshUnavailableResponses" in value:
+                    try:
+                        refresh_unavailable = int(
+                            value["sendRefreshUnavailableResponses"]
+                        )
+                    except (TypeError, ValueError):
+                        refresh_unavailable = -1
+                    if refresh_unavailable < 0 or refresh_unavailable > 10:
+                        self.send_json(
+                            400,
+                            error_document(
+                                "invalid_request", "Invalid Send refresh unavailable count"
+                            ),
+                        )
+                        return
+                    self.state.send_refresh_unavailable_responses = refresh_unavailable
                 if "sendCommandDelayMs" in value:
                     self.state.send_command_delay_ms = max(
                         0, min(5000, int(value["sendCommandDelayMs"]))
@@ -1748,6 +1859,10 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.send_result_unavailable_responses = unavailable_responses
+                if "sendResultDelayMs" in value:
+                    self.state.send_result_delay_ms = max(
+                        0, min(5000, int(value["sendResultDelayMs"]))
+                    )
                 if value.get("sendPrepareReconcileError") is True:
                     self.state.send_prepared_failures = 1
                     self.state.suppress_next_send_events = True
@@ -1836,7 +1951,8 @@ class Handler(BaseHTTPRequestHandler):
                 send_create_delay_ms = self.state.send_create_delay_ms
             if send_create_delay_ms > 0:
                 time.sleep(send_create_delay_ms / 1000)
-            status, response, events = self.state.create_send(value)
+            idempotency_key = self.headers.get("Idempotency-Key")
+            status, response, events = self.state.create_send(value, idempotency_key)
             if status == 0:
                 self.close_connection = True
                 return

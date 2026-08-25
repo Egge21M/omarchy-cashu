@@ -33,9 +33,14 @@ ShellRoot {
 
   QtObject {
     id: testBar
+    property var shell: testShell
     property string position: "top"
+    property bool vertical: false
     property int barSize: 1
     property color foreground: "white"
+    property color barForeground: foreground
+    property color background: "black"
+    property bool foregroundAnimationEnabled: false
     property color urgent: "red"
     property string fontFamily: "sans-serif"
     property var activePopout: null
@@ -53,6 +58,13 @@ ShellRoot {
     id: testShell
     property var bar: testBar
     function hide(pluginId) { walletPanel.close() }
+    function serviceFor(pluginId) { return adapter }
+    function isPluginOpen(pluginId) { return walletPanel.opened }
+    function summon(pluginId, payload) { walletPanel.open(payload) }
+    function toggle(pluginId, payload) {
+      if (walletPanel.opened) walletPanel.close()
+      else walletPanel.open(payload)
+    }
   }
 
   Service {
@@ -69,11 +81,20 @@ ShellRoot {
     shell: testShell
   }
 
+  BarWidget {
+    id: walletBar
+    bar: testBar
+  }
+
   IpcHandler {
     target: "io.github.egge21m.omarchy-cashu.runtime-test"
 
     function panelSnapshot(): string {
       return walletPanel.smokeSnapshot()
+    }
+
+    function barSnapshot(): string {
+      return walletBar.smokeSnapshot()
     }
 
     function openPanel(): string {
@@ -170,6 +191,64 @@ ShellRoot {
 
     function retrySend(): string {
       return walletPanel.smokeRetrySend()
+    }
+
+    function openActiveSends(): string {
+      return walletPanel.smokeOpenActiveSends()
+    }
+
+    function selectActiveSend(operationId: string): string {
+      return walletPanel.smokeSelectActiveSend(operationId)
+    }
+
+    function backActiveSends(): string {
+      return walletPanel.smokeBackActiveSends()
+    }
+
+    function refreshActiveSends(): string {
+      return walletPanel.smokeRefreshActiveSends()
+    }
+
+    function setActiveSendsPollInterval(intervalMs: int): string {
+      if (intervalMs < 50) return "disabled"
+      adapter.activeSendsPollIntervalMs = intervalMs
+      return "ok"
+    }
+
+    function copyActivePendingSend(): string {
+      return walletPanel.smokeCopyActivePendingSend()
+    }
+
+    function revealActivePendingSend(): string {
+      return walletPanel.smokeRevealActivePendingSend()
+    }
+
+    function hideActivePendingSend(): string {
+      return walletPanel.smokeHideActivePendingSend()
+    }
+
+    function refreshActivePendingSend(): string {
+      return walletPanel.smokeRefreshActivePendingSend()
+    }
+
+    function beginActivePendingReclaim(): string {
+      return walletPanel.smokeBeginActivePendingReclaim()
+    }
+
+    function confirmActivePendingReclaim(): string {
+      return walletPanel.smokeConfirmActivePendingReclaim()
+    }
+
+    function confirmActivePreparedSend(): string {
+      return walletPanel.smokeConfirmActivePreparedSend()
+    }
+
+    function cancelActivePreparedSend(): string {
+      return walletPanel.smokeCancelActivePreparedSend()
+    }
+
+    function refreshActivePreparedSend(): string {
+      return walletPanel.smokeRefreshActivePreparedSend()
     }
   }
 }

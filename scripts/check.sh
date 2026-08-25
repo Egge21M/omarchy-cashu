@@ -27,6 +27,10 @@ jq -e --arg id "$plugin_id" '
 if rg -n 'spendableBalance|reservedBalance' "$project_dir/BarWidget.qml"; then
   fail "the bar must not expose balances"
 fi
+if rg -n 'activeSends|activeTransfers|operationAmount|amountText' \
+    "$project_dir/BarWidget.qml"; then
+  fail "the bar must not expose Active Sends counts or transfer amounts"
+fi
 
 if rg -n '(^|[^A-Za-z])(Process|FileView|Socket|WebSocket|NetworkAccessManager)[[:space:]]*\{' \
   "$project_dir/BarWidget.qml" "$project_dir/Panel.qml"; then

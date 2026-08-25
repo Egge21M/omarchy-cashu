@@ -24,10 +24,54 @@ Item {
   property string recoveryViewState: "closed"
   property string recoveryPhrase: ""
   property string recoveryError: ""
+  property string activeSendsViewState: "closed"
+  property string selectedActiveSendOperationId: ""
+  property double relativeTimeEpoch: Date.now()
+  readonly property bool activeSendsReconnecting: activeSends.length > 0
+    && stateOwner && ["connecting", "reconnecting", "unavailable"]
+      .indexOf(String(stateOwner.connectionState || "")) !== -1
+  readonly property bool activeSendsRefreshing: stateOwner
+    && stateOwner.connectionState === "connected"
+    && stateOwner.sendCanonicalSynchronized === false
   readonly property Item anchorItem: hostWidget && hostWidget.anchorItem
     ? hostWidget.anchorItem : null
   readonly property var activeTransfer: stateOwner
     && stateOwner.activeTransfers.length > 0 ? stateOwner.activeTransfers[0] : null
+  readonly property var activeSends: stateOwner
+    && Array.isArray(stateOwner.activeSends) ? stateOwner.activeSends : []
+  readonly property var selectedActiveSend: {
+    for (var index = 0; index < activeSends.length; index++)
+      if (String(activeSends[index].id || "") === selectedActiveSendOperationId)
+        return activeSends[index]
+    return null
+  }
+  readonly property var selectedSendDescriptor: stateOwner
+    && typeof stateOwner.sendOperationDescriptor === "function"
+    ? stateOwner.sendOperationDescriptor(selectedActiveSendOperationId,
+      activeSendsViewState === "detail") : ({
+      isPrepared: false, isPending: false, readOnly: false,
+      mutationActionCount: 0, preparedBusy: false,
+      preparedCommandsAvailable: false, terminalState: "", terminalMessage: "",
+      preparedAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: ""
+      }),
+      pendingAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+      })
+    })
+  readonly property var selectedPendingSendAction: selectedSendDescriptor.pendingAction
+  readonly property string selectedPendingSendTerminalState: String(
+    selectedPendingSendAction.terminalState || "")
+  readonly property var selectedPreparedSendAction: selectedSendDescriptor.preparedAction
+  readonly property string selectedPreparedSendTerminalState: String(
+    selectedPreparedSendAction.terminalState || "")
+  readonly property var selectedPreparedSendBalance: stateOwner && selectedActiveSend
+    && selectedSendDescriptor.isPrepared
+    && typeof stateOwner.sendBalanceForMint === "function"
+    ? stateOwner.sendBalanceForMint(selectedActiveSend.mintUrl) : null
+  readonly property bool selectedPreparedSendBusy: selectedSendDescriptor.preparedBusy
+  readonly property bool selectedPreparedSendCommandsAvailable:
+    selectedSendDescriptor.preparedCommandsAvailable
 
   readonly property color foreground: shell && shell.bar
     ? shell.bar.foreground : Color.foreground
@@ -82,6 +126,7 @@ Item {
   function close() {
     if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
+    closeActiveSends()
     opened = false
     return true
   }
@@ -89,6 +134,7 @@ Item {
   function dismiss() {
     if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
+    closeActiveSends()
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else opened = false
     return true
@@ -103,6 +149,98 @@ Item {
     for (var index = firstGroup; index < digits.length; index += 3)
       formatted += "," + digits.slice(index, index + 3)
     return formatted + " " + (stateOwner ? stateOwner.unit : "sat")
+  }
+
+  function relativeUpdateText(timestamp) {
+    if (!stateOwner || typeof stateOwner.relativeUpdateTime !== "function")
+      return "Update time unavailable"
+    return stateOwner.relativeUpdateTime(timestamp, relativeTimeEpoch)
+  }
+
+  function activeSendRowsSnapshot() {
+    var rows = []
+    for (var index = 0; index < activeSends.length; index++) {
+      var send = activeSends[index]
+      rows.push({
+        id: String(send.id || ""),
+        state: String(send.state || ""),
+        stateLabel: String(send.stateLabel || ""),
+        amount: String(send.amount || "0"),
+        mintHostname: String(send.mintHostname || ""),
+        updatedAt: String(send.updatedAt || ""),
+        relativeUpdate: relativeUpdateText(send.updatedAt),
+        reservedInput: String(send.reservedInput || "")
+      })
+    }
+    return rows
+  }
+
+  function openActiveSends() {
+    if (!stateOwner || activeSendsViewState !== "closed") return false
+    clearRecoveryPhrase()
+    selectedActiveSendOperationId = ""
+    activeSendsViewState = "list"
+    if (typeof stateOwner.refreshActiveSends === "function")
+      stateOwner.refreshActiveSends("active-sends-open")
+    panelFlick.contentY = 0
+    return true
+  }
+
+  function refreshActiveSends() {
+    if (!stateOwner || activeSendsViewState === "closed"
+        || typeof stateOwner.refreshActiveSends !== "function") return false
+    return stateOwner.refreshActiveSends("explicit")
+  }
+
+  function selectActiveSend(operationId) {
+    var selected = String(operationId || "")
+    if (activeSendsViewState !== "list" || !selected) return false
+    for (var index = 0; index < activeSends.length; index++) {
+      if (String(activeSends[index].id || "") !== selected) continue
+      selectedActiveSendOperationId = selected
+      activeSendsViewState = "detail"
+      var descriptor = stateOwner
+        && typeof stateOwner.sendOperationDescriptor === "function"
+        ? stateOwner.sendOperationDescriptor(selected, true) : null
+      if (descriptor && descriptor.isPending)
+        activePendingSendFlow.focusPendingDetail(selected,
+          String(activeSends[index].amount || ""))
+      panelFlick.contentY = 0
+      return true
+    }
+    return false
+  }
+
+  function backActiveSends() {
+    if (activeSendsViewState === "detail") {
+      var selected = selectedActiveSendOperationId
+      activePendingSendFlow.leavePendingDetail()
+      if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
+        stateOwner.acknowledgePendingSendTerminal(selected)
+      if (stateOwner && typeof stateOwner.acknowledgePreparedSendTerminal === "function")
+        stateOwner.acknowledgePreparedSendTerminal(selected)
+      selectedActiveSendOperationId = ""
+      activeSendsViewState = "list"
+      panelFlick.contentY = 0
+      return true
+    }
+    if (activeSendsViewState === "list") {
+      closeActiveSends()
+      panelFlick.contentY = 0
+      return true
+    }
+    return false
+  }
+
+  function closeActiveSends() {
+    var selected = selectedActiveSendOperationId
+    activePendingSendFlow.leavePendingDetail()
+    if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
+      stateOwner.acknowledgePendingSendTerminal(selected)
+    if (stateOwner && typeof stateOwner.acknowledgePreparedSendTerminal === "function")
+      stateOwner.acknowledgePreparedSendTerminal(selected)
+    selectedActiveSendOperationId = ""
+    activeSendsViewState = "closed"
   }
 
   function smokeCreateWallet() {
@@ -247,6 +385,67 @@ Item {
     return sendFlow.retryPending() ? "ok" : "disabled"
   }
 
+  function smokeOpenActiveSends() {
+    return openActiveSends() ? "ok" : "disabled"
+  }
+
+  function smokeSelectActiveSend(operationId) {
+    return selectActiveSend(operationId) ? "ok" : "disabled"
+  }
+
+  function smokeBackActiveSends() {
+    return backActiveSends() ? "ok" : "disabled"
+  }
+
+  function smokeRefreshActiveSends() {
+    return refreshActiveSends() ? "ok" : "disabled"
+  }
+
+  function smokeCopyActivePendingSend() {
+    return activePendingSendFlow.copyPendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeRevealActivePendingSend() {
+    return activePendingSendFlow.revealPendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeHideActivePendingSend() {
+    return activePendingSendFlow.hidePendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeRefreshActivePendingSend() {
+    return activePendingSendFlow.refreshPending() ? "ok" : "disabled"
+  }
+
+  function smokeBeginActivePendingReclaim() {
+    return activePendingSendFlow.beginActivePendingReclaim() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmActivePendingReclaim() {
+    return activePendingSendFlow.confirmActivePendingReclaim() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmActivePreparedSend() {
+    if (!selectedPreparedSendCommandsAvailable || !stateOwner
+        || typeof stateOwner.executeActivePreparedSend !== "function") return "disabled"
+    return stateOwner.executeActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
+  function smokeCancelActivePreparedSend() {
+    if (!selectedPreparedSendCommandsAvailable || !stateOwner
+        || typeof stateOwner.cancelActivePreparedSend !== "function") return "disabled"
+    return stateOwner.cancelActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
+  function smokeRefreshActivePreparedSend() {
+    if (!selectedSendDescriptor.isPrepared || !stateOwner
+        || typeof stateOwner.refreshActivePreparedSend !== "function") return "disabled"
+    return stateOwner.refreshActivePreparedSend(selectedActiveSendOperationId)
+      ? "ok" : "disabled"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -319,6 +518,50 @@ Item {
       activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
       activeTransferStateLabel: activeTransfer ? activeTransfer.stateLabel : "",
       activeTransferDetail: activeTransfer ? activeTransfer.detail : "",
+      activeSendsCount: activeSends.length,
+      activeSendsCountText: activeSendsButton.text,
+      activeSendsViewState: activeSendsViewState,
+      activeSendsReconnecting: activeSendsReconnecting,
+      activeSendsRefreshing: activeSendsRefreshing,
+      activeSendsCanonicalSynchronized: stateOwner
+        ? stateOwner.sendCanonicalSynchronized : false,
+      activeSendsCanonicalRefreshCount: stateOwner
+        ? stateOwner.activeSendsCanonicalRefreshCount : 0,
+      activeSendsPolling: activeSendsPoll.running,
+      activeSendsPollIntervalMs: activeSendsPoll.interval,
+      activeSendsBackVisible: backActiveSendsButton.visible,
+      activeSendsEmptyVisible: activeSendsEmpty.visible,
+      activeSendRows: activeSendRowsSnapshot(),
+      selectedActiveSendOperationId: selectedActiveSendOperationId,
+      selectedActiveSend: selectedActiveSend,
+      activeSendDetailReadOnly: activeSendsViewState === "detail"
+        && !!selectedActiveSend && selectedSendDescriptor.readOnly,
+      activeSendMutationActionCount: activeSendsViewState === "detail"
+        && selectedActiveSend ? selectedSendDescriptor.mutationActionCount : 0,
+      activePreparedActionState: String(selectedPreparedSendAction.state || "idle"),
+      activePreparedErrorCode: String(selectedPreparedSendAction.errorCode || ""),
+      activePreparedError: String(selectedPreparedSendAction.error || ""),
+      activePreparedTerminalState: selectedPreparedSendTerminalState,
+      activePreparedConfirmAvailable: selectedPreparedSendCommandsAvailable,
+      activePreparedCancelAvailable: selectedPreparedSendCommandsAvailable,
+      activePreparedRefreshAvailable: !!selectedActiveSend
+        && selectedSendDescriptor.isPrepared && !selectedPreparedSendBusy,
+      activePreparedBalanceSpendable: selectedPreparedSendBalance
+        ? String(selectedPreparedSendBalance.spendable || "") : "",
+      activePreparedBalanceReserved: selectedPreparedSendBalance
+        ? String(selectedPreparedSendBalance.reserved || "") : "",
+      activePendingActionState: activePendingSendFlow.pendingActionState,
+      activePendingErrorCode: activePendingSendFlow.pendingErrorCode,
+      activePendingError: activePendingSendFlow.pendingError,
+      activePendingTerminalState: activePendingSendFlow.pendingTerminalState,
+      activePendingCopyAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingRevealAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingRefreshAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingReclaimAvailable: activePendingSendFlow.pendingReclaimAvailable,
+      activePendingReclaimWarningVisible: activePendingSendFlow.reclaimWarningVisible,
+      activePendingReclaimWarning: activePendingSendFlow.reclaimWarning,
+      activePendingTokenRevealed: activePendingSendFlow.pendingTokenRevealed,
+      activePendingClipboardWrites: activePendingSendFlow.clipboardWrites,
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
@@ -326,9 +569,18 @@ Item {
   onOpenedChanged: {
     if (!opened) {
       clearRecoveryPhrase()
+      closeActiveSends()
       receiveFlow.panelClosed()
       sendFlow.panelClosed()
     }
+  }
+
+  onSelectedActiveSendChanged: {
+    if (activeSendsViewState === "detail" && selectedActiveSend
+        && selectedSendDescriptor.isPending
+        && activePendingSendFlow.pendingOperationId !== selectedActiveSendOperationId)
+      activePendingSendFlow.focusPendingDetail(selectedActiveSendOperationId,
+        String(selectedActiveSend.amount || ""))
   }
 
   Component.onDestruction: clearRecoveryPhrase()
@@ -364,6 +616,12 @@ Item {
           sendFlow.panelClosed()
       }
     }
+
+    function onConnectionStateChanged() {
+      if (root.stateOwner && root.stateOwner.connectionState === "connected"
+          && activeSendsPoll.running)
+        activeSendsPoll.restart()
+    }
   }
 
   Timer {
@@ -372,6 +630,25 @@ Item {
     repeat: true
     running: root.opened && !root.hostWidget
     onTriggered: root.hostWidget = root.resolveHostWidget()
+  }
+
+  Timer {
+    id: activeSendsPoll
+    interval: root.stateOwner
+      ? Number(root.stateOwner.activeSendsPollIntervalMs || 15000) : 15000
+    repeat: true
+    running: root.opened && root.activeSends.length > 0
+    onTriggered: {
+      if (root.stateOwner && typeof root.stateOwner.refreshActiveSends === "function")
+        root.stateOwner.refreshActiveSends("visible-poll")
+    }
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.opened && root.activeSendsViewState !== "closed"
+    onTriggered: root.relativeTimeEpoch = Date.now()
   }
 
   KeyboardPanel {
@@ -408,7 +685,8 @@ Item {
 
           PanelHero {
             width: parent.width
-            title: "Cashu Wallet"
+            title: root.activeSendsViewState === "closed" ? "Cashu Wallet"
+              : root.activeSendsViewState === "detail" ? "Active Send" : "Active Sends"
             meta: root.stateOwner
               ? root.stateOwner.walletStateDetail + " · " + root.stateOwner.walletStateLabel
               : "Wallet State unavailable"
@@ -432,7 +710,8 @@ Item {
           }
 
           Column {
-            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            visible: root.activeSendsViewState === "closed"
+              && root.stateOwner && root.stateOwner.walletState === "unlocked"
               && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             width: parent.width
             spacing: Style.space(10)
@@ -547,12 +826,14 @@ Item {
           }
 
           PanelSeparator {
-            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            visible: root.activeSendsViewState === "closed"
+              && root.stateOwner && root.stateOwner.walletState === "unlocked"
               && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.spacing.labelGap
 
@@ -645,10 +926,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -711,10 +994,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -787,10 +1072,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -798,6 +1085,20 @@ Item {
               text: "ACTIVE TRANSFERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            Button {
+              id: activeSendsButton
+              visible: !!root.stateOwner
+              width: parent.width
+              text: root.activeSends.length + " Active Send"
+                + (root.activeSends.length === 1 ? "" : "s")
+              iconText: "󰒊"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              leftAlign: true
+              onClicked: root.openActiveSends()
             }
 
             Row {
@@ -874,6 +1175,279 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               horizontalAlignment: Text.AlignHCenter
+            }
+          }
+
+          Column {
+            visible: root.activeSendsViewState !== "closed"
+            width: parent.width
+            spacing: Style.space(10)
+
+            Button {
+              id: backActiveSendsButton
+              width: parent.width
+              text: root.activeSendsViewState === "detail"
+                ? "Back to Active Sends" : "Back"
+              iconText: "󰁍"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              leftAlign: true
+              onClicked: root.backActiveSends()
+            }
+
+            Text {
+              visible: root.activeSendsReconnecting || root.activeSendsRefreshing
+              width: parent.width
+              text: root.activeSendsReconnecting
+                ? "Reconnecting · showing the last canonical Active Sends read-only"
+                : "Refreshing canonical Active Sends…"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+
+            Column {
+              visible: root.activeSendsViewState === "list"
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "ACTIVE SENDS · " + root.activeSends.length
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Button {
+                id: refreshActiveSendsButton
+                width: parent.width
+                text: "Refresh Active Sends"
+                iconText: "󰑐"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: root.stateOwner
+                  && root.stateOwner.connectionState === "connected"
+                  && root.stateOwner.compatibilityState === "compatible"
+                  && root.stateOwner.walletState === "unlocked"
+                  && !root.stateOwner.fullFetchInProgress
+                  && !root.stateOwner.sendCommandRequest
+                  && root.stateOwner.sendReconcileRequests.length === 0
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.refreshActiveSends()
+              }
+
+              Repeater {
+                model: root.activeSends
+
+                Button {
+                  required property var modelData
+                  width: parent ? parent.width : 0
+                  text: String(modelData.stateLabel || "") + " · "
+                    + root.amountText(modelData.amount) + " · "
+                    + String(modelData.mintHostname || "") + " · "
+                    + root.relativeUpdateText(modelData.updatedAt)
+                    + (String(modelData.reservedInput || "") !== ""
+                      ? " · Reserved input " + root.amountText(modelData.reservedInput) : "")
+                  iconText: "󰅂"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  leftAlign: true
+                  onClicked: root.selectActiveSend(modelData.id)
+                }
+              }
+
+              Text {
+                id: activeSendsEmpty
+                visible: root.activeSends.length === 0
+                width: parent.width
+                text: "No Active Sends"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                horizontalAlignment: Text.AlignHCenter
+              }
+            }
+
+            Column {
+              visible: root.activeSendsViewState === "detail"
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "OPERATION"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                width: parent.width
+                text: root.selectedActiveSendOperationId
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WrapAnywhere
+              }
+
+              Text {
+                visible: !root.selectedActiveSend
+                  && root.selectedPendingSendTerminalState === ""
+                  && root.selectedPreparedSendTerminalState === ""
+                width: parent.width
+                text: "This Send is no longer active in cocod. Return to Active Sends."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: !!root.selectedActiveSend
+                width: parent.width
+                text: root.selectedActiveSend
+                  ? "STATE\n" + root.selectedActiveSend.stateLabel
+                    + "\n\nAMOUNT\n" + root.amountText(root.selectedActiveSend.amount)
+                    + "\n\nMINT\n" + root.selectedActiveSend.mintHostname
+                    + "\n\nUPDATED\n"
+                    + root.relativeUpdateText(root.selectedActiveSend.updatedAt)
+                  : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: root.selectedActiveSend
+                  && root.selectedSendDescriptor.isPrepared
+                width: parent.width
+                text: root.selectedActiveSend
+                  ? "TRANSFER PREVIEW\nRequested · "
+                    + root.amountText(root.selectedActiveSend.requestedAmount)
+                    + "\nFee · " + root.amountText(root.selectedActiveSend.fee)
+                    + "\nInput · " + root.amountText(root.selectedActiveSend.inputAmount)
+                    + "\nSwap required · "
+                    + (root.selectedActiveSend.needsSwap ? "Yes" : "No")
+                    + (root.selectedPreparedSendBalance
+                      ? "\n\nCANONICAL MINT BALANCE\nSpendable · "
+                        + root.amountText(root.selectedPreparedSendBalance.spendable)
+                        + "\nReserved · "
+                        + root.amountText(root.selectedPreparedSendBalance.reserved)
+                      : "") : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: !!root.selectedActiveSend
+                  && root.selectedSendDescriptor.readOnly
+                width: parent.width
+                text: "Read-only canonical Send details"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+              }
+
+              Text {
+                visible: root.selectedPreparedSendBusy
+                width: parent.width
+                text: root.selectedSendDescriptor.preparedBusyMessage
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: String(root.selectedPreparedSendAction.error || "") !== ""
+                  && root.selectedPreparedSendTerminalState === ""
+                width: parent.width
+                text: String(root.selectedPreparedSendAction.error || "")
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: root.selectedPreparedSendTerminalState !== ""
+                  && root.selectedSendDescriptor.terminalMessage !== ""
+                width: parent.width
+                text: root.selectedSendDescriptor.terminalMessage
+                color: root.selectedSendDescriptor.terminalPositive
+                  ? root.foreground : root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+
+              Row {
+                visible: root.selectedActiveSend
+                  && root.selectedSendDescriptor.isPrepared
+                width: parent.width
+                spacing: Style.spacing.controlGap
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: "Confirm"
+                  iconText: "󰄬"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  enabled: root.selectedPreparedSendCommandsAvailable
+                  opacity: enabled ? 1 : 0.5
+                  onClicked: root.smokeConfirmActivePreparedSend()
+                }
+
+                Button {
+                  width: (parent.width - parent.spacing) / 2
+                  text: "Cancel"
+                  iconText: "󰅖"
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  enabled: root.selectedPreparedSendCommandsAvailable
+                  opacity: enabled ? 1 : 0.5
+                  onClicked: root.smokeCancelActivePreparedSend()
+                }
+              }
+
+              Button {
+                visible: root.selectedActiveSend
+                  && root.selectedSendDescriptor.isPrepared
+                width: parent.width
+                text: "Refresh"
+                iconText: "󰑐"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: !root.selectedPreparedSendBusy
+                  && root.selectedPreparedSendCommandsAvailable
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.smokeRefreshActivePreparedSend()
+              }
+
+              SendFlow {
+                id: activePendingSendFlow
+                width: parent.width
+                service: root.stateOwner
+                foreground: root.foreground
+                urgent: root.urgent
+                dim: root.dim
+                fontFamily: root.fontFamily
+                pendingDetailMode: true
+              }
             }
           }
         }

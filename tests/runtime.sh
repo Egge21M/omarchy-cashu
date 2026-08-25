@@ -49,6 +49,11 @@ panel_call() {
     io.github.egge21m.omarchy-cashu.runtime-test panelSnapshot 2>/dev/null
 }
 
+bar_call() {
+  quickshell ipc --any-display -p "$shell_qml" call \
+    io.github.egge21m.omarchy-cashu.runtime-test barSnapshot 2>/dev/null
+}
+
 panel_action() {
   quickshell ipc --any-display -p "$shell_qml" call \
     io.github.egge21m.omarchy-cashu.runtime-test "$@" 2>/dev/null
@@ -187,6 +192,20 @@ fund_send_fixture() {
     and .activeTransfers == []" >/dev/null
 }
 
+create_pending_send_fixture() {
+  local amount=$1
+  local prepared operation_id executed
+  prepared=$(jq -cn --arg amount "$amount" '{
+    mintUrl:"https://mint.one",unit:"sat",amount:$amount
+  }' | curl -fsS -H "Authorization: Bearer $credential" -X POST \
+    -H 'Content-Type: application/json' --data-binary @- \
+    "$base_url/v1/operations/send")
+  operation_id=$(jq -r '.id' <<<"$prepared")
+  executed=$(curl -fsS -H "Authorization: Bearer $credential" -X POST \
+    "$base_url/v1/operations/send/$operation_id/execute")
+  jq -r '[.operation.id,.result.token] | @tsv' <<<"$executed"
+}
+
 open_send_flow() {
   local amount=$1
   local mint_url=${2:-https://mint.one}
@@ -219,6 +238,7 @@ cp "$project_dir/Service.qml" "$runtime_dir/Service.qml"
 cp "$project_dir/Panel.qml" "$runtime_dir/Panel.qml"
 cp "$project_dir/ReceiveFlow.qml" "$runtime_dir/ReceiveFlow.qml"
 cp "$project_dir/SendFlow.qml" "$runtime_dir/SendFlow.qml"
+cp "$project_dir/BarWidget.qml" "$runtime_dir/BarWidget.qml"
 cp "$project_dir/tests/runtime-shell.qml" "$shell_qml"
 ln -s /usr/share/omarchy/shell/Commons "$runtime_dir/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$runtime_dir/Ui"
@@ -928,6 +948,60 @@ wait_panel_snapshot '.receiveViewState == "closed"
 
 echo "runtime: connection rotation clears sensitive non-Send presentation state"
 
+pagination_payload=$(jq -cn '
+  def send($id; $state; $amount; $updated): {
+    id:$id,type:"send",state:$state,mintUrl:"https://mint.pagination.test",
+    unit:"sat",method:"default",requestedAmount:$amount,fee:"1",
+    inputAmount:$amount,needsSwap:false,
+    createdAt:"2026-08-25T00:00:00.000Z",updatedAt:$updated
+  };
+  [range(0;101) as $index
+    | send("send-page-prepared-" + ($index|tostring); "prepared";
+        (($index + 1)|tostring); "2026-08-25T00:01:00.000Z")]
+    + [send("send-transition-duplicate"; "prepared"; "777";
+        "2026-08-25T00:01:00.000Z")] as $prepared
+  | [range(0;101) as $index
+    | send("send-page-in-flight-" + ($index|tostring); "pending";
+        (($index + 201)|tostring); "2026-08-25T00:02:00.000Z")]
+    + [send("send-transition-duplicate"; "pending"; "999";
+        "2026-08-25T00:03:00.000Z")] as $inFlight
+  | {
+      balances:{items:[{
+        mintUrl:"https://mint.pagination.test",unit:"sat",
+        spendable:"1000000",reserved:"1000",total:"1001000"
+      }]},
+      sendPrepared:{items:$prepared},sendInFlight:{items:$inFlight}
+    }
+')
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary "$pagination_payload" "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '
+  .connectionState == "connected"
+  and (.activeSends | length) == 203
+  and ([.activeSends[].id] | unique | length) == 203
+  and ([.activeSends[].id] | index("send-page-prepared-100") != null)
+  and ([.activeSends[].id] | index("send-page-in-flight-100") != null)
+  and (.activeSends | any(.id == "send-transition-duplicate"
+    and .state == "pending" and .amount == "999"))
+' >/dev/null
+panel_action closePanel >/dev/null || true
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+[[ $(panel_action selectActiveSend send-transition-duplicate) == "ok" ]] \
+  || fail "newest canonical transition duplicate could not be selected"
+wait_panel_snapshot '
+  .selectedActiveSendOperationId == "send-transition-duplicate"
+  and .selectedActiveSend.state == "pending"
+  and .activePendingCopyAvailable == true
+  and .activePreparedConfirmAvailable == false
+' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action closePanel >/dev/null
+
+echo "runtime: paginated Active Sends and newest transition duplicate passed"
+
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "balances":{"items":[
@@ -952,6 +1026,533 @@ wait_snapshot '
 ' >/dev/null
 
 echo "runtime: canonical init Send accepts its state-specific safe shape"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "balances":{"items":[
+      {"mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","spendable":"401","reserved":"99","total":"500"}
+    ]},
+    "sendPrepared":{"items":[{
+      "id":"send-browse-prepared","type":"send","state":"prepared",
+      "mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","method":"default",
+      "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+      "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:01:00.000Z"
+    }]},
+    "sendInFlight":{"items":[
+      {"id":"send-browse-executing","type":"send","state":"executing",
+       "mintUrl":"https://mint.executing.test","unit":"sat","method":"default",
+       "requestedAmount":"21","fee":"1","inputAmount":"22","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:02:00.000Z"},
+      {"id":"send-browse-pending","type":"send","state":"pending",
+       "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+       "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:03:00.000Z"},
+      {"id":"send-browse-reclaiming","type":"send","state":"rolling_back",
+       "mintUrl":"https://mint.reclaiming.test","unit":"sat","method":"default",
+       "requestedAmount":"41","fee":"1","inputAmount":"42","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:04:00.000Z"},
+      {"id":"send-browse-prepared","type":"send","state":"prepared",
+       "mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","method":"default",
+       "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:01:00.000Z"},
+      {"id":"send-browse-terminal","type":"send","state":"finalized",
+       "mintUrl":"https://mint.terminal.test","unit":"sat","method":"default",
+       "requestedAmount":"51","fee":"1","inputAmount":"52","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:05:00.000Z"},
+      {"id":"send-browse-init","type":"send","state":"init",
+       "mintUrl":"https://mint.init.test","unit":"sat","method":"default",
+       "requestedAmount":"61","createdAt":"2026-08-25T00:00:00.000Z",
+       "updatedAt":"2026-08-25T00:06:00.000Z"}
+    ]}
+  }' "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '
+  .connectionState == "connected"
+  and .reservedBalance == "99"
+  and (.activeSends | length) == 4
+  and [.activeSends[].id] == [
+    "send-browse-reclaiming","send-browse-pending",
+    "send-browse-executing","send-browse-prepared"
+  ]
+  and [.activeSends[].stateLabel] == ["Reclaiming","Pending","Executing","Prepared"]
+  and .activeSends[1].amount == "31"
+  and .activeSends[1].mintHostname == "mint.pending.test"
+  and .activeSends[3].mintHostname == "mint.prepared.test"
+  and .activeSends[3].reservedInput == "12"
+  and (.activeSends | all(.id != "send-browse-terminal" and .id != "send-browse-init"))
+' >/dev/null
+
+bar_snapshot=$(bar_call)
+jq -e '
+  .stateLabel == "Unlocked"
+  and (.text | contains("Unlocked"))
+  and (.tooltipText | contains("Active Transfer"))
+  and ([.text,.tooltipText] | all(test("4|11|21|31|41|99") | not))
+' <<<"$bar_snapshot" >/dev/null \
+  || fail "Omarchy bar exposed an Active Sends count or transfer amount"
+
+panel_action openPanel >/dev/null
+wait_panel_snapshot '
+  .activeSendsCount == 4
+  and .activeSendsCountText == "4 Active Sends"
+  and .activeSendsViewState == "closed"
+' >/dev/null
+before_active_browse=$(curl -fsS "$base_url/__test__/status")
+before_active_browse_executes=$(jq -r '.sendExecuteRequests' <<<"$before_active_browse")
+before_active_browse_cancels=$(jq -r '.sendCancelRequests' <<<"$before_active_browse")
+before_active_browse_reclaims=$(jq -r '.sendReclaimRequests' <<<"$before_active_browse")
+before_active_browse_results=$(jq -r '.sendResultRequests' <<<"$before_active_browse")
+before_active_browse_refreshes=$(jq -r '.sendRefreshRequests' <<<"$before_active_browse")
+[[ $(panel_action openActiveSends) == "ok" ]] \
+  || fail "Active Sends count did not open its full panel subpage"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsBackVisible == true
+  and .activeSendsEmptyVisible == false
+  and [.activeSendRows[].id] == [
+    "send-browse-reclaiming","send-browse-pending",
+    "send-browse-executing","send-browse-prepared"
+  ]
+  and .activeSendRows[0].amount == "41"
+  and .activeSendRows[0].mintHostname == "mint.reclaiming.test"
+  and .activeSendRows[0].stateLabel == "Reclaiming"
+  and (.activeSendRows | all(.relativeUpdate | startswith("Updated ")))
+  and .activeSendRows[3].reservedInput == "12"
+' >/dev/null
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_active_browse")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_active_browse")" >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+
+before_explicit_active_refresh=$(curl -fsS "$base_url/__test__/status")
+[[ $(panel_action refreshActiveSends) == "ok" ]] \
+  || fail "explicit Active Sends Refresh action was unavailable"
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_explicit_active_refresh")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_explicit_active_refresh")" >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+
+[[ $(panel_action setActiveSendsPollInterval 200) == "ok" ]] \
+  || fail "Active Sends poll test interval could not be configured"
+before_visible_poll=$(curl -fsS "$base_url/__test__/status")
+wait_panel_snapshot '.activeSendsPolling == true and .activeSendsPollIntervalMs == 200' >/dev/null
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_visible_poll")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_visible_poll")" >/dev/null
+[[ $(panel_action closePanel) == "ok" ]] \
+  || fail "panel could not close after visible Active Sends polling"
+wait_panel_snapshot '.opened == false and .activeSendsPolling == false' >/dev/null
+sleep 0.3
+hidden_poll_baseline=$(curl -fsS "$base_url/__test__/status")
+sleep 0.6
+hidden_poll_after=$(curl -fsS "$base_url/__test__/status")
+jq -e --argjson before "$(jq '.resourceRequests' <<<"$hidden_poll_baseline")" '
+  .resourceRequests.sendPrepared == $before.sendPrepared
+  and .resourceRequests.sendInFlight == $before.sendInFlight
+' <<<"$hidden_poll_after" >/dev/null \
+  || fail "background Shell Adapter polled Active Sends while the panel was hidden"
+panel_action setActiveSendsPollInterval 15000 >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true
+  and .activeSendsPolling == true and .activeSendsPollIntervalMs == 15000' >/dev/null
+
+[[ $(panel_action selectActiveSend send-browse-pending) == "ok" ]] \
+  || fail "exact Pending Send row could not be selected"
+wait_panel_snapshot '
+  .activeSendsViewState == "detail"
+  and .selectedActiveSendOperationId == "send-browse-pending"
+  and .selectedActiveSend.id == "send-browse-pending"
+  and .selectedActiveSend.amount == "31"
+  and .selectedActiveSend.mintHostname == "mint.pending.test"
+  and .activeSendDetailReadOnly == false
+  and .activeSendMutationActionCount == 4
+  and .activePendingCopyAvailable == true
+  and .activePendingRevealAvailable == true
+  and .activePendingRefreshAvailable == true
+  and .activePendingReclaimAvailable == true
+  and .activePendingTokenRevealed == false
+' >/dev/null
+wait_mock_status ".sendExecuteRequests == $before_active_browse_executes
+  and .sendCancelRequests == $before_active_browse_cancels
+  and .sendReclaimRequests == $before_active_browse_reclaims
+  and .sendResultRequests == $before_active_browse_results
+  and .sendRefreshRequests == $before_active_browse_refreshes" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Active Send detail Back action failed"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsCount == 4
+  and .selectedActiveSendOperationId == ""
+' >/dev/null
+[[ $(panel_action selectActiveSend send-browse-pending) == "ok" ]] \
+  || fail "Pending Send could not be reselected for terminal reconciliation"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "sendPrepared":{"items":[]},
+    "sendInFlight":{"items":[{
+      "id":"send-browse-pending","type":"send","state":"rolled_back",
+      "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+      "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+      "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:07:00.000Z"
+    }]}
+  }' "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected" and .activeSends == []' >/dev/null
+wait_panel_snapshot '
+  .activeSendsViewState == "detail"
+  and .selectedActiveSendOperationId == "send-browse-pending"
+  and .selectedActiveSend == null
+  and .activePendingTerminalState == "reclaimed"
+' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "terminal Send detail could not return to the collection"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsCount == 0
+  and .activeSendsEmptyVisible == true
+  and .activePendingTerminalState == ""
+' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Active Sends list Back action failed"
+wait_panel_snapshot '.activeSendsViewState == "closed"' >/dev/null
+
+echo "runtime: mixed-state Active Sends browsing, navigation, empty state, and bar privacy passed"
+
+fund_send_fixture 300
+IFS=$'\t' read -r first_pending_id first_pending_token \
+  < <(create_pending_send_fixture 21)
+IFS=$'\t' read -r second_pending_id second_pending_token \
+  < <(create_pending_send_fixture 22)
+adapter_call reconnect >/dev/null
+wait_snapshot ".connectionState == \"connected\"
+  and ([.activeSends[].id] | index(\"$first_pending_id\") != null)
+  and ([.activeSends[].id] | index(\"$second_pending_id\") != null)" >/dev/null
+
+set_sensitive_clipboard 'pending-send-copy-sentinel'
+before_pending_detail=$(curl -fsS "$base_url/__test__/status")
+before_pending_results=$(jq -r '.sendResultRequests' <<<"$before_pending_detail")
+before_pending_reclaims=$(jq -r '.sendReclaimRequests' <<<"$before_pending_detail")
+[[ $(panel_action openPanel) == "ok" ]] \
+  || fail "panel could not open for exact Pending Send actions"
+[[ $(panel_action openActiveSends) == "ok" ]] \
+  || fail "Active Sends could not open for exact Pending Send actions"
+[[ $(panel_action selectActiveSend "$second_pending_id") == "ok" ]] \
+  || fail "second Pending Send could not be selected by exact ID"
+wait_panel_snapshot ".activeSendsViewState == \"detail\"
+  and .selectedActiveSendOperationId == \"$second_pending_id\"
+  and .selectedActiveSend.id == \"$second_pending_id\"
+  and .selectedActiveSend.amount == \"22\"
+  and .activePendingActionState == \"idle\"
+  and .activePendingCopyAvailable == true
+  and .activePendingRevealAvailable == true
+  and .activePendingRefreshAvailable == true
+  and .activePendingReclaimAvailable == true
+  and .activePendingTokenRevealed == false" >/dev/null
+wait_mock_status ".sendResultRequests == $before_pending_results
+  and .sendReclaimRequests == $before_pending_reclaims" >/dev/null
+[[ $(wl-paste --no-newline) == 'pending-send-copy-sentinel' ]] \
+  || fail "opening a Pending Send detail changed the clipboard"
+
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/__test__/disconnect" >/dev/null
+wait_snapshot '.connectionState == "unavailable"
+  and .sendCanonicalSynchronized == false and (.activeSends | length) == 2' >/dev/null
+wait_panel_snapshot ".activeSendsReconnecting == true
+  and .selectedActiveSendOperationId == \"$second_pending_id\"
+  and .selectedActiveSend.id == \"$second_pending_id\"
+  and .activePendingCopyAvailable == false
+  and .activePendingRevealAvailable == false
+  and .activePendingRefreshAvailable == false
+  and .activePendingReclaimAvailable == false" >/dev/null
+wait_panel_snapshot '.connectionState == "connected"
+  and .activeSendsReconnecting == false
+  and .activeSendsCanonicalSynchronized == true
+  and .activePendingCopyAvailable == true' >/dev/null
+
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "explicit Copy did not start for the selected Pending Send"
+wait_mock_status ".sendResultRequests == $((before_pending_results + 1))
+  and .sendResultOperationIds[-1] == \"$second_pending_id\"" >/dev/null
+for _attempt in {1..200}; do
+  [[ $(wl-paste --no-newline 2>/dev/null || true) == "$second_pending_token" ]] && break
+  sleep 0.05
+done
+[[ $(wl-paste --no-newline) == "$second_pending_token" ]] \
+  || fail "explicit Copy did not write the selected Pending Send token"
+wait_panel_snapshot '.activePendingClipboardWrites == 1
+  and .activePendingTokenRevealed == false' >/dev/null
+pending_copy_snapshot=$(panel_call)
+if rg -Fq "$second_pending_token" <<<"$pending_copy_snapshot" \
+    || rg -q 'cashuA' <<<"$pending_copy_snapshot"; then
+  fail "Pending Send token escaped into the panel diagnostics snapshot"
+fi
+
+[[ $(panel_action revealActivePendingSend) == "ok" ]] \
+  || fail "explicit Reveal did not start for the selected Pending Send"
+wait_mock_status ".sendResultRequests == $((before_pending_results + 2))
+  and .sendResultOperationIds[-1] == \"$second_pending_id\"" >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == true' >/dev/null
+revealed_pending_snapshot=$(panel_call)
+[[ $revealed_pending_snapshot != *"$second_pending_token"* ]] \
+  || fail "revealed Pending Send token escaped the focused presentation"
+
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{
+  "status":{
+    "daemon":{"version":"0.0.17","interfaceVersion":"1"},
+    "wallet":{"configuredAt":"2026-08-25T14:00:00.000Z"},
+    "seedAccess":{"state":"available","requiresPassphrase":false},
+    "cocoSession":{"state":"running","startedAt":"2026-08-25T14:00:00.000Z","lastFailure":null}
+  }
+}' "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and .canonicalRefreshInProgress == false' >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == false' >/dev/null
+
+[[ $(panel_action revealActivePendingSend) == "ok" ]] \
+  || fail "Pending Send could not be revealed before credential rotation"
+wait_panel_snapshot '.activePendingTokenRevealed == true' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action selectActiveSend "$first_pending_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultUnavailableResponses":1}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action revealActivePendingSend >/dev/null
+wait_panel_snapshot '.activePendingErrorCode == "result_not_available"' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action selectActiveSend "$second_pending_id" >/dev/null
+panel_action revealActivePendingSend >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == true' >/dev/null
+wait_snapshot '.sendOperationErrorCount == 1' >/dev/null
+rotated_credential=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+mkdir -p "$state_dir/credentials/generation-2"
+printf '%s\n' "$rotated_credential" >"$state_dir/credentials/generation-2/client"
+chmod 700 "$state_dir/credentials/generation-2"
+chmod 600 "$state_dir/credentials/generation-2/client"
+ln -s generation-2 "$state_dir/credentials/next"
+mv -Tf "$state_dir/credentials/next" "$state_dir/credentials/current"
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState != "connected"
+  and .activeSends == []
+  and .sendOperationErrorCount == 0
+  and .sendCanonicalSynchronized == false' >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == false
+  and .selectedActiveSend == null
+  and .activePendingErrorCode == ""' >/dev/null
+ln -s generation-1 "$state_dir/credentials/next"
+mv -Tf "$state_dir/credentials/next" "$state_dir/credentials/current"
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and .canonicalRefreshInProgress == false' >/dev/null
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
+  quickshell --no-color -p "$shell_qml" >>"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and (.activeSends | length) == 2
+  and .sendOperationErrorCount == 0' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+wait_panel_snapshot '.activeSendsViewState == "list"
+  and .activePendingTokenRevealed == false' >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultUnavailableResponses":1}' \
+  "$base_url/__test__/mode" >/dev/null
+before_post_rotation_result=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendResultRequests')
+[[ $(panel_action selectActiveSend "$first_pending_id") == "ok" ]] \
+  || fail "first Pending Send could not be selected by exact ID"
+[[ $(panel_action revealActivePendingSend) == "ok" ]] \
+  || fail "temporarily unavailable Pending result request did not start"
+wait_mock_status ".sendResultRequests > $before_post_rotation_result" >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$first_pending_id\"
+  and .selectedActiveSend.state == \"pending\"
+  and .activePendingActionState == \"error\"
+  and .activePendingErrorCode == \"result_not_available\"
+  and .activePendingRefreshAvailable == true
+  and .activePendingReclaimAvailable == true" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Pending result error could not return to the list"
+[[ $(panel_action selectActiveSend "$second_pending_id") == "ok" ]] \
+  || fail "second Pending Send could not be revisited"
+wait_panel_snapshot '.activePendingErrorCode == ""' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "second Pending Send could not return to the list"
+[[ $(panel_action selectActiveSend "$first_pending_id") == "ok" ]] \
+  || fail "first Pending Send could not be revisited"
+wait_panel_snapshot '.activePendingErrorCode == "result_not_available"' >/dev/null
+
+set_sensitive_clipboard 'late-pending-copy-must-not-land'
+before_late_result=$(jq -r '.sendResultRequests' \
+  <<<"$(curl -fsS "$base_url/__test__/status")")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultDelayMs":400}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "delayed exact Pending Copy did not start"
+[[ $(panel_action closePanel) == "ok" ]] \
+  || fail "panel close was blocked during Pending result retrieval"
+wait_panel_snapshot '.opened == false
+  and .activeSendsViewState == "closed"
+  and .activePendingTokenRevealed == false' >/dev/null
+panel_action openPanel >/dev/null
+[[ $(panel_action openActiveSends) == "ok" ]] \
+  || fail "Active Sends could not reopen during Pending result retrieval"
+[[ $(panel_action selectActiveSend "$second_pending_id") == "ok" ]] \
+  || fail "another Pending Send could not be selected during result retrieval"
+[[ $(panel_action copyActivePendingSend) == "disabled" ]] \
+  || fail "Pending result requests were not serialized"
+wait_mock_status ".sendResultRequests == $((before_late_result + 1))
+  and .sendResultOperationIds[-1] == \"$first_pending_id\"" >/dev/null
+sleep 0.5
+wait_panel_snapshot '.activePendingCopyAvailable == true
+  and .activePendingTokenRevealed == false' >/dev/null
+[[ $(wl-paste --no-newline) == 'late-pending-copy-must-not-land' ]] \
+  || fail "late Pending Copy wrote after focus changed"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Pending detail could not close after serialized retrieval"
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Active Sends list could not close after Pending retrieval tests"
+
+fund_send_fixture 100
+IFS=$'\t' read -r reclaimed_pending_id reclaimed_pending_token \
+  < <(create_pending_send_fixture 20)
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$reclaimed_pending_id" >/dev/null
+before_reclaim_count=$(jq -r '.sendReclaimRequests' \
+  <<<"$(curl -fsS "$base_url/__test__/status")")
+[[ $(panel_action beginActivePendingReclaim) == "ok" ]] \
+  || fail "Reclaim warning did not open for a canonical Pending Send"
+wait_panel_snapshot '.activePendingReclaimWarningVisible == true
+  and (.activePendingReclaimWarning | contains("20 sat"))
+  and (.activePendingReclaimWarning | test("recipient"; "i"))
+  and (.activePendingReclaimWarning | test("race"; "i"))' >/dev/null
+wait_mock_status ".sendReclaimRequests == $before_reclaim_count" >/dev/null
+[[ $(panel_action confirmActivePendingReclaim) == "ok" ]] \
+  || fail "confirmed exact Pending Reclaim did not start"
+wait_mock_status ".sendReclaimRequests == $((before_reclaim_count + 1))
+  and .sendReclaimOperationIds[-1] == \"$reclaimed_pending_id\"" >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$reclaimed_pending_id\"
+  and .selectedActiveSend == null
+  and .activePendingTerminalState == \"reclaimed\"" >/dev/null
+wait_snapshot '.spendableBalance == "100" and .reservedBalance == "0"' >/dev/null
+panel_action backActiveSends >/dev/null
+wait_panel_snapshot '.activeSendsViewState == "list"
+  and .activeSendsCount == 0
+  and .activePendingTerminalState == ""' >/dev/null
+panel_action backActiveSends >/dev/null
+
+fund_send_fixture 100
+IFS=$'\t' read -r recipient_pending_id recipient_pending_token \
+  < <(create_pending_send_fixture 23)
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$recipient_pending_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendReclaimOutcome":"recipient_won"}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action beginActivePendingReclaim >/dev/null
+panel_action confirmActivePendingReclaim >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$recipient_pending_id\"
+  and .selectedActiveSend == null
+  and .activePendingTerminalState == \"recipient_won\"" >/dev/null
+wait_mock_status ".sendReclaimOperationIds[-1] == \"$recipient_pending_id\"" >/dev/null
+wait_snapshot '.reservedBalance == "0"' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
+
+fund_send_fixture 100
+IFS=$'\t' read -r retry_pending_id retry_pending_token \
+  < <(create_pending_send_fixture 25)
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$retry_pending_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action beginActivePendingReclaim >/dev/null
+panel_action confirmActivePendingReclaim >/dev/null
+wait_panel_snapshot ".selectedActiveSend.id == \"$retry_pending_id\"
+  and .selectedActiveSend.state == \"pending\"
+  and .activePendingErrorCode == \"coco_error\"
+  and .activePendingRefreshAvailable == true
+  and .activePendingReclaimAvailable == true" >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{
+  "sendRefreshUnavailableResponses":10
+}' "$base_url/__test__/mode" >/dev/null
+before_explicit_pending_refresh=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendRefreshRequests')
+[[ $(panel_action refreshActivePendingSend) == "ok" ]] \
+  || fail "unavailable exact Pending Refresh did not start"
+wait_panel_snapshot ".selectedActiveSend.id == \"$retry_pending_id\"
+  and .selectedActiveSend.state == \"pending\"
+  and .activePendingErrorCode == \"refresh_unavailable\"
+  and .activePendingReclaimAvailable == true" >/dev/null
+wait_mock_status ".sendRefreshRequests > $before_explicit_pending_refresh" >/dev/null
+
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{
+  "sendReclaimOutcome":"operation_conflict","sendCommandDelayMs":300,
+  "sendRefreshUnavailableResponses":0
+}' "$base_url/__test__/mode" >/dev/null
+panel_action beginActivePendingReclaim >/dev/null
+panel_action confirmActivePendingReclaim >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "navigation was blocked during Reclaim"
+[[ $(panel_action selectActiveSend "$retry_pending_id") == "ok" ]] \
+  || fail "Pending Send could not be reselected while Reclaim was in flight"
+wait_panel_snapshot '.activePendingActionState == "reclaiming"
+  and .activePendingReclaimAvailable == false' >/dev/null
+wait_panel_snapshot ".selectedActiveSend.id == \"$retry_pending_id\"
+  and .activePendingErrorCode == \"operation_conflict\"
+  and .activePendingReclaimAvailable == true" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+panel_action beginActivePendingReclaim >/dev/null
+panel_action confirmActivePendingReclaim >/dev/null
+wait_panel_snapshot '.activePendingTerminalState == "reclaimed"' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
+
+fund_send_fixture 100
+IFS=$'\t' read -r missing_pending_id missing_pending_token \
+  < <(create_pending_send_fixture 27)
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected"' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$missing_pending_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendReclaimOutcome":"operation_not_found"}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action beginActivePendingReclaim >/dev/null
+panel_action confirmActivePendingReclaim >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$missing_pending_id\"
+  and .selectedActiveSend == null
+  and .activePendingTerminalState == \"unavailable\"
+  and .activePendingErrorCode == \"operation_not_found\"" >/dev/null
+wait_mock_status ".sendReclaimOperationIds[-1] == \"$missing_pending_id\"" >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
+
+final_pending_diagnostics="$(adapter_call snapshot)$(panel_call)$(curl -fsS "$base_url/__test__/status")"
+if rg -q 'cashuA' <<<"$final_pending_diagnostics"; then
+  fail "Pending Send bearer material escaped into diagnostics"
+fi
+
+echo "runtime: exact Pending Copy, Reveal, Refresh, Reclaim, navigation, and redaction passed"
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
@@ -1065,7 +1666,7 @@ adapter_snapshot=$(wait_snapshot '
   and .sendPreparedOperation.needsSwap == true
   and (.activeTransfers | length) == 1
 ')
-if rg -qi 'cashuA|token|proof|secret' <<<"$adapter_snapshot$panel_snapshot"; then
+if rg -qi 'cashuA|proof|secret' <<<"$adapter_snapshot$panel_snapshot"; then
   fail "Prepared Send review exposed sensitive Wallet material"
 fi
 before_mint_revalidation=$(curl -fsS "$base_url/__test__/status" \
@@ -1157,7 +1758,15 @@ wait_mock_status '.resourceRequestsActive > 0' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":0,"sendCreateInterruption":"malformed_after_commit"}' \
   "$base_url/__test__/mode" >/dev/null
-panel_action prepareSend >/dev/null
+[[ $(panel_action prepareSend) == "disabled" ]] \
+  || fail "Send mutation was enabled before targeted canonical synchronization"
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+[[ $(panel_action prepareSend) == "ok" ]] \
+  || fail "Send mutation did not recover after targeted canonical synchronization"
+wait_panel_snapshot '.sendViewState == "error" and .sendErrorCode == "invalid_response"
+  and .activeSendsCount == 1' >/dev/null
+[[ $(panel_action retrySend) == "ok" ]] \
+  || fail "ambiguous malformed Send could not retry its exact intent"
 wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"' >/dev/null
 wait_mock_status '.resourceRequestsActive == 0' >/dev/null
 wait_panel_snapshot '
@@ -1189,6 +1798,8 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   }}' "$base_url/__test__/resources" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCreateDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_panel_snapshot '.sendViewState == "error" and .sendErrorCode == "invalid_response"' >/dev/null
+panel_action retrySend >/dev/null
 wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"' >/dev/null
 wait_mock_status ".resourceRequests.sendPrepared >= $((before_queued_send_event + 2))" >/dev/null
 panel_action cancelSend >/dev/null
@@ -1260,18 +1871,110 @@ wait_snapshot ".activeTransfers[0].id == \"$reloaded_send_id\"
   and .activeTransfers[0].state == \"prepared\"" >/dev/null
 panel_action openPanel >/dev/null
 [[ $(panel_action openSend) == "ok" ]] \
-  || fail "canonical Prepared Send could not be reopened"
+  || fail "fresh Send entry did not open beside a canonical Prepared Send"
+wait_panel_snapshot ".sendViewState == \"entry\"
+  and .sendAmount == \"\"
+  and .sendReviewAmount == \"\"
+  and .reservedBalance == \"70\"
+  and .activeSendsCount == 1
+  and .sendInputFocused == true" >/dev/null
+panel_action setSendAmount 20 >/dev/null
+[[ $(panel_action prepareSend) == "ok" ]] \
+  || fail "existing Prepared Send blocked a fundable fresh Send"
 wait_panel_snapshot ".sendViewState == \"review\"
-  and .sendReviewAmount == \"60\"
-  and .sendReviewReserved == \"70\"
-  and .sendInputFocused == false
-  and .keyCatcherBlocked == false" >/dev/null
+  and .sendReviewAmount == \"20\"
+  and .sendOperationId != \"$reloaded_send_id\"
+  and .activeSendsCount == 2
+  and .spendableBalance == \"0\" and .reservedBalance == \"100\"" >/dev/null
 panel_action cancelSend >/dev/null
-wait_panel_snapshot '.sendViewState == "entry" and .reservedBalance == "0"' >/dev/null
+wait_panel_snapshot '.sendViewState == "entry" and .activeSendsCount == 1
+  and .spendableBalance == "30" and .reservedBalance == "70"' >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+before_explicit_prepared_cancel=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendCancelRequests')
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$reloaded_send_id" >/dev/null
+wait_panel_snapshot ".activeSendsViewState == \"detail\"
+  and .selectedActiveSend.id == \"$reloaded_send_id\"
+  and .selectedActiveSend.state == \"prepared\"
+  and .selectedActiveSend.requestedAmount == \"60\"
+  and .selectedActiveSend.fee == \"2\"
+  and .selectedActiveSend.inputAmount == \"70\"
+  and .selectedActiveSend.needsSwap == true
+  and .activePreparedBalanceSpendable == \"30\"
+  and .activePreparedBalanceReserved == \"70\"
+  and .activePreparedConfirmAvailable == true
+  and .activePreparedCancelAvailable == true" >/dev/null
+[[ $(panel_action cancelActivePreparedSend) == "ok" ]] \
+  || fail "exact Prepared Send Cancel was unavailable"
+wait_panel_snapshot '.activePreparedTerminalState == "cancelled"
+  and .spendableBalance == "100" and .reservedBalance == "0"' >/dev/null
+wait_mock_status ".sendCancelRequests == $((before_explicit_prepared_cancel + 1))" >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
 
-echo "runtime: canonical Prepared Send reattaches after reconnect"
+echo "runtime: primary Send stays fresh and Prepared detail cancels exact Operation"
+
+fund_send_fixture 300
+first_prepared=$(curl -fsS -H "Authorization: Bearer $credential" \
+  -H 'Idempotency-Key: runtime-prepared-one' -H 'Content-Type: application/json' \
+  -X POST --data '{"mintUrl":"https://mint.one","unit":"sat","amount":"60"}' \
+  "$base_url/v1/operations/send")
+first_prepared_id=$(jq -er '.id' <<<"$first_prepared")
+second_prepared=$(curl -fsS -H "Authorization: Bearer $credential" \
+  -H 'Idempotency-Key: runtime-prepared-two' -H 'Content-Type: application/json' \
+  -X POST --data '{"mintUrl":"https://mint.one","unit":"sat","amount":"60"}' \
+  "$base_url/v1/operations/send")
+second_prepared_id=$(jq -er '.id' <<<"$second_prepared")
+adapter_call reconnect >/dev/null
+wait_snapshot "(.activeSends | length) == 2
+  and ([.activeSends[].id] | index(\"$first_prepared_id\") != null)
+  and ([.activeSends[].id] | index(\"$second_prepared_id\") != null)
+  and .spendableBalance == \"160\" and .reservedBalance == \"140\"" >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$first_prepared_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":800}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action confirmActivePreparedSend) == "ok" ]] \
+  || fail "first exact Prepared Send could not be confirmed"
+wait_panel_snapshot ".activePreparedActionState == \"executing\"
+  and .selectedActiveSendOperationId == \"$first_prepared_id\"" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "navigation was blocked during Prepared Send confirmation"
+[[ $(panel_action selectActiveSend "$second_prepared_id") == "ok" ]] \
+  || fail "unrelated Prepared Send was not browseable during confirmation"
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$second_prepared_id\"
+  and .activePreparedConfirmAvailable == false
+  and .activePreparedCancelAvailable == false" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_snapshot "(.activeSends | any(.id == \"$first_prepared_id\" and .state == \"pending\"))
+  and (.activeSends | any(.id == \"$second_prepared_id\" and .state == \"prepared\"))" >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$second_prepared_id\"
+  and .selectedActiveSend.id == \"$second_prepared_id\"
+  and .activePreparedCancelAvailable == true" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":800}' "$base_url/__test__/mode" >/dev/null
+[[ $(panel_action cancelActivePreparedSend) == "ok" ]] \
+  || fail "second exact Prepared Send could not be cancelled"
+wait_panel_snapshot '.activePreparedActionState == "cancelling"' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "navigation was blocked during Prepared Send cancellation"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+wait_snapshot "(.activeSends | length) == 1
+  and .activeSends[0].id == \"$first_prepared_id\"
+  and .activeSends[0].state == \"pending\"
+  and .spendableBalance == \"230\" and .reservedBalance == \"70\"" >/dev/null
+panel_action backActiveSends >/dev/null
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$first_prepared_id/reclaim" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.activeSends == [] and .reservedBalance == "0"' >/dev/null
+
+echo "runtime: multiple Prepared Sends mutate exactly and remain browseable in one lane"
 
 for external_send_state in removed pending; do
   fund_send_fixture 100
@@ -1308,11 +2011,14 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$base_url/__test__/mode" >/dev/null
 panel_action prepareSend >/dev/null
 wait_panel_snapshot '
-  .sendViewState == "review"
-  and .sendReviewAmount == "60"
-  and .sendReviewReserved == "70"
-  and .activeTransferCount == 1
+  .sendViewState == "error"
+  and .sendErrorCode == "invalid_response"
+  and .activeSendsCount == 1
+  and .sendReviewAmount == ""
 ' >/dev/null
+panel_action retrySend >/dev/null
+wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"
+  and .sendReviewReserved == "70"' >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '
   .sendViewState == "entry"
@@ -1322,25 +2028,34 @@ wait_panel_snapshot '
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: malformed committed Send creation reconciles its reservation"
+echo "runtime: malformed committed Send retries by Idempotency-Key"
 
 fund_send_fixture 100
 open_send_flow 60
-before_ambiguous_create=$(curl -fsS "$base_url/__test__/status" \
-  | jq -r '.sendCreateRequests')
+before_ambiguous_status=$(curl -fsS "$base_url/__test__/status")
+before_ambiguous_create=$(jq -r '.sendCreateRequests' <<<"$before_ambiguous_status")
+before_ambiguous_unique=$(jq -r '.sendIdempotencyUniqueKeys' <<<"$before_ambiguous_status")
+before_ambiguous_replays=$(jq -r '.sendIdempotencyReplays' <<<"$before_ambiguous_status")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCreateInterruption":"after_commit"}' \
   "$base_url/__test__/mode" >/dev/null
 panel_action prepareSend >/dev/null
 wait_panel_snapshot '
-  .sendViewState == "review"
-  and .sendReviewAmount == "60"
-  and .sendReviewReserved == "70"
-  and .activeTransferCount == 1
+  .sendViewState == "error"
+  and .sendErrorCode == "transport_unavailable"
+  and .sendReviewAmount == ""
+  and .activeSendsCount == 1
 ' >/dev/null
 wait_mock_status ".sendCreateRequests == $((before_ambiguous_create + 1))" >/dev/null
 [[ $(panel_action prepareSend) == "disabled" ]] \
-  || fail "ambiguous Send creation allowed a duplicate retry"
+  || fail "ambiguous Send creation allowed an unkeyed duplicate preparation"
+[[ $(panel_action retrySend) == "ok" ]] \
+  || fail "ambiguous Send creation did not expose Retry"
+wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "60"
+  and .sendReviewReserved == "70"' >/dev/null
+wait_mock_status ".sendCreateRequests == $((before_ambiguous_create + 2))
+  and .sendIdempotencyUniqueKeys == $((before_ambiguous_unique + 1))
+  and .sendIdempotencyReplays == $((before_ambiguous_replays + 1))" >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '
   .sendViewState == "entry"
@@ -1350,7 +2065,7 @@ wait_panel_snapshot '
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: ambiguous Send creation reconciles its committed reservation"
+echo "runtime: ambiguous Send retry reuses one Idempotency-Key and reservation"
 
 fund_send_fixture 100
 open_send_flow 60
@@ -1372,16 +2087,22 @@ wait_snapshot '
   and .activeTransfers == []
 ' >/dev/null
 adapter_call reconnect >/dev/null
-wait_mock_status ".sendCancelRequests > $before_deferred_ambiguous_cancel" >/dev/null
+wait_mock_status ".sendCancelRequests == $before_deferred_ambiguous_cancel" >/dev/null
 wait_snapshot '
   .connectionState == "connected"
-  and .sendState == "idle"
-  and .spendableBalance == "100"
-  and .reservedBalance == "0"
-  and .activeTransfers == []
+  and .sendState == "error"
+  and .spendableBalance == "30"
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1
 ' >/dev/null
+deferred_ambiguous_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$deferred_ambiguous_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
-echo "runtime: deferred ambiguous Send cancellation survives failed reconciliation"
+echo "runtime: closing an ambiguous Send never cancels its durable reservation"
 
 fund_send_fixture 100
 open_send_flow 60
@@ -1423,15 +2144,21 @@ wait_panel_snapshot '.sendViewState == "preparing"' >/dev/null
   || fail "panel could not close while Send preparation was reconciling"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":0}' "$base_url/__test__/mode" >/dev/null
-wait_mock_status ".sendCancelRequests > $before_deferred_cancel" >/dev/null
+wait_mock_status ".sendCancelRequests == $before_deferred_cancel" >/dev/null
+adapter_call reconnect >/dev/null
 wait_snapshot '
-  .sendState == "idle"
-  and .spendableBalance == "100"
-  and .reservedBalance == "0"
-  and .activeTransfers == []
+  .spendableBalance == "30"
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1
 ' >/dev/null
+deferred_prepared_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$deferred_prepared_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
-echo "runtime: hidden preparation releases its reservation after reconciliation failure"
+echo "runtime: hidden preparation remains durable after reconciliation failure"
 
 prepare_send_flow 60 https://mint.one
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -1443,8 +2170,8 @@ panel_action closePanel >/dev/null
 sleep 0.25
 after_hidden_cancel=$(curl -fsS "$base_url/__test__/status" \
   | jq -r '.sendCancelRequests')
-[[ $after_hidden_cancel -eq $((before_hidden_cancel + 1)) ]] \
-  || fail "panel dismissal retried Prepared Send cancellation without user intent"
+[[ $after_hidden_cancel -eq $before_hidden_cancel ]] \
+  || fail "panel dismissal signalled Prepared Send cancellation"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCancelError":""}' "$base_url/__test__/mode" >/dev/null
 hidden_prepared_id=$(curl -fsS -H "Authorization: Bearer $credential" \
@@ -1454,7 +2181,7 @@ curl -fsS -H "Authorization: Bearer $credential" -X POST \
 adapter_call reconnect >/dev/null
 wait_snapshot '.activeTransfers == [] and .reservedBalance == "0"' >/dev/null
 
-echo "runtime: panel dismissal makes one Prepared Send cancellation attempt"
+echo "runtime: panel dismissal never cancels a Prepared Send"
 
 prepare_send_flow 60 https://mint.one
 wait_panel_snapshot '.sendReviewAmount == "60"' >/dev/null
@@ -1468,9 +2195,6 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 [[ $(panel_action confirmSend) == "ok" ]] \
   || fail "Prepared Send could not be explicitly confirmed"
 wait_panel_snapshot '.sendViewState == "executing"' >/dev/null
-[[ $(panel_action closePanel) == "disabled" ]] \
-  || fail "panel closed while the one-shot Send result was still in flight"
-wait_panel_snapshot '.opened == true and .sendViewState == "executing"' >/dev/null
 wait_mock_status ".sendExecuteRequests > $before_send_execute_count" >/dev/null
 sleep 0.1
 canonical_execute_snapshot=$(panel_call)
@@ -1498,7 +2222,7 @@ adapter_snapshot=$(wait_snapshot '
 ')
 [[ $(wl-paste --no-newline) == "$clipboard_sentinel" ]] \
   || fail "Send confirmation wrote the clipboard automatically"
-if rg -qi 'cashuA|result.*token|proof|secret' <<<"$adapter_snapshot$panel_snapshot"; then
+if rg -qi 'cashuA|proof|secret' <<<"$adapter_snapshot$panel_snapshot"; then
   fail "outgoing Send token entered generic adapter or panel diagnostics"
 fi
 [[ $(panel_action copySend) == "ok" ]] \
@@ -1644,8 +2368,15 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 wait_snapshot '.connectionState == "connected"
   and .canonicalRefreshInProgress == false
   and .sendState == "idle"
-  and .reservedBalance == "0"' >/dev/null
-wait_mock_status ".sendCancelRequests > $before_refresh_dismiss_cancel" >/dev/null
+  and .reservedBalance == "70"
+  and (.activeSends | length) == 1' >/dev/null
+wait_mock_status ".sendCancelRequests == $before_refresh_dismiss_cancel" >/dev/null
+refresh_dismissed_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
+curl -fsS -H "Authorization: Bearer $credential" -X POST \
+  "$base_url/v1/operations/send/$refresh_dismissed_id/cancel" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.reservedBalance == "0" and .activeSends == []' >/dev/null
 
 echo "runtime: Send commands wait for full canonical fetch completion"
 
@@ -1790,33 +2521,38 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendResultUnavailableResponses":1}' \
   "$base_url/__test__/mode" >/dev/null
 [[ $(panel_action openSend) == "ok" ]] \
-  || fail "reloaded Pending Send could not be reopened"
-wait_panel_snapshot '.sendViewState == "pending"
-  and .sendErrorCode == "result_not_available"
-  and .sendError != ""
-  and .sendCopyAvailable == false
+  || fail "fresh Send entry did not open beside a reloaded Pending Send"
+wait_panel_snapshot '.sendViewState == "entry" and .sendAmount == ""
   and .activeTransferStateLabel == "Pending Send"' >/dev/null
-[[ $(panel_action retrySend) == "ok" ]] \
-  || fail "retryable Pending Send result could not be requested again"
-wait_panel_snapshot '.sendViewState == "result"
-  and .sendCopyAvailable == true' >/dev/null
+panel_action cancelSend >/dev/null
+reloaded_pending_id=$(curl -fsS -H "Authorization: Bearer $credential" \
+  "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+panel_action openActiveSends >/dev/null
+panel_action selectActiveSend "$reloaded_pending_id" >/dev/null
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "exact reloaded Pending Send result could not be requested"
+wait_panel_snapshot '.activePendingActionState == "error"
+  and .activePendingErrorCode == "result_not_available"
+  and .activePendingError != ""
+  and .activePendingCopyAvailable == true' >/dev/null
+[[ $(panel_action copyActivePendingSend) == "ok" ]] \
+  || fail "retryable exact Pending Send result could not be requested again"
+wait_panel_snapshot '.activePendingActionState == "idle"' >/dev/null
 wait_mock_status ".sendCreateRequests == $before_dropped_send_creates
   and .sendExecuteRequests == $((before_dropped_send_executes + 1))
   and .sendResultRequests >= 3" >/dev/null
-[[ $(panel_action beginReclaimSend) == "ok" ]] \
+[[ $(panel_action beginActivePendingReclaim) == "ok" ]] \
   || fail "Pending Send did not offer Reclaim"
-wait_panel_snapshot '.sendViewState == "reclaim-warning"
-  and .sendReclaimWarningVisible == true
-  and (.sendReclaimWarning | test("race"; "i"))' >/dev/null
-[[ $(panel_action confirmReclaimSend) == "ok" ]] \
+wait_panel_snapshot '.activePendingReclaimWarningVisible == true
+  and (.activePendingReclaimWarning | test("race"; "i"))' >/dev/null
+[[ $(panel_action confirmActivePendingReclaim) == "ok" ]] \
   || fail "warned Pending Send Reclaim could not begin"
-wait_panel_snapshot '.sendViewState == "reclaimed"
+wait_panel_snapshot '.activePendingTerminalState == "reclaimed"
   and .spendableBalance == "100"
   and .reservedBalance == "0"
-  and .activeTransferCount == 0
-  and .sendCopyAvailable == false' >/dev/null
-panel_action doneSend >/dev/null
-wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
+  and .activeTransferCount == 0' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
 panel_action closePanel >/dev/null
 
 echo "runtime: dropped Send recovery, reload, explicit result, and warned Reclaim passed"
@@ -1849,7 +2585,7 @@ for _duplicate in 1 2; do
     "$base_url/__test__/resources" >/dev/null
 done
 wait_mock_status ".sendLookupRequests > $before_send_lookup
-  and .sendRefreshRequests > $before_send_refresh
+  and .sendRefreshRequests == $before_send_refresh
   and .resourceRequests.balances > $before_send_balance
   and .sendCreateRequests == $before_send_invalidation_creates
   and .sendExecuteRequests == $before_send_invalidation_executes" >/dev/null
@@ -1862,21 +2598,26 @@ jq -cn '{event:{
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
 wait_mock_status ".sendLookupRequests > $after_operation_lookup
-  and .sendRefreshRequests > $after_operation_refresh" >/dev/null
+  and .sendRefreshRequests == $after_operation_refresh" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data "$(jq -cn --arg id "$invalidated_send_id" '{operationId:$id}')" \
+  --data "$(jq -cn --arg id "$invalidated_send_id" \
+    '{operationId:$id,suppressEvents:true}')" \
   "$base_url/__test__/redeem-send" >/dev/null \
   || fail "recipient redemption fixture failed"
+sleep 0.3
+wait_snapshot ".activeTransfers | any(.id == \"$invalidated_send_id\")" >/dev/null
+panel_action openPanel >/dev/null
 wait_snapshot "(.activeTransfers | all(.id != \"$invalidated_send_id\"))
   and .spendableBalance == \"30\"
   and .reservedBalance == \"0\"" >/dev/null
+panel_action closePanel >/dev/null
 if rg -Fq "$invalidated_send_token" \
     <<<"$(adapter_call snapshot)$(panel_call)$(curl -fsS "$base_url/__test__/status")" \
     || rg -Fq "$invalidated_send_token" "$shell_log" "$mock_log"; then
   fail "redeemed Pending Send token escaped its explicit result resource"
 fi
 
-echo "runtime: operation and proof-change Send invalidations and recipient redemption passed"
+echo "runtime: duplicate and missed Send invalidations reconcile canonically"
 
 fund_send_fixture 100
 prepare_send_flow 60
@@ -1888,12 +2629,20 @@ wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
   "$base_url/__test__/mode" >/dev/null
+before_inconclusive_reclaims=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendReclaimRequests')
+inconclusive_reclaim_id=$(panel_call | jq -er '.sendOperationId')
 panel_action beginReclaimSend >/dev/null
-wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
-panel_action confirmReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaim-warning"
+  and .sendReclaimAvailable == true' >/dev/null
+[[ $(panel_action confirmReclaimSend) == "ok" ]] \
+  || fail "inconclusive Pending Send Reclaim confirmation was unavailable"
+wait_mock_status ".sendReclaimRequests > $before_inconclusive_reclaims
+  and .sendReclaimOperationIds[-1] == \"$inconclusive_reclaim_id\"" >/dev/null
 wait_panel_snapshot '.sendViewState == "error"
   and .sendErrorCode == "coco_error"
   and .sendError != ""
+  and .sendOperationId == "'$inconclusive_reclaim_id'"
   and .sendCopyAvailable == false
   and .activeTransferStateLabel == "Pending Send"
   and .spendableBalance == "30"
@@ -1930,6 +2679,11 @@ wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
   and .sendReclaimAvailable == true' >/dev/null
 pending_unavailable_id=$(curl -fsS -H "Authorization: Bearer $credential" \
   "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+before_pending_hint=$(curl -fsS "$base_url/__test__/status")
+before_pending_hint_lookup=$(jq -r '.sendLookupRequests' <<<"$before_pending_hint")
+before_pending_hint_refresh=$(jq -r '.sendRefreshRequests' <<<"$before_pending_hint")
+before_pending_hint_balance=$(jq -r '.resourceRequests.balances' \
+  <<<"$before_pending_hint")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendRefreshError":"mint_unavailable"}' \
   "$base_url/__test__/mode" >/dev/null
@@ -1938,14 +2692,17 @@ jq -cn --arg id "$pending_unavailable_id" '{event:{
   data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
-wait_panel_snapshot '.sendViewState == "error"
-  and .sendErrorCode == "coco_error"
-  and .sendCopyAvailable == false
-  and .activeTransferStateLabel == "Pending Send"
-  and .spendableBalance == "30"
-  and .reservedBalance == "70"' >/dev/null
-panel_action retrySend >/dev/null
-wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true' >/dev/null
+wait_mock_status ".sendLookupRequests > $before_pending_hint_lookup
+  and .sendRefreshRequests == $before_pending_hint_refresh
+  and .resourceRequests.balances > $before_pending_hint_balance" >/dev/null
+wait_panel_snapshot ".sendViewState == \"result\"
+  and .sendOperationId == \"$pending_unavailable_id\"
+  and .sendCopyAvailable == true
+  and .activeTransferStateLabel == \"Pending Send\"
+  and .spendableBalance == \"30\"
+  and .reservedBalance == \"70\"" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendRefreshError":""}' "$base_url/__test__/mode" >/dev/null
 panel_action beginReclaimSend >/dev/null
 wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
 panel_action confirmReclaimSend >/dev/null
@@ -2049,7 +2806,7 @@ wait_snapshot "
 " >/dev/null
 wait_mock_status \
   ".sendLookupRequests > $before_send_lookup
-   and .sendRefreshRequests > $before_send_refresh
+   and .sendRefreshRequests == $before_send_refresh
    and .resourceRequests.balances > $before_send_balance
    and .resourceRequests.receivePrepared == $before_receive_prepared" >/dev/null
 curl -fsS -H "Authorization: Bearer $credential" -X POST \
