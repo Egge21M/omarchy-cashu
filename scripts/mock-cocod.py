@@ -58,6 +58,9 @@ COLLECTION_PATHS = {
     "/v1/operations/send/prepared": "sendPrepared",
     "/v1/operations/send/in-flight": "sendInFlight",
 }
+BODYLESS_COMMAND_PATH = re.compile(
+    r"/v1/operations/(?:receive|send)/[^/]+/(?:execute|cancel|refresh|reclaim)"
+)
 RECEIVE_MINT = "https://mint.slice4.test"
 REGISTRATION_RACE_MINT = "https://registration-race.slice4.test"
 TRUST_RACE_MINT = "https://trust-race.slice4.test"
@@ -1563,9 +1566,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path.startswith("/v1/") and not self.require_authentication():
             return
-        value = self.read_json()
-        if value is None:
-            return
+        if BODYLESS_COMMAND_PATH.fullmatch(self.path):
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = -1
+            if content_length != 0 or self.headers.get("Transfer-Encoding") is not None:
+                if content_length > 0:
+                    self.rfile.read(content_length)
+                self.send_json(
+                    400,
+                    error_document(
+                        "invalid_request",
+                        "This command does not accept a request body",
+                    ),
+                )
+                return
+            value: object = {}
+        else:
+            value = self.read_json()
+            if value is None:
+                return
         if self.path == "/__test__/resources":
             if not isinstance(value, dict):
                 self.send_json(400, error_document("invalid_request", "Expected an object"))

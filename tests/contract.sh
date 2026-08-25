@@ -248,7 +248,6 @@ canonical_prepared_send=$(curl -fsS "${auth[@]}" \
   || fail "canonical Send resource disagreed with preparation"
 
 cancelled_send=$(curl -fsS "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$prepared_send_id/cancel") \
   || fail "Prepared Send cancellation failed"
 jq -e --arg id "$prepared_send_id" \
@@ -294,7 +293,6 @@ jq -e '.amount == "100" and .fee == "0" and .inputAmount == "100"
   and .needsSwap == false' <<<"$max_prepared_send" >/dev/null \
   || fail "exact Send Max was recalculated by the client fixture"
 executed_send=$(curl -fsS -D "$command_headers" "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$max_prepared_send_id/execute") \
   || fail "Prepared Send execution failed"
 send_token=$(jq -er '.result.token | select(type == "string" and length > 0)' \
@@ -326,7 +324,6 @@ rg -qi '^Cache-Control: no-store' "$result_headers" \
   || fail "retrieved Send result is cacheable"
 
 reclaimed_send=$(curl -fsS "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$max_prepared_send_id/reclaim") \
   || fail "Pending Send Reclaim failed"
 jq -e --arg id "$max_prepared_send_id" '
@@ -351,14 +348,13 @@ inconclusive_send=$(jq -cn --arg mint "$send_mint" \
       --data-binary @- "$base_url/v1/operations/send") \
   || fail "inconclusive Reclaim fixture preparation failed"
 inconclusive_send_id=$(jq -er '.id' <<<"$inconclusive_send")
-curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+curl -fsS "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$inconclusive_send_id/execute" >/dev/null \
   || fail "inconclusive Reclaim fixture execution failed"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
   "$base_url/__test__/mode" >/dev/null
 inconclusive_reclaim=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$inconclusive_send_id/reclaim")
 [[ ${inconclusive_reclaim##*$'\n'} == 503 ]] \
   || fail "inconclusive Reclaim returned the wrong status"
@@ -374,7 +370,7 @@ jq -e --arg mint "$send_mint" '
   .items == [{mintUrl:$mint,unit:"sat",spendable:"30",reserved:"70",total:"100"}]
 ' <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/balances")" >/dev/null \
   || fail "inconclusive Reclaim changed the Pending Send reservation"
-curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+curl -fsS "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$inconclusive_send_id/reclaim" >/dev/null \
   || fail "retry after inconclusive Reclaim did not succeed"
 
@@ -384,7 +380,7 @@ recipient_send=$(jq -cn --arg mint "$send_mint" \
       --data-binary @- "$base_url/v1/operations/send") \
   || fail "recipient-won fixture preparation failed"
 recipient_send_id=$(jq -er '.id' <<<"$recipient_send")
-curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+curl -fsS "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$recipient_send_id/execute" >/dev/null \
   || fail "recipient-won fixture execution failed"
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -392,7 +388,6 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$base_url/__test__/redeem-send" >/dev/null \
   || fail "recipient-won fixture redemption failed"
 recipient_won=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$recipient_send_id/reclaim")
 [[ ${recipient_won##*$'\n'} == 409 ]] \
   || fail "recipient-won Reclaim race returned the wrong status"
@@ -422,13 +417,12 @@ unavailable_refresh_send=$(jq -cn --arg mint "$send_mint" \
   | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
       --data-binary @- "$base_url/v1/operations/send")
 unavailable_refresh_send_id=$(jq -er '.id' <<<"$unavailable_refresh_send")
-curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+curl -fsS "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id/execute" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendRefreshError":"mint_unavailable"}' \
   "$base_url/__test__/mode" >/dev/null
 unavailable_refresh=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id/refresh")
 [[ ${unavailable_refresh##*$'\n'} == 503 ]] \
   || fail "unavailable Mint Send refresh returned the wrong status"
@@ -439,7 +433,7 @@ jq -e --arg id "$unavailable_refresh_send_id" '.id == $id and .state == "pending
   <<<"$(curl -fsS "${auth[@]}" \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id")" >/dev/null \
   || fail "unavailable Mint refresh did not leave the Send recoverable"
-curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+curl -fsS "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id/reclaim" >/dev/null
 
 receive_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC11bmtub3duLW1pbnQifQ'
@@ -544,8 +538,7 @@ cancelled_prepare=$(post_token "/v1/operations/receive" false -fsS \
   <<<"$cancel_token") || fail "cancellable Receive creation failed"
 cancelled_id=$(jq -er '.id' <<<"$cancelled_prepare")
 cancelled=$(curl -fsS -D "$command_headers" "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' \
-  --data '{}' "$base_url/v1/operations/receive/$cancelled_id/cancel") \
+  "$base_url/v1/operations/receive/$cancelled_id/cancel") \
   || fail "Prepared Receive cancellation failed"
 rg -q '^HTTP/.* 200' "$command_headers" \
   || fail "Receive cancellation did not return 200 OK"
@@ -599,8 +592,7 @@ jq -e --arg id "$operation_id" \
   || fail "Prepared Receive was absent from its canonical collection"
 
 executed=$(curl -fsS -D "$command_headers" "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' \
-  --data '{}' "$base_url/v1/operations/receive/$operation_id/execute") \
+  "$base_url/v1/operations/receive/$operation_id/execute") \
   || fail "Prepared Receive execution failed"
 rg -q '^HTTP/.* 200' "$command_headers" \
   || fail "Receive execution did not return 200 OK"
@@ -635,7 +627,6 @@ for operation_case in \
   expected_code=${remainder%%|*}
   expected_status=${remainder##*|}
   failure=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
-    -H 'Content-Type: application/json' --data '{}' \
     "$base_url/v1/operations/receive/$case_id/$command")
   [[ ${failure##*$'\n'} == "$expected_status" ]] \
     || fail "$expected_code command returned the wrong status"
@@ -785,8 +776,7 @@ jq -e '.error.code == "result_not_available" and .error.retryable == true' \
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendExecuteInterruption":"after_commit"}' \
   "$recovery_base_url/__test__/mode" >/dev/null
-if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
-    --data '{}' \
+if curl -fsS "${auth[@]}" -X POST \
     "$recovery_base_url/v1/operations/send/$recovery_send_id/execute" >/dev/null 2>&1; then
   fail "dropped Send execute response returned an optimistic success"
 fi
@@ -811,7 +801,7 @@ before_interrupt=$(jq -Rn '{token: input}' <<<"$cancel_token" \
       --data-binary @- "$recovery_base_url/v1/operations/receive") \
   || fail "before-commit Receive preparation failed"
 before_interrupt_id=$(jq -er '.id' <<<"$before_interrupt")
-if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+if curl -fsS "${auth[@]}" -X POST \
     "$recovery_base_url/v1/operations/receive/$before_interrupt_id/execute" >/dev/null 2>&1; then
   fail "before-commit interruption returned an optimistic execute success"
 fi
@@ -824,7 +814,7 @@ after_interrupt=$(jq -Rn '{token: input}' <<<"$receive_token" \
       --data-binary @- "$recovery_base_url/v1/operations/receive") \
   || fail "after-commit Receive preparation failed"
 after_interrupt_id=$(jq -er '.id' <<<"$after_interrupt")
-if curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' --data '{}' \
+if curl -fsS "${auth[@]}" -X POST \
     "$recovery_base_url/v1/operations/receive/$after_interrupt_id/execute" >/dev/null 2>&1; then
   fail "after-commit interruption returned an optimistic execute success"
 fi
@@ -888,11 +878,9 @@ jq -e --arg mint "$send_recovery_mint" '
   || fail "recovered Pending Send did not preserve its Reserved Balance"
 
 before_refreshed=$(curl -fsS "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$recovery_base_url/v1/operations/receive/$before_interrupt_id/refresh") \
   || fail "before-commit Receive refresh failed"
 after_refreshed=$(curl -fsS "${auth[@]}" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$recovery_base_url/v1/operations/receive/$after_interrupt_id/refresh") \
   || fail "after-commit Receive refresh failed"
 jq -e --arg id "$before_interrupt_id" \

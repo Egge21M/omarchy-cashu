@@ -831,7 +831,8 @@ Item {
     request.setRequestHeader("Accept", accept || "application/json")
     request.setRequestHeader("Authorization", "Bearer " + credential)
     if (body !== undefined) request.setRequestHeader("Content-Type", "application/json")
-    request.send(body === undefined ? null : JSON.stringify(body))
+    if (body === undefined) request.send()
+    else request.send(JSON.stringify(body))
     return request
   }
 
@@ -1198,7 +1199,7 @@ Item {
       }
       if (trackRecovery) root.setReceiveRecoveryFromOperation(operation)
       var refreshRequest = root.sendRequest("POST", "/v1/operations/receive/"
-        + encodeURIComponent(id) + "/refresh", {}, function(result) {
+        + encodeURIComponent(id) + "/refresh", undefined, function(result) {
           if (!current()) return
           if (!result.ok) {
             if (trackRecovery) root.setReceiveRecoveryFailure(id, result.error)
@@ -1748,7 +1749,7 @@ Item {
     sendError = ""
     sendErrorCode = ""
     var request = root.sendRequest("POST", "/v1/operations/send/"
-      + encodeURIComponent(operationId) + "/cancel", {}, function(result) {
+      + encodeURIComponent(operationId) + "/cancel", undefined, function(result) {
         if (request !== root.sendCommandRequest) return
         root.sendCommandRequest = null
         if (!result.ok) {
@@ -1806,7 +1807,7 @@ Item {
     sendError = ""
     sendErrorCode = ""
     var request = root.sendRequest("POST", "/v1/operations/send/"
-      + encodeURIComponent(operationId) + "/execute", {}, function(result) {
+      + encodeURIComponent(operationId) + "/execute", undefined, function(result) {
         if (request !== root.sendCommandRequest) return
         root.sendCommandRequest = null
         if (!result.ok) {
@@ -1900,7 +1901,7 @@ Item {
     sendError = ""
     sendErrorCode = ""
     var request = sendRequest("POST", "/v1/operations/send/"
-      + encodeURIComponent(operationId) + "/reclaim", {}, function(result) {
+      + encodeURIComponent(operationId) + "/reclaim", undefined, function(result) {
         if (request !== root.sendCommandRequest) return
         root.sendCommandRequest = null
         if (!result.ok) {
@@ -2133,7 +2134,7 @@ Item {
 
   function executePreparedReceive(operationId) {
     var request = sendRequest("POST", "/v1/operations/receive/"
-      + encodeURIComponent(operationId) + "/execute", {}, function(result) {
+      + encodeURIComponent(operationId) + "/execute", undefined, function(result) {
         if (request !== root.receiveRequest) return
         root.receiveRequest = null
         if (!result.ok) {
@@ -2520,7 +2521,7 @@ Item {
         }
         var canonical = result.value
         var refresh = root.sendRequest("POST", "/v1/operations/send/"
-          + encodeURIComponent(id) + "/refresh", {}, function(refreshResult) {
+          + encodeURIComponent(id) + "/refresh", undefined, function(refreshResult) {
             if (root.sendLookupRequestsById[id] !== refresh) return
             if (!refreshResult.ok) {
               if (refreshResult.error.code === "operation_not_found")

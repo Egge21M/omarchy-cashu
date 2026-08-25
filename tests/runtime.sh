@@ -549,7 +549,6 @@ before_recovery=$(prepare_receive_fixture "$recovery_token") \
   || fail "pre-commit recovery fixture preparation failed"
 before_recovery_id=$(jq -er '.id' <<<"$before_recovery")
 if curl -fsS -H "Authorization: Bearer $credential" -X POST \
-    -H 'Content-Type: application/json' --data '{}' \
     "$base_url/v1/operations/receive/$before_recovery_id/execute" >/dev/null 2>&1; then
   fail "pre-commit interruption reported optimistic success"
 fi
@@ -614,7 +613,6 @@ kill "$shell_pid"
 wait "$shell_pid" 2>/dev/null || true
 shell_pid=""
 if curl -fsS -H "Authorization: Bearer $credential" -X POST \
-    -H 'Content-Type: application/json' --data '{}' \
     "$base_url/v1/operations/receive/$after_recovery_id/execute" >/dev/null 2>&1; then
   fail "post-commit interruption reported optimistic success"
 fi
@@ -774,7 +772,6 @@ wait_mock_status '.streamConnections == 0' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"receiveLookupDelayMs":0}' "$base_url/__test__/mode" >/dev/null
 curl -fsS -H "Authorization: Bearer $credential" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/receive/$pending_recovery_id/cancel" >/dev/null \
   || fail "stale-lookup Receive cleanup failed"
 adapter_call reconnect >/dev/null
@@ -820,7 +817,6 @@ first_concurrent_id=$(jq -er '.id' <<<"$first_concurrent")
 second_concurrent_id=$(jq -er '.id' <<<"$second_concurrent")
 for concurrent_id in "$first_concurrent_id" "$second_concurrent_id"; do
   if curl -fsS -H "Authorization: Bearer $credential" -X POST \
-      -H 'Content-Type: application/json' --data '{}' \
       "$base_url/v1/operations/receive/$concurrent_id/execute" >/dev/null 2>&1; then
     fail "concurrent recovery fixture reported optimistic success"
   fi
@@ -1288,7 +1284,6 @@ for external_send_state in removed pending; do
     | jq -r '.sendCancelRequests')
   if [[ $external_send_state == pending ]]; then
     curl -fsS -H "Authorization: Bearer $credential" -X POST \
-      -H 'Content-Type: application/json' --data '{}' \
       "$base_url/v1/operations/send/$external_send_id/execute" >/dev/null
     external_send_error=operation_conflict
   else
@@ -1457,7 +1452,6 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 hidden_prepared_id=$(curl -fsS -H "Authorization: Bearer $credential" \
   "$base_url/v1/operations/send/prepared" | jq -er '.items[0].id')
 curl -fsS -H "Authorization: Bearer $credential" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$hidden_prepared_id/cancel" >/dev/null
 adapter_call reconnect >/dev/null
 wait_snapshot '.activeTransfers == [] and .reservedBalance == "0"' >/dev/null
@@ -1864,7 +1858,6 @@ invalidated_send=$(jq -cn '{mintUrl:"https://mint.one",unit:"sat",amount:"60"}' 
       "$base_url/v1/operations/send")
 invalidated_send_id=$(jq -er '.id' <<<"$invalidated_send")
 invalidated_send_execution=$(curl -fsS -H "Authorization: Bearer $credential" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$invalidated_send_id/execute")
 invalidated_send_token=$(jq -er '.result.token' <<<"$invalidated_send_execution")
 adapter_call reconnect >/dev/null
@@ -2090,7 +2083,6 @@ wait_mock_status \
    and .resourceRequests.balances > $before_send_balance
    and .resourceRequests.receivePrepared == $before_receive_prepared" >/dev/null
 curl -fsS -H "Authorization: Bearer $credential" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/send/$canonical_invalidation_send_id/cancel" >/dev/null
 wait_snapshot ".activeTransfers | all(.id != \"$canonical_invalidation_send_id\")" \
   >/dev/null
@@ -2188,7 +2180,6 @@ wait_mock_status \
 before_rotation_cleanup_lookup=$(curl -fsS "$base_url/__test__/status" \
   | jq -r '.receiveLookupRequests')
 curl -fsS -H "Authorization: Bearer $credential" -X POST \
-  -H 'Content-Type: application/json' --data '{}' \
   "$base_url/v1/operations/receive/$rotation_receive_id/cancel" >/dev/null \
   || fail "rotation recovery fixture cleanup failed"
 jq -cn --arg id "$rotation_receive_id" '{
