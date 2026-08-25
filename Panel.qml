@@ -45,32 +45,33 @@ Item {
         return activeSends[index]
     return null
   }
-  readonly property var selectedPendingSendAction: stateOwner
-    && selectedActiveSendOperationId
-    && typeof stateOwner.pendingSendAction === "function"
-    ? stateOwner.pendingSendAction(selectedActiveSendOperationId) : ({
-      state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+  readonly property var selectedSendDescriptor: stateOwner
+    && typeof stateOwner.sendOperationDescriptor === "function"
+    ? stateOwner.sendOperationDescriptor(selectedActiveSendOperationId,
+      activeSendsViewState === "detail") : ({
+      isPrepared: false, isPending: false, readOnly: false,
+      mutationActionCount: 0, preparedBusy: false,
+      preparedCommandsAvailable: false, terminalState: "", terminalMessage: "",
+      preparedAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: ""
+      }),
+      pendingAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+      })
     })
+  readonly property var selectedPendingSendAction: selectedSendDescriptor.pendingAction
   readonly property string selectedPendingSendTerminalState: String(
     selectedPendingSendAction.terminalState || "")
-  readonly property var selectedPreparedSendAction: stateOwner
-    && selectedActiveSendOperationId
-    && typeof stateOwner.preparedSendAction === "function"
-    ? stateOwner.preparedSendAction(selectedActiveSendOperationId) : ({
-      state: "idle", errorCode: "", error: "", terminalState: ""
-    })
+  readonly property var selectedPreparedSendAction: selectedSendDescriptor.preparedAction
   readonly property string selectedPreparedSendTerminalState: String(
     selectedPreparedSendAction.terminalState || "")
   readonly property var selectedPreparedSendBalance: stateOwner && selectedActiveSend
-    && selectedActiveSend.state === "prepared"
+    && selectedSendDescriptor.isPrepared
     && typeof stateOwner.sendBalanceForMint === "function"
     ? stateOwner.sendBalanceForMint(selectedActiveSend.mintUrl) : null
-  readonly property bool selectedPreparedSendBusy: ["executing", "cancelling", "refreshing"]
-    .indexOf(String(selectedPreparedSendAction.state || "")) !== -1
-  readonly property bool selectedPreparedSendCommandsAvailable: !!selectedActiveSend
-    && selectedActiveSend.state === "prepared" && stateOwner
-    && stateOwner.sendCommandsAvailable !== false && !stateOwner.sendCommandRequest
-    && stateOwner.sendReconcileRequests.length === 0
+  readonly property bool selectedPreparedSendBusy: selectedSendDescriptor.preparedBusy
+  readonly property bool selectedPreparedSendCommandsAvailable:
+    selectedSendDescriptor.preparedCommandsAvailable
 
   readonly property color foreground: shell && shell.bar
     ? shell.bar.foreground : Color.foreground
@@ -198,7 +199,10 @@ Item {
       if (String(activeSends[index].id || "") !== selected) continue
       selectedActiveSendOperationId = selected
       activeSendsViewState = "detail"
-      if (String(activeSends[index].state || "") === "pending")
+      var descriptor = stateOwner
+        && typeof stateOwner.sendOperationDescriptor === "function"
+        ? stateOwner.sendOperationDescriptor(selected, true) : null
+      if (descriptor && descriptor.isPending)
         activePendingSendFlow.focusPendingDetail(selected,
           String(activeSends[index].amount || ""))
       panelFlick.contentY = 0
@@ -436,7 +440,7 @@ Item {
   }
 
   function smokeRefreshActivePreparedSend() {
-    if (!selectedActiveSend || selectedActiveSend.state !== "prepared" || !stateOwner
+    if (!selectedSendDescriptor.isPrepared || !stateOwner
         || typeof stateOwner.refreshActivePreparedSend !== "function") return "disabled"
     return stateOwner.refreshActivePreparedSend(selectedActiveSendOperationId)
       ? "ok" : "disabled"
@@ -531,12 +535,9 @@ Item {
       selectedActiveSendOperationId: selectedActiveSendOperationId,
       selectedActiveSend: selectedActiveSend,
       activeSendDetailReadOnly: activeSendsViewState === "detail"
-        && !(selectedActiveSend && ["prepared", "pending"]
-          .indexOf(selectedActiveSend.state) !== -1),
+        && !!selectedActiveSend && selectedSendDescriptor.readOnly,
       activeSendMutationActionCount: activeSendsViewState === "detail"
-        && selectedActiveSend && selectedActiveSend.state === "pending" ? 4
-        : activeSendsViewState === "detail" && selectedActiveSend
-          && selectedActiveSend.state === "prepared" ? 3 : 0,
+        && selectedActiveSend ? selectedSendDescriptor.mutationActionCount : 0,
       activePreparedActionState: String(selectedPreparedSendAction.state || "idle"),
       activePreparedErrorCode: String(selectedPreparedSendAction.errorCode || ""),
       activePreparedError: String(selectedPreparedSendAction.error || ""),
@@ -544,7 +545,7 @@ Item {
       activePreparedConfirmAvailable: selectedPreparedSendCommandsAvailable,
       activePreparedCancelAvailable: selectedPreparedSendCommandsAvailable,
       activePreparedRefreshAvailable: !!selectedActiveSend
-        && selectedActiveSend.state === "prepared" && !selectedPreparedSendBusy,
+        && selectedSendDescriptor.isPrepared && !selectedPreparedSendBusy,
       activePreparedBalanceSpendable: selectedPreparedSendBalance
         ? String(selectedPreparedSendBalance.spendable || "") : "",
       activePreparedBalanceReserved: selectedPreparedSendBalance
@@ -576,7 +577,7 @@ Item {
 
   onSelectedActiveSendChanged: {
     if (activeSendsViewState === "detail" && selectedActiveSend
-        && selectedActiveSend.state === "pending"
+        && selectedSendDescriptor.isPending
         && activePendingSendFlow.pendingOperationId !== selectedActiveSendOperationId)
       activePendingSendFlow.focusPendingDetail(selectedActiveSendOperationId,
         String(selectedActiveSend.amount || ""))
@@ -1248,7 +1249,7 @@ Item {
                     + root.amountText(modelData.amount) + " · "
                     + String(modelData.mintHostname || "") + " · "
                     + root.relativeUpdateText(modelData.updatedAt)
-                    + (String(modelData.state || "") === "prepared"
+                    + (String(modelData.reservedInput || "") !== ""
                       ? " · Reserved input " + root.amountText(modelData.reservedInput) : "")
                   iconText: "󰅂"
                   foreground: root.foreground
@@ -1322,7 +1323,7 @@ Item {
 
               Text {
                 visible: root.selectedActiveSend
-                  && root.selectedActiveSend.state === "prepared"
+                  && root.selectedSendDescriptor.isPrepared
                 width: parent.width
                 text: root.selectedActiveSend
                   ? "TRANSFER PREVIEW\nRequested · "
@@ -1345,7 +1346,7 @@ Item {
 
               Text {
                 visible: !!root.selectedActiveSend
-                  && ["prepared", "pending"].indexOf(root.selectedActiveSend.state) === -1
+                  && root.selectedSendDescriptor.readOnly
                 width: parent.width
                 text: "Read-only canonical Send details"
                 color: root.dim
@@ -1357,11 +1358,7 @@ Item {
               Text {
                 visible: root.selectedPreparedSendBusy
                 width: parent.width
-                text: root.selectedPreparedSendAction.state === "executing"
-                  ? "Confirming this exact Prepared Send…"
-                  : root.selectedPreparedSendAction.state === "cancelling"
-                    ? "Cancelling this exact Prepared Send…"
-                    : "Refreshing this exact Prepared Send…"
+                text: root.selectedSendDescriptor.preparedBusyMessage
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1383,21 +1380,12 @@ Item {
               }
 
               Text {
-                visible: root.selectedPreparedSendTerminalState === "cancelled"
+                visible: root.selectedPreparedSendTerminalState !== ""
+                  && root.selectedSendDescriptor.terminalMessage !== ""
                 width: parent.width
-                text: "This exact Prepared Send was cancelled. Its reservation was released after canonical balance reconciliation."
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
-                wrapMode: Text.WordWrap
-              }
-
-              Text {
-                visible: root.selectedPreparedSendTerminalState === "completed"
-                width: parent.width
-                text: "This exact Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
-                color: root.foreground
+                text: root.selectedSendDescriptor.terminalMessage
+                color: root.selectedSendDescriptor.terminalPositive
+                  ? root.foreground : root.urgent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 font.bold: true
@@ -1406,7 +1394,7 @@ Item {
 
               Row {
                 visible: root.selectedActiveSend
-                  && root.selectedActiveSend.state === "prepared"
+                  && root.selectedSendDescriptor.isPrepared
                 width: parent.width
                 spacing: Style.spacing.controlGap
 
@@ -1437,7 +1425,7 @@ Item {
 
               Button {
                 visible: root.selectedActiveSend
-                  && root.selectedActiveSend.state === "prepared"
+                  && root.selectedSendDescriptor.isPrepared
                 width: parent.width
                 text: "Refresh"
                 iconText: "󰑐"

@@ -25,27 +25,27 @@ Item {
   property string pendingAmount: ""
   property int pendingPresentationGeneration: 0
   property bool pendingTokenRevealed: false
-  readonly property var pendingAction: service && pendingOperationId
-    && typeof service.pendingSendAction === "function"
-    ? service.pendingSendAction(pendingOperationId) : ({
-      state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+  readonly property var pendingDescriptor: service
+    && typeof service.sendOperationDescriptor === "function"
+    ? service.sendOperationDescriptor(pendingOperationId, pendingDetailFocused) : ({
+      operation: null, isPending: false, pendingBusy: false,
+      pendingCommandsAvailable: false, pendingResultAvailable: false,
+      terminalMessage: "", terminalPositive: false,
+      pendingAction: ({
+        state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+      })
     })
+  readonly property var pendingAction: pendingDescriptor.pendingAction
   readonly property string pendingActionState: String(pendingAction.state || "idle")
   readonly property string pendingErrorCode: String(pendingAction.errorCode || "")
   readonly property string pendingError: String(pendingAction.error || "")
   readonly property string pendingTerminalState: String(pendingAction.terminalState || "")
-  readonly property var pendingCanonicalOperation: service && pendingOperationId
-    && typeof service.canonicalSendOperation === "function"
-    ? service.canonicalSendOperation(pendingOperationId) : null
-  readonly property bool pendingCanonical: pendingCanonicalOperation
-    && String(pendingCanonicalOperation.state || "") === "pending"
-  readonly property bool pendingBusy: ["copying", "revealing", "refreshing", "reclaiming"]
-    .indexOf(pendingActionState) !== -1
-  readonly property bool pendingCommandsAvailable: service
-    && service.sendCommandsAvailable !== false && !service.sendCommandRequest
-    && !service.sendResultReconciling && service.sendReconcileRequests.length === 0
-  readonly property bool pendingResultAvailable: pendingDetailFocused
-    && pendingCanonical && pendingCommandsAvailable && !pendingBusy
+  readonly property var pendingCanonicalOperation: pendingDescriptor.operation
+  readonly property bool pendingCanonical: pendingDescriptor.isPending
+  readonly property bool pendingBusy: pendingDescriptor.pendingBusy
+  readonly property bool pendingCommandsAvailable:
+    pendingDescriptor.pendingCommandsAvailable
+  readonly property bool pendingResultAvailable: pendingDescriptor.pendingResultAvailable
   readonly property bool pendingReclaimAvailable: pendingResultAvailable
   readonly property string reclaimWarning: pendingDetailMode
     ? "Reclaim " + pendingAmount + " sat from this exact Pending Send? Reclaim races recipient redemption; the recipient can still win while cocod checks the Mint."
@@ -77,6 +77,7 @@ Item {
   readonly property bool copyAvailable: viewState === "result" && outgoingToken !== ""
   readonly property bool reclaimAvailable: service
     && service.sendCanReclaim === true
+    && commandsAvailable
     && ["result", "pending", "error"].indexOf(sendState) !== -1
 
   implicitHeight: pendingDetailMode ? pendingContent.implicitHeight : content.implicitHeight
@@ -660,10 +661,7 @@ Item {
     Text {
       visible: root.pendingBusy
       width: parent.width
-      text: root.pendingActionState === "copying" ? "Retrieving this Send for Copy…"
-        : root.pendingActionState === "revealing" ? "Retrieving this Send for Reveal…"
-        : root.pendingActionState === "refreshing" ? "Refreshing this exact Pending Send…"
-        : "Attempting Reclaim with cocod…"
+      text: root.pendingDescriptor.pendingBusyMessage
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
@@ -809,14 +807,8 @@ Item {
     Text {
       visible: root.pendingTerminalState !== ""
       width: parent.width
-      text: root.pendingTerminalState === "reclaimed"
-        ? "Reclaim succeeded. The reserved ecash is spendable again."
-        : root.pendingTerminalState === "recipient_won"
-          ? "The recipient redeemed this Send before Reclaim completed."
-          : root.pendingTerminalState === "completed"
-            ? "This Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
-            : root.pendingError
-      color: root.pendingTerminalState === "reclaimed"
+      text: root.pendingDescriptor.terminalMessage
+      color: root.pendingDescriptor.terminalPositive
         ? root.foreground : root.urgent
       font.family: root.fontFamily
       font.pixelSize: Style.font.body

@@ -533,9 +533,29 @@ Item {
     return null
   }
 
+  function authoritativeSendOperations(values) {
+    var source = Array.isArray(values) ? values : []
+    var byId = ({})
+    var order = []
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation && operation.id || "")
+      if (!id) continue
+      if (!byId[id]) order.push(id)
+      var previous = byId[id]
+      if (previous && updateTimestampValue(previous.updatedAt)
+          > updateTimestampValue(operation.updatedAt)) continue
+      byId[id] = operation
+    }
+    var result = []
+    for (var orderIndex = 0; orderIndex < order.length; orderIndex++)
+      result.push(byId[order[orderIndex]])
+    return result
+  }
+
   function canonicalSendOperation(operationId) {
     var selected = String(operationId || "")
-    var operations = Array.isArray(sendOperations) ? sendOperations : []
+    var operations = authoritativeSendOperations(sendOperations)
     for (var index = 0; selected && index < operations.length; index++)
       if (String(operations[index].id || "") === selected)
         return operations[index]
@@ -548,15 +568,57 @@ Item {
       ? operation : null
   }
 
-  function preparedSendAction(operationId) {
+  function actionStoreGet(store, operationId, fallback) {
     var id = String(operationId || "")
-    var action = id ? preparedSendActions[id] : null
-    return action || {
-      operationId: id,
+    var action = id && store ? store[id] : null
+    return action || fallback
+  }
+
+  function actionStoreCopyUpdate(store, operationId, action) {
+    var id = String(operationId || "")
+    var next = ({})
+    for (var key in store) next[key] = store[key]
+    if (id) next[id] = action
+    return next
+  }
+
+  function actionStoreRemove(store, operationId) {
+    var id = String(operationId || "")
+    var next = ({})
+    for (var key in store) if (key !== id) next[key] = store[key]
+    return next
+  }
+
+  function actionStoreAcknowledge(store, operationId) {
+    var id = String(operationId || "")
+    var action = id && store ? store[id] : null
+    return action && action.terminalState
+      ? actionStoreRemove(store, id) : null
+  }
+
+  function emptyPreparedSendAction(operationId) {
+    return {
+      operationId: String(operationId || ""),
       state: "idle",
       errorCode: "",
       error: "",
       terminalState: ""
+    }
+  }
+
+  function preparedSendAction(operationId) {
+    var id = String(operationId || "")
+    return actionStoreGet(preparedSendActions, id, emptyPreparedSendAction(id))
+  }
+
+  function emptyPendingSendAction(operationId) {
+    return {
+      operationId: String(operationId || ""),
+      state: "idle",
+      errorCode: "",
+      error: "",
+      terminalState: "",
+      amount: ""
     }
   }
 
@@ -572,26 +634,19 @@ Item {
   function updatePreparedSendAction(operationId, state, errorCode, terminalState) {
     var id = String(operationId || "")
     if (!id) return
-    var actions = ({})
-    for (var key in preparedSendActions) actions[key] = preparedSendActions[key]
     var code = String(errorCode || "")
-    actions[id] = {
+    preparedSendActions = actionStoreCopyUpdate(preparedSendActions, id, {
       operationId: id,
       state: String(state || "idle"),
       errorCode: code,
       error: code ? preparedSendErrorMessage(code) : "",
       terminalState: String(terminalState || "")
-    }
-    preparedSendActions = actions
+    })
   }
 
   function acknowledgePreparedSendTerminal(operationId) {
-    var id = String(operationId || "")
-    var action = preparedSendActions[id]
-    if (!action || !action.terminalState) return false
-    var actions = ({})
-    for (var key in preparedSendActions)
-      if (key !== id) actions[key] = preparedSendActions[key]
+    var actions = actionStoreAcknowledge(preparedSendActions, operationId)
+    if (!actions) return false
     preparedSendActions = actions
     return true
   }
@@ -611,44 +666,91 @@ Item {
 
   function pendingSendAction(operationId) {
     var id = String(operationId || "")
-    var action = id ? pendingSendActions[id] : null
-    return action || {
-      operationId: id,
-      state: "idle",
-      errorCode: "",
-      error: "",
-      terminalState: "",
-      amount: ""
-    }
+    return actionStoreGet(pendingSendActions, id, emptyPendingSendAction(id))
   }
 
   function updatePendingSendAction(operationId, state, errorCode,
       terminalState, amount) {
     var id = String(operationId || "")
     if (!id) return
-    var actions = ({})
-    for (var key in pendingSendActions) actions[key] = pendingSendActions[key]
     var code = String(errorCode || "")
-    actions[id] = {
+    pendingSendActions = actionStoreCopyUpdate(pendingSendActions, id, {
       operationId: id,
       state: String(state || "idle"),
       errorCode: code,
       error: code ? pendingSendErrorMessage(code) : "",
       terminalState: String(terminalState || ""),
       amount: decimalString(amount) || ""
-    }
-    pendingSendActions = actions
+    })
   }
 
   function acknowledgePendingSendTerminal(operationId) {
-    var id = String(operationId || "")
-    var action = pendingSendActions[id]
-    if (!action || !action.terminalState) return false
-    var actions = ({})
-    for (var key in pendingSendActions)
-      if (key !== id) actions[key] = pendingSendActions[key]
+    var actions = actionStoreAcknowledge(pendingSendActions, operationId)
+    if (!actions) return false
     pendingSendActions = actions
     return true
+  }
+
+  function sendOperationDescriptor(operationId, detailFocused) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    var state = operation ? String(operation.state || "") : ""
+    var prepared = state === "prepared"
+    var pending = state === "pending"
+    var preparedAction = preparedSendAction(id)
+    var pendingAction = pendingSendAction(id)
+    var preparedActionState = String(preparedAction.state || "idle")
+    var pendingActionState = String(pendingAction.state || "idle")
+    var preparedBusy = ["executing", "cancelling", "refreshing"]
+      .indexOf(preparedActionState) !== -1
+    var pendingBusy = ["copying", "revealing", "refreshing", "reclaiming"]
+      .indexOf(pendingActionState) !== -1
+    var mutationLaneAvailable = sendCommandsAvailable && !sendCommandRequest
+      && !sendResultReconciling && sendReconcileRequests.length === 0
+    var pendingTerminal = String(pendingAction.terminalState || "")
+    var preparedTerminal = String(preparedAction.terminalState || "")
+    var terminalState = pendingTerminal || preparedTerminal
+    var terminalMessages = {
+      reclaimed: "Reclaim succeeded. The reserved ecash is spendable again.",
+      recipient_won: "The recipient redeemed this Send before Reclaim completed.",
+      cancelled: "This exact Prepared Send was cancelled. Its reservation was released after canonical balance reconciliation.",
+      completed: "This Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
+    }
+    var pendingBusyMessages = {
+      copying: "Retrieving this Send for Copy…",
+      revealing: "Retrieving this Send for Reveal…",
+      refreshing: "Refreshing this exact Pending Send…",
+      reclaiming: "Attempting Reclaim with cocod…"
+    }
+    var preparedBusyMessages = {
+      executing: "Confirming this exact Prepared Send…",
+      cancelling: "Cancelling this exact Prepared Send…",
+      refreshing: "Refreshing this exact Prepared Send…"
+    }
+    return {
+      operationId: id,
+      operation: operation,
+      state: state,
+      isPrepared: prepared,
+      isPending: pending,
+      readOnly: !!operation && !prepared && !pending,
+      mutationActionCount: pending ? 4 : prepared ? 3 : 0,
+      preparedAction: preparedAction,
+      pendingAction: pendingAction,
+      preparedBusy: preparedBusy,
+      pendingBusy: pendingBusy,
+      preparedBusyMessage: preparedBusyMessages[preparedActionState] || "",
+      pendingBusyMessage: pendingBusyMessages[pendingActionState] || "",
+      preparedCommandsAvailable: prepared && mutationLaneAvailable && !preparedBusy,
+      pendingCommandsAvailable: pending && mutationLaneAvailable && !pendingBusy,
+      pendingResultAvailable: detailFocused === true && pending
+        && mutationLaneAvailable && !pendingBusy,
+      terminalState: terminalState,
+      terminalMessage: terminalMessages[terminalState]
+        || String(pendingAction.error || preparedAction.error || ""),
+      terminalPositive: ["reclaimed", "cancelled", "completed"]
+        .indexOf(terminalState) !== -1
+    }
   }
 
   function annotateMissingCanonicalSends(previous, next) {
@@ -697,7 +799,7 @@ Item {
   }
 
   function replaceCanonicalSendOperations(values, annotateMissing) {
-    var next = Array.isArray(values) ? values : []
+    var next = authoritativeSendOperations(values)
     if (annotateMissing !== false)
       annotateMissingCanonicalSends(sendOperations, next)
     sendOperations = next
@@ -862,7 +964,7 @@ Item {
   function composeActiveSends(sends) {
     var activeStates = ["prepared", "executing", "pending", "rolling_back"]
     var byId = ({})
-    var source = Array.isArray(sends) ? sends : []
+    var source = authoritativeSendOperations(sends)
     for (var index = 0; index < source.length; index++) {
       var operation = source[index]
       var id = String(operation.id || "")
@@ -1157,6 +1259,68 @@ Item {
     }
   }
 
+  function paginatedOperationPath(path, offset) {
+    return String(path || "") + "?offset=" + Number(offset || 0) + "&limit=100"
+  }
+
+  function fetchAllOperationPages(path, type, trackRequest, requestIsCurrent,
+      callback) {
+    var items = []
+    var finished = false
+
+    function complete(result) {
+      if (finished) return
+      finished = true
+      callback(result)
+    }
+
+    function fetchPage(offset) {
+      var request = root.sendRequest("GET", root.paginatedOperationPath(path, offset),
+        undefined, function(result) {
+          if (finished || (typeof requestIsCurrent === "function"
+              && !requestIsCurrent(request))) return
+          if (!result.ok) {
+            complete({
+              ok: false,
+              status: result.status,
+              code: result.error.code,
+              error: result.error
+            })
+            return
+          }
+          var page = result.value
+          if (result.status !== 200 || !root.isOperationCollection(page, type)
+              || page.offset !== offset || page.items.length > page.limit) {
+            complete({ ok: false, code: "invalid_response" })
+            return
+          }
+          items = items.concat(page.items)
+          if (page.items.length < page.limit) {
+            complete({ ok: true, items: items })
+            return
+          }
+          var nextOffset = page.offset + page.items.length
+          if (nextOffset <= offset) {
+            complete({ ok: false, code: "invalid_response" })
+            return
+          }
+          fetchPage(nextOffset)
+        })
+      if (!request) {
+        complete({
+          ok: false,
+          status: 0,
+          code: "credential_unavailable",
+          error: { code: "credential_unavailable", retryable: false }
+        })
+        return
+      }
+      if (typeof trackRequest === "function") trackRequest(request)
+    }
+
+    fetchPage(0)
+  }
+
   function abortIncrementalSendFetches() {
     abortRequests(sendRequests)
     sendRequests = []
@@ -1210,8 +1374,37 @@ Item {
       else root.failSend(code)
     }
 
+    function accept(specification, value) {
+      if (failed) return
+      values[specification.key] = value
+      pending--
+      if (pending !== 0) return
+      root.sendReconcileRequests = []
+      callback(values)
+    }
+
+    function track(request) {
+      requests.push(request)
+      root.sendReconcileRequests = requests
+    }
+
+    function current(request) {
+      return !failed && requests.indexOf(request) !== -1
+    }
+
     for (var index = 0; index < specifications.length; index++) {
       (function(specification) {
+        if (specification.type === "send") {
+          root.fetchAllOperationPages(specification.path, "send", track, current,
+            function(result) {
+              if (!result.ok) {
+                reject(result.code)
+                return
+              }
+              accept(specification, { items: result.items, offset: 0, limit: 100 })
+            })
+          return
+        }
         var request = root.sendRequest("GET", specification.path, undefined,
           function(result) {
             if (failed || requests.indexOf(request) === -1) return
@@ -1219,27 +1412,21 @@ Item {
               reject(result.error.code)
               return
             }
-            var valid = specification.type === "balances"
-              ? root.isBalanceCollection(result.value)
-              : root.isOperationCollection(result.value, "send")
+            var valid = root.isBalanceCollection(result.value)
             if (result.status !== 200 || !valid) {
               reject("invalid_response")
               return
             }
-            values[specification.key] = result.value
-            pending--
-            if (pending !== 0) return
-            root.sendReconcileRequests = []
-            callback(values)
+            accept(specification, result.value)
           })
         if (!request) {
           reject("credential_unavailable")
           return
         }
-        requests.push(request)
+        track(request)
       })(specifications[index])
     }
-    sendReconcileRequests = requests
+    if (!failed) sendReconcileRequests = requests
     return !failed
   }
 
@@ -1395,8 +1582,79 @@ Item {
     var values = ({})
     var pending = specifications.length
     var failed = false
+
+    function accept(specification, value) {
+      if (failed || token !== root.fullFetchToken) return
+      values[specification.key] = value
+      pending--
+      if (pending !== 0) return
+      var receiveSummaries = values.receivePrepared.items.concat(
+        values.receiveInFlight.items)
+      var sends = values.sendPrepared.items.concat(values.sendInFlight.items)
+      root.inspectReceivesForFullFetch(token, receiveSummaries,
+        function(receives, needsFreshBalances) {
+          if (token !== root.fullFetchToken) return
+          if (!needsFreshBalances) {
+            root.finishFullFetch(openApi, status, values.balances,
+              values.mints, receives, sends, connectAfterward)
+            return
+          }
+          var balanceRequest = root.sendRequest("GET", "/v1/balances", undefined,
+            function(balanceResult) {
+              if (token !== root.fullFetchToken) return
+              if (!balanceResult.ok) {
+                root.handleFetchFailure(balanceResult)
+                return
+              }
+              if (!root.isBalanceCollection(balanceResult.value)) {
+                root.handleContractFailure("invalid_balances",
+                  "cocod returned invalid balances")
+                return
+              }
+              root.finishFullFetch(openApi, status, balanceResult.value,
+                values.mints, receives, sends, connectAfterward)
+            })
+          if (!balanceRequest) {
+            root.handleCredentialUnavailable()
+            return
+          }
+          root.canonicalRequests.push(balanceRequest)
+        })
+    }
+
+    function track(request) {
+      root.canonicalRequests.push(request)
+    }
+
+    function current(request) {
+      return !failed && token === root.fullFetchToken
+        && root.canonicalRequests.indexOf(request) !== -1
+    }
+
     for (var i = 0; i < specifications.length; i++) {
       (function(specification) {
+        if (specification.type === "receive" || specification.type === "send") {
+          root.fetchAllOperationPages(specification.path, specification.type,
+            track, current, function(pageResult) {
+              if (failed || token !== root.fullFetchToken) return
+              if (!pageResult.ok) {
+                failed = true
+                if (pageResult.code === "invalid_response")
+                  root.handleContractFailure("invalid_" + specification.key,
+                    "cocod returned an invalid canonical resource")
+                else if (pageResult.code === "credential_unavailable")
+                  root.handleCredentialUnavailable()
+                else root.handleFetchFailure({
+                  status: Number(pageResult.status || 0),
+                  error: pageResult.error || { code: pageResult.code }
+                })
+                return
+              }
+              accept(specification,
+                { items: pageResult.items, offset: 0, limit: 100 })
+            })
+          return
+        }
         var request = root.sendRequest("GET", specification.path, undefined, function(result) {
           if (token !== root.fullFetchToken || failed) return
           if (!result.ok) {
@@ -1405,57 +1663,21 @@ Item {
             return
           }
           var valid = specification.type === "balances" ? root.isBalanceCollection(result.value)
-            : specification.type === "mints" ? root.isMintCollection(result.value)
-            : root.isOperationCollection(result.value, specification.type)
+            : root.isMintCollection(result.value)
           if (!valid) {
             failed = true
             root.handleContractFailure("invalid_" + specification.key,
               "cocod returned an invalid canonical resource")
             return
           }
-          values[specification.key] = result.value
-          pending--
-          if (pending === 0) {
-            var receiveSummaries = values.receivePrepared.items.concat(
-              values.receiveInFlight.items)
-            var sends = values.sendPrepared.items.concat(values.sendInFlight.items)
-            root.inspectReceivesForFullFetch(token, receiveSummaries,
-              function(receives, needsFreshBalances) {
-                if (token !== root.fullFetchToken) return
-                if (!needsFreshBalances) {
-                  root.finishFullFetch(openApi, status, values.balances,
-                    values.mints, receives, sends, connectAfterward)
-                  return
-                }
-                var balanceRequest = root.sendRequest("GET", "/v1/balances", undefined,
-                  function(balanceResult) {
-                    if (token !== root.fullFetchToken) return
-                    if (!balanceResult.ok) {
-                      root.handleFetchFailure(balanceResult)
-                      return
-                    }
-                    if (!root.isBalanceCollection(balanceResult.value)) {
-                      root.handleContractFailure("invalid_balances",
-                        "cocod returned invalid balances")
-                      return
-                    }
-                    root.finishFullFetch(openApi, status, balanceResult.value,
-                      values.mints, receives, sends, connectAfterward)
-                  })
-                if (!balanceRequest) {
-                  root.handleCredentialUnavailable()
-                  return
-                }
-                root.canonicalRequests.push(balanceRequest)
-              })
-          }
+          accept(specification, result.value)
         })
         if (!request) {
           failed = true
           root.handleCredentialUnavailable()
           return
         }
-        root.canonicalRequests.push(request)
+        track(request)
       })(specifications[i])
     }
   }
@@ -2023,37 +2245,44 @@ Item {
     })
   }
 
-  function executeActivePreparedSend(operationId) {
+  function runActivePreparedSendCommand(operationId, command) {
     var id = String(operationId || "")
+    var requestedCommand = String(command || "")
+    var executing = requestedCommand === "execute"
+    if (!executing && requestedCommand !== "cancel") return false
     var operation = canonicalSendOperation(id)
     if (!id || !operation || String(operation.state || "") !== "prepared"
         || !sendCommandsAvailable || sendCommandRequest
         || sendReconcileRequests.length > 0 || sendResultReconciling) return false
     abortIncrementalSendFetches()
     activePreparedCommandOperationId = id
-    updatePreparedSendAction(id, "executing", "", "")
+    updatePreparedSendAction(id, executing ? "executing" : "cancelling", "", "")
     var request = sendRequest("POST", "/v1/operations/send/"
-      + encodeURIComponent(id) + "/execute", undefined, function(result) {
+      + encodeURIComponent(id) + "/" + requestedCommand, undefined, function(result) {
         if (request !== root.sendCommandRequest) return
         root.sendCommandRequest = null
         if (!result.ok) {
           root.reconcileActivePreparedSend(id, "", result.error.code)
           return
         }
-        var exact = result.value && result.value.operation
-          ? result.value.operation : null
-        var resultDocument = result.value && result.value.result
+        var exact = executing && result.value && result.value.operation
+          ? result.value.operation : result.value
+        var resultDocument = executing && result.value && result.value.result
           ? result.value.result : null
+        var expectedState = executing ? "pending" : "rolled_back"
         if (result.status !== 200 || !root.isSendOperation(exact)
             || String(exact.id || "") !== id
-            || String(exact.state || "") !== "pending"
-            || !root.isSendResult(resultDocument)) {
+            || String(exact.state || "") !== expectedState
+            || (executing && !root.isSendResult(resultDocument))) {
           root.reconcileActivePreparedSend(id, "", "invalid_response")
           return
         }
-        // Confirmation from Active Sends does not reveal bearer material.
-        resultDocument.token = ""
-        root.reconcileActivePreparedSend(id, "pending", "")
+        if (executing) {
+          // Confirmation from Active Sends does not reveal bearer material.
+          resultDocument.token = ""
+        }
+        root.reconcileActivePreparedSend(id,
+          executing ? "pending" : "cancelled", "")
       })
     if (!request) {
       activePreparedCommandOperationId = ""
@@ -2065,39 +2294,12 @@ Item {
     return true
   }
 
+  function executeActivePreparedSend(operationId) {
+    return runActivePreparedSendCommand(operationId, "execute")
+  }
+
   function cancelActivePreparedSend(operationId) {
-    var id = String(operationId || "")
-    var operation = canonicalSendOperation(id)
-    if (!id || !operation || String(operation.state || "") !== "prepared"
-        || !sendCommandsAvailable || sendCommandRequest
-        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
-    abortIncrementalSendFetches()
-    activePreparedCommandOperationId = id
-    updatePreparedSendAction(id, "cancelling", "", "")
-    var request = sendRequest("POST", "/v1/operations/send/"
-      + encodeURIComponent(id) + "/cancel", undefined, function(result) {
-        if (request !== root.sendCommandRequest) return
-        root.sendCommandRequest = null
-        if (!result.ok) {
-          root.reconcileActivePreparedSend(id, "", result.error.code)
-          return
-        }
-        if (result.status !== 200 || !root.isSendOperation(result.value)
-            || String(result.value.id || "") !== id
-            || String(result.value.state || "") !== "rolled_back") {
-          root.reconcileActivePreparedSend(id, "", "invalid_response")
-          return
-        }
-        root.reconcileActivePreparedSend(id, "cancelled", "")
-      })
-    if (!request) {
-      activePreparedCommandOperationId = ""
-      updatePreparedSendAction(id, "error", "credential_unavailable", "")
-      resumeDeferredCanonicalReconcile()
-      return false
-    }
-    sendCommandRequest = request
-    return true
+    return runActivePreparedSendCommand(operationId, "cancel")
   }
 
   function refreshActivePreparedSend(operationId) {
@@ -2271,50 +2473,13 @@ Item {
       { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
       { key: "balances", path: "/v1/balances", type: "balances" }
     ]
-    var values = ({})
-    var requests = []
-    var pending = specifications.length
-    var failed = false
-
-    function reject(code) {
-      if (failed) return
-      failed = true
-      root.abortRequests(requests)
-      root.sendReconcileRequests = []
+    collectSendResources(specifications, function(values) {
+      root.finishActivePendingReconciliation(operationId, exactOperation,
+        exactMissing, outcomeCode, values)
+    }, function(code) {
       root.finishActivePendingReconciliation(operationId, exactOperation,
         exactMissing, code || outcomeCode || "transport_unavailable", null)
-    }
-
-    for (var index = 0; index < specifications.length; index++) {
-      (function(specification) {
-        var request = root.sendRequest("GET", specification.path, undefined,
-          function(result) {
-            if (failed || requests.indexOf(request) === -1) return
-            if (!result.ok) {
-              reject(result.error.code)
-              return
-            }
-            var valid = specification.type === "balances"
-              ? root.isBalanceCollection(result.value)
-              : root.isOperationCollection(result.value, "send")
-            if (result.status !== 200 || !valid) {
-              reject("invalid_response")
-              return
-            }
-            values[specification.key] = result.value
-            pending--
-            if (pending === 0)
-              root.finishActivePendingReconciliation(operationId, exactOperation,
-                exactMissing, outcomeCode, values)
-          })
-        if (!request) {
-          reject("credential_unavailable")
-          return
-        }
-        requests.push(request)
-      })(specifications[index])
-    }
-    sendReconcileRequests = requests
+    })
   }
 
   function reconcileActivePendingSend(operationId, outcomeCode, fallbackOperation) {
@@ -3237,20 +3402,46 @@ Item {
     var values = []
     var pending = paths.length
     var requests = []
+    var failed = false
+
+    function track(request) {
+      requests.push(request)
+      if (type === "receive") root.receiveRequests = requests
+      else root.sendRequests = requests
+    }
+
+    function current(request) {
+      return !failed && requests.indexOf(request) !== -1
+    }
+
+    function reject(code) {
+      if (failed) return
+      failed = true
+      root.abortRequests(requests)
+      if (type === "receive") root.receiveRequests = []
+      else root.sendRequests = []
+      if (code === "credential_unavailable") {
+        root.handleCredentialUnavailable()
+      } else if (code === "invalid_response") {
+        root.handleContractFailure("invalid_" + type + "_operations",
+          "cocod returned invalid Operation resources")
+      } else {
+        root.handleFetchFailure({
+          status: code === "transport_unavailable" ? 0 : 500,
+          error: { code: code }
+        })
+      }
+    }
+
     for (var i = 0; i < paths.length; i++) {
       (function(index) {
-        var request = root.sendRequest("GET", paths[index], undefined, function(result) {
-          if (requests.indexOf(request) === -1) return
+        root.fetchAllOperationPages(paths[index], type, track, current,
+          function(result) {
           if (!result.ok) {
-            root.handleFetchFailure(result)
+            reject(result.code)
             return
           }
-          if (!root.isOperationCollection(result.value, type)) {
-            root.handleContractFailure("invalid_" + type + "_operations",
-              "cocod returned invalid Operation resources")
-            return
-          }
-          values[index] = result.value.items
+          values[index] = result.items
           pending--
           if (pending === 0) {
             if (type === "receive") {
@@ -3264,15 +3455,12 @@ Item {
             root.refreshCount++
           }
         })
-        if (!request) {
-          root.handleCredentialUnavailable()
-          return
-        }
-        requests.push(request)
       })(i)
     }
-    if (type === "receive") receiveRequests = requests
-    else sendRequests = requests
+    if (!failed) {
+      if (type === "receive") receiveRequests = requests
+      else sendRequests = requests
+    }
   }
 
   function withSendOperation(values, operation) {
@@ -3358,37 +3546,7 @@ Item {
             "cocod returned an invalid Send Operation")
           return
         }
-        var canonical = result.value
-        var refresh = root.sendRequest("POST", "/v1/operations/send/"
-          + encodeURIComponent(id) + "/refresh", undefined, function(refreshResult) {
-            if (root.sendLookupRequestsById[id] !== refresh) return
-            if (!refreshResult.ok) {
-              if (refreshResult.error.code === "operation_not_found")
-                complete(null, true)
-              else complete(canonical)
-              if (String(root.sendOperationId || "") === id)
-                root.failSend(refreshResult.error.code)
-              return
-            }
-            if (refreshResult.status !== 200
-                || !root.isSendOperation(refreshResult.value)) {
-              complete(canonical)
-              root.handleContractFailure("invalid_send_operation",
-                "cocod returned an invalid refreshed Send Operation")
-              return
-            }
-            complete(refreshResult.value)
-          })
-        if (!refresh) {
-          complete(canonical)
-          root.handleCredentialUnavailable()
-          return
-        }
-        var requests = ({})
-        for (var key in root.sendLookupRequestsById)
-          requests[key] = root.sendLookupRequestsById[key]
-        requests[id] = refresh
-        root.sendLookupRequestsById = requests
+        complete(result.value)
       })
     if (!lookup) {
       handleCredentialUnavailable()

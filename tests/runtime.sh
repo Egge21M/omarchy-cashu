@@ -948,6 +948,60 @@ wait_panel_snapshot '.receiveViewState == "closed"
 
 echo "runtime: connection rotation clears sensitive non-Send presentation state"
 
+pagination_payload=$(jq -cn '
+  def send($id; $state; $amount; $updated): {
+    id:$id,type:"send",state:$state,mintUrl:"https://mint.pagination.test",
+    unit:"sat",method:"default",requestedAmount:$amount,fee:"1",
+    inputAmount:$amount,needsSwap:false,
+    createdAt:"2026-08-25T00:00:00.000Z",updatedAt:$updated
+  };
+  [range(0;101) as $index
+    | send("send-page-prepared-" + ($index|tostring); "prepared";
+        (($index + 1)|tostring); "2026-08-25T00:01:00.000Z")]
+    + [send("send-transition-duplicate"; "prepared"; "777";
+        "2026-08-25T00:01:00.000Z")] as $prepared
+  | [range(0;101) as $index
+    | send("send-page-in-flight-" + ($index|tostring); "pending";
+        (($index + 201)|tostring); "2026-08-25T00:02:00.000Z")]
+    + [send("send-transition-duplicate"; "pending"; "999";
+        "2026-08-25T00:03:00.000Z")] as $inFlight
+  | {
+      balances:{items:[{
+        mintUrl:"https://mint.pagination.test",unit:"sat",
+        spendable:"1000000",reserved:"1000",total:"1001000"
+      }]},
+      sendPrepared:{items:$prepared},sendInFlight:{items:$inFlight}
+    }
+')
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary "$pagination_payload" "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '
+  .connectionState == "connected"
+  and (.activeSends | length) == 203
+  and ([.activeSends[].id] | unique | length) == 203
+  and ([.activeSends[].id] | index("send-page-prepared-100") != null)
+  and ([.activeSends[].id] | index("send-page-in-flight-100") != null)
+  and (.activeSends | any(.id == "send-transition-duplicate"
+    and .state == "pending" and .amount == "999"))
+' >/dev/null
+panel_action closePanel >/dev/null || true
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+[[ $(panel_action selectActiveSend send-transition-duplicate) == "ok" ]] \
+  || fail "newest canonical transition duplicate could not be selected"
+wait_panel_snapshot '
+  .selectedActiveSendOperationId == "send-transition-duplicate"
+  and .selectedActiveSend.state == "pending"
+  and .activePendingCopyAvailable == true
+  and .activePreparedConfirmAvailable == false
+' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action closePanel >/dev/null
+
+echo "runtime: paginated Active Sends and newest transition duplicate passed"
+
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "balances":{"items":[
@@ -1439,12 +1493,15 @@ wait_panel_snapshot ".selectedActiveSend.id == \"$retry_pending_id\"
 curl -fsS -X POST -H 'Content-Type: application/json' --data '{
   "sendRefreshUnavailableResponses":10
 }' "$base_url/__test__/mode" >/dev/null
+before_explicit_pending_refresh=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendRefreshRequests')
 [[ $(panel_action refreshActivePendingSend) == "ok" ]] \
   || fail "unavailable exact Pending Refresh did not start"
 wait_panel_snapshot ".selectedActiveSend.id == \"$retry_pending_id\"
   and .selectedActiveSend.state == \"pending\"
   and .activePendingErrorCode == \"refresh_unavailable\"
   and .activePendingReclaimAvailable == true" >/dev/null
+wait_mock_status ".sendRefreshRequests > $before_explicit_pending_refresh" >/dev/null
 
 curl -fsS -X POST -H 'Content-Type: application/json' --data '{
   "sendReclaimOutcome":"operation_conflict","sendCommandDelayMs":300,
@@ -2528,7 +2585,7 @@ for _duplicate in 1 2; do
     "$base_url/__test__/resources" >/dev/null
 done
 wait_mock_status ".sendLookupRequests > $before_send_lookup
-  and .sendRefreshRequests > $before_send_refresh
+  and .sendRefreshRequests == $before_send_refresh
   and .resourceRequests.balances > $before_send_balance
   and .sendCreateRequests == $before_send_invalidation_creates
   and .sendExecuteRequests == $before_send_invalidation_executes" >/dev/null
@@ -2541,7 +2598,7 @@ jq -cn '{event:{
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
 wait_mock_status ".sendLookupRequests > $after_operation_lookup
-  and .sendRefreshRequests > $after_operation_refresh" >/dev/null
+  and .sendRefreshRequests == $after_operation_refresh" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "$(jq -cn --arg id "$invalidated_send_id" \
     '{operationId:$id,suppressEvents:true}')" \
@@ -2572,12 +2629,20 @@ wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendReclaimOutcome":"reclaim_inconclusive"}' \
   "$base_url/__test__/mode" >/dev/null
+before_inconclusive_reclaims=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendReclaimRequests')
+inconclusive_reclaim_id=$(panel_call | jq -er '.sendOperationId')
 panel_action beginReclaimSend >/dev/null
-wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
-panel_action confirmReclaimSend >/dev/null
+wait_panel_snapshot '.sendViewState == "reclaim-warning"
+  and .sendReclaimAvailable == true' >/dev/null
+[[ $(panel_action confirmReclaimSend) == "ok" ]] \
+  || fail "inconclusive Pending Send Reclaim confirmation was unavailable"
+wait_mock_status ".sendReclaimRequests > $before_inconclusive_reclaims
+  and .sendReclaimOperationIds[-1] == \"$inconclusive_reclaim_id\"" >/dev/null
 wait_panel_snapshot '.sendViewState == "error"
   and .sendErrorCode == "coco_error"
   and .sendError != ""
+  and .sendOperationId == "'$inconclusive_reclaim_id'"
   and .sendCopyAvailable == false
   and .activeTransferStateLabel == "Pending Send"
   and .spendableBalance == "30"
@@ -2614,6 +2679,11 @@ wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true
   and .sendReclaimAvailable == true' >/dev/null
 pending_unavailable_id=$(curl -fsS -H "Authorization: Bearer $credential" \
   "$base_url/v1/operations/send/in-flight" | jq -er '.items[0].id')
+before_pending_hint=$(curl -fsS "$base_url/__test__/status")
+before_pending_hint_lookup=$(jq -r '.sendLookupRequests' <<<"$before_pending_hint")
+before_pending_hint_refresh=$(jq -r '.sendRefreshRequests' <<<"$before_pending_hint")
+before_pending_hint_balance=$(jq -r '.resourceRequests.balances' \
+  <<<"$before_pending_hint")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendRefreshError":"mint_unavailable"}' \
   "$base_url/__test__/mode" >/dev/null
@@ -2622,14 +2692,17 @@ jq -cn --arg id "$pending_unavailable_id" '{event:{
   data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
-wait_panel_snapshot '.sendViewState == "error"
-  and .sendErrorCode == "coco_error"
-  and .sendCopyAvailable == false
-  and .activeTransferStateLabel == "Pending Send"
-  and .spendableBalance == "30"
-  and .reservedBalance == "70"' >/dev/null
-panel_action retrySend >/dev/null
-wait_panel_snapshot '.sendViewState == "result" and .sendCopyAvailable == true' >/dev/null
+wait_mock_status ".sendLookupRequests > $before_pending_hint_lookup
+  and .sendRefreshRequests == $before_pending_hint_refresh
+  and .resourceRequests.balances > $before_pending_hint_balance" >/dev/null
+wait_panel_snapshot ".sendViewState == \"result\"
+  and .sendOperationId == \"$pending_unavailable_id\"
+  and .sendCopyAvailable == true
+  and .activeTransferStateLabel == \"Pending Send\"
+  and .spendableBalance == \"30\"
+  and .reservedBalance == \"70\"" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendRefreshError":""}' "$base_url/__test__/mode" >/dev/null
 panel_action beginReclaimSend >/dev/null
 wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
 panel_action confirmReclaimSend >/dev/null
@@ -2733,7 +2806,7 @@ wait_snapshot "
 " >/dev/null
 wait_mock_status \
   ".sendLookupRequests > $before_send_lookup
-   and .sendRefreshRequests > $before_send_refresh
+   and .sendRefreshRequests == $before_send_refresh
    and .resourceRequests.balances > $before_send_balance
    and .resourceRequests.receivePrepared == $before_receive_prepared" >/dev/null
 curl -fsS -H "Authorization: Bearer $credential" -X POST \

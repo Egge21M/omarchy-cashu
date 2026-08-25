@@ -1510,12 +1510,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, mint)
             return
-        if self.path in COLLECTION_PATHS:
+        if request_url.path in COLLECTION_PATHS:
             if not self.wallet_required():
                 return
-            name = COLLECTION_PATHS[self.path]
+            name = COLLECTION_PATHS[request_url.path]
             with self.state.lock:
                 value = copy.deepcopy(self.state.resources[name])
+            if name in (
+                "receivePrepared",
+                "receiveInFlight",
+                "sendPrepared",
+                "sendInFlight",
+            ):
+                query = parse_qs(request_url.query)
+                try:
+                    offset = int(query.get("offset", ["0"])[0])
+                    limit = int(query.get("limit", ["20"])[0])
+                except (TypeError, ValueError):
+                    self.send_json(
+                        400,
+                        error_document("invalid_request", "Invalid pagination"),
+                    )
+                    return
+                if offset < 0 or limit < 1 or limit > 100:
+                    self.send_json(
+                        400,
+                        error_document("invalid_request", "Invalid pagination"),
+                    )
+                    return
+                items = value.get("items", [])
+                value = {
+                    "items": items[offset : offset + limit],
+                    "offset": offset,
+                    "limit": limit,
+                }
             self.resource_response(name, value)
             return
         match = re.fullmatch(r"/v1/operations/send/([^/]+)/result", self.path)
