@@ -72,7 +72,7 @@ An inbound Ecash Transfer in which the Wallet accepts and redeems an encoded Cas
 _Avoid_: Mint, deposit
 
 **Prepared Receive**:
-A Receive that has been previewed and approved but whose encoded Cashu token has not yet been redeemed. A Prepared Receive can be confirmed or cancelled.
+A Receive from a previously Trusted Mint whose encoded Cashu token has been validated but not yet redeemed. A Prepared Receive can be confirmed or cancelled.
 _Avoid_: Pending Receive, completed Receive
 
 **Send**:

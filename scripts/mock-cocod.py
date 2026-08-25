@@ -15,21 +15,20 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 RECOVERY_PHRASE = (
     "abandon abandon abandon abandon abandon abandon abandon abandon "
     "abandon abandon abandon about"
 )
-FIXED_TIME = "2026-08-20T12:00:00Z"
+FIXED_TIME = "2026-08-20T12:00:00.000Z"
 OPENAPI_PATHS = [
     "/v1/openapi.json",
     "/v1/status",
     "/v1/balances",
     "/v1/events",
     "/v1/mints",
-    "/v1/token-previews",
     "/v1/operations/receive",
     "/v1/operations/receive/{operationId}",
     "/v1/operations/receive/prepared",
@@ -37,7 +36,6 @@ OPENAPI_PATHS = [
     "/v1/operations/receive/{operationId}/execute",
     "/v1/operations/receive/{operationId}/cancel",
     "/v1/operations/receive/{operationId}/refresh",
-    "/v1/operations/send/max",
     "/v1/operations/send",
     "/v1/operations/send/{operationId}",
     "/v1/operations/send/prepared",
@@ -70,49 +68,49 @@ RECEIVE_TOKENS: dict[str, dict[str, str]] = {
         "unit": "sat",
         "amount": "1200",
         "fee": "2",
-        "netAmount": "1198",
+        "creditedAmount": "1198",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jYW5jZWwifQ": {
         "mintUrl": RECEIVE_MINT,
         "unit": "sat",
         "amount": "400",
         "fee": "1",
-        "netAmount": "399",
+        "creditedAmount": "399",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1wZW5kaW5nIn0": {
         "mintUrl": RECEIVE_MINT,
         "unit": "sat",
         "amount": "250",
         "fee": "1",
-        "netAmount": "249",
+        "creditedAmount": "249",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1yb3RhdGlvbiJ9": {
         "mintUrl": "https://mint.one",
         "unit": "sat",
         "amount": "80",
         "fee": "1",
-        "netAmount": "79",
+        "creditedAmount": "79",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNi1jb25jdXJyZW50In0": {
         "mintUrl": RECEIVE_MINT,
         "unit": "sat",
         "amount": "350",
         "fee": "1",
-        "netAmount": "349",
+        "creditedAmount": "349",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC11c2QifQ": {
         "mintUrl": RECEIVE_MINT,
         "unit": "usd",
         "amount": "12",
         "fee": "1",
-        "netAmount": "11",
+        "creditedAmount": "11",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1taW50LWRvd24ifQ": {
         "mintUrl": RECEIVE_MINT,
         "unit": "sat",
         "amount": "600",
         "fee": "1",
-        "netAmount": "599",
+        "creditedAmount": "599",
         "previewError": "mint_unavailable",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1zcGVudCJ9": {
@@ -120,7 +118,7 @@ RECEIVE_TOKENS: dict[str, dict[str, str]] = {
         "unit": "sat",
         "amount": "500",
         "fee": "1",
-        "netAmount": "499",
+        "creditedAmount": "499",
         "createError": "token_already_spent",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jb25mbGljdCJ9": {
@@ -128,7 +126,7 @@ RECEIVE_TOKENS: dict[str, dict[str, str]] = {
         "unit": "sat",
         "amount": "700",
         "fee": "1",
-        "netAmount": "699",
+        "creditedAmount": "699",
         "createError": "operation_conflict",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtcmVnaXN0ZXJlZCJ9": {
@@ -136,28 +134,44 @@ RECEIVE_TOKENS: dict[str, dict[str, str]] = {
         "unit": "sat",
         "amount": "800",
         "fee": "1",
-        "netAmount": "799",
+        "creditedAmount": "799",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtdHJ1c3RlZCJ9": {
         "mintUrl": TRUST_RACE_MINT,
         "unit": "sat",
         "amount": "900",
         "fee": "1",
-        "netAmount": "899",
+        "creditedAmount": "899",
     },
     "cashuAeyJ0ZXN0Ijoic2xpY2UtNC1ub3QtZm91bmQifQ": {
         "mintUrl": RECEIVE_MINT,
         "unit": "sat",
         "amount": "1000",
         "fee": "1",
-        "netAmount": "999",
-        "executeError": "operation_not_found",
+        "creditedAmount": "999",
+        "executeError": "not_found",
     },
 }
 
 
 def error_document(code: str, message: str, retryable: bool = False) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "retryable": retryable}}
+
+
+def operation_error(
+    code: str, message: str, retryable: bool = False
+) -> tuple[int, dict[str, Any]]:
+    if code in ("operation_not_found", "not_found"):
+        return 404, error_document("not_found", message)
+    if code in ("operation_conflict", "invalid_operation_state"):
+        return 409, error_document("invalid_operation_state", message)
+    if code == "operation_in_progress":
+        return 409, error_document("operation_in_progress", message, True)
+    if code in ("result_not_available", "operation_result_not_available"):
+        return 409, error_document(
+            "operation_result_not_available", message, retryable
+        )
+    return 500, error_document("coco_error", message)
 
 
 class MockState:
@@ -192,7 +206,6 @@ class MockState:
         self.recovery_material_requests = 0
         self.recovery_material_responses = 0
         self.recovery_delay_ms = 0
-        self.token_preview_requests = 0
         self.mint_registration_requests = 0
         self.mint_trust_requests = 0
         self.receive_delay_ms = 0
@@ -204,15 +217,17 @@ class MockState:
         self.receive_lookup_responses = 0
         self.receive_lookup_requests_active = 0
         self.receive_lookup_delay_ms = 0
+        self.receive_prepared_failures = 0
+        self.receive_prepare_reconcile_failures = 0
         self.receive_operation_sequence = 0
         self.receive_operations: dict[str, dict[str, Any]] = {}
         self.receive_token_keys: dict[str, str] = {}
         self.receive_command_errors: dict[str, str] = {}
         self.receive_recovery_outcomes: dict[str, str] = {}
         self.receive_interruption = "none"
+        self.receive_create_interruption = "none"
+        self.receive_create_dropped_responses = 0
         self.receive_refresh_error = ""
-        self.send_max_requests = 0
-        self.send_max_override: dict[str, Any] | None = None
         self.send_create_requests = 0
         self.send_create_delay_ms = 0
         self.send_execute_requests = 0
@@ -492,37 +507,6 @@ class MockState:
         if delay_ms > 0:
             time.sleep(delay_ms / 1000)
 
-    def token_preview(self, value: object) -> tuple[int, dict[str, Any]]:
-        token = value.get("token") if isinstance(value, dict) else None
-        accepted_units = value.get("acceptedUnits") if isinstance(value, dict) else None
-        with self.lock:
-            self.token_preview_requests += 1
-            details = copy.deepcopy(RECEIVE_TOKENS.get(token)) if isinstance(token, str) else None
-            mints = copy.deepcopy(self.resources["mints"]["items"])
-        if details is None:
-            return 422, error_document("invalid_token", "The Cashu token is invalid")
-        if details.get("previewError") == "mint_unavailable":
-            return 503, error_document("mint_unavailable", "The Mint is unavailable", True)
-        if accepted_units is not None and (
-            not isinstance(accepted_units, list)
-            or details["unit"] not in accepted_units
-        ):
-            return 422, error_document("unsupported_unit", "The token unit is not accepted")
-        if details["unit"] != "sat":
-            return 422, error_document("unsupported_unit", "The token unit is not supported")
-        trusted = any(
-            mint.get("mintUrl") == details["mintUrl"] and mint.get("trusted") is True
-            for mint in mints
-        )
-        return 200, {
-            "mintUrl": details["mintUrl"],
-            "unit": details["unit"],
-            "amount": details["amount"],
-            "fee": details["fee"],
-            "netAmount": details["netAmount"],
-            "trusted": trusted,
-        }
-
     def register_mint(self, value: object) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
         mint_url = value.get("mintUrl") if isinstance(value, dict) else None
         if not isinstance(mint_url, str) or not re.fullmatch(r"https?://[^\s/]+(?:/[^\s]*)?", mint_url):
@@ -557,7 +541,7 @@ class MockState:
                     for mint in self.resources["mints"]["items"]
                     if mint.get("mintUrl") != mint_url
                 ]
-                return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+                return 500, error_document("coco_error", "Coco could not trust the Mint"), []
             for mint in self.resources["mints"]["items"]:
                 if mint.get("mintUrl") != mint_url:
                     continue
@@ -569,47 +553,9 @@ class MockState:
                 self._persist_locked()
                 break
             else:
-                return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+                return 500, error_document("coco_error", "Coco could not trust the Mint"), []
         event = self.safe_event("mint.updated", {"mintUrl": mint_url})
         return 200, result, [event]
-
-    def send_max(self, mint_url: object, unit: object) -> tuple[int, dict[str, Any]]:
-        with self.lock:
-            self.send_max_requests += 1
-            mints = copy.deepcopy(self.resources["mints"]["items"])
-            balances = copy.deepcopy(self.resources["balances"]["items"])
-            override = copy.deepcopy(self.send_max_override)
-        if not isinstance(mint_url, str) or not mint_url:
-            return 400, error_document("invalid_request", "A Mint URL is required")
-        if unit != "sat":
-            return 422, error_document("unsupported_unit", "Only sat is supported")
-        mint = next((item for item in mints if item.get("mintUrl") == mint_url), None)
-        if mint is None:
-            return 404, error_document("mint_not_registered", "The Mint is not registered")
-        if mint.get("trusted") is not True:
-            return 409, error_document("mint_not_trusted", "The Mint is not trusted")
-        balance = next(
-            (
-                item
-                for item in balances
-                if item.get("mintUrl") == mint_url and item.get("unit") == "sat"
-            ),
-            None,
-        )
-        spendable = str(balance.get("spendable", "0")) if balance else "0"
-        maximum = override or {
-            "maxAmount": spendable,
-            "fee": "0",
-            "needsSwap": False,
-        }
-        return 200, {
-            "mintUrl": mint_url,
-            "unit": "sat",
-            "spendable": spendable,
-            "maxAmount": maximum["maxAmount"],
-            "fee": maximum["fee"],
-            "needsSwap": maximum["needsSwap"],
-        }
 
     def send_operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -626,22 +572,20 @@ class MockState:
             self.send_result_requests += 1
             operation = self.send_operations.get(operation_id)
             if operation is None:
-                return 404, error_document(
-                    "operation_not_found", "The Send does not exist"
-                )
+                return operation_error("not_found", "The Send does not exist")
             if self.send_result_unavailable_responses > 0:
                 self.send_result_unavailable_responses -= 1
-                return 409, error_document(
-                    "result_not_available",
+                return operation_error(
+                    "operation_result_not_available",
                     "The Send result is not available yet",
-                    True,
+                    operation["state"] == "executing",
                 )
             token = self.send_results.get(operation_id)
             if token is None:
-                return 409, error_document(
-                    "result_not_available",
+                return operation_error(
+                    "operation_result_not_available",
                     "The Send result is not available yet",
-                    True,
+                    operation["state"] == "executing",
                 )
             return 200, {"token": token}
 
@@ -657,24 +601,28 @@ class MockState:
         if not isinstance(mint_url, str) or not mint_url:
             return 400, error_document("invalid_request", "A Mint URL is required"), []
         if unit != "sat":
-            return 422, error_document("unsupported_unit", "Only sat is supported"), []
+            return 400, error_document("invalid_request", "Only sat is supported"), []
         if not isinstance(amount, str) or not re.fullmatch(r"[1-9][0-9]*", amount):
             return 400, error_document("invalid_request", "A positive decimal amount is required"), []
         mint = next((item for item in mints if item.get("mintUrl") == mint_url), None)
         if mint is None:
-            return 404, error_document("mint_not_registered", "The Mint is not registered"), []
+            status, response = operation_error(
+                "coco_error", "Coco could not prepare the Send Operation"
+            )
+            return status, response, []
         if mint.get("trusted") is not True:
-            return 409, error_document("mint_not_trusted", "The Mint is not trusted"), []
+            status, response = operation_error(
+                "coco_error", "Coco could not prepare the Send Operation"
+            )
+            return status, response, []
         with self.lock:
             forced_error = self.send_create_error
             self.send_create_error = ""
             if forced_error:
-                status = 503 if forced_error == "mint_unavailable" else 409
-                return status, error_document(
-                    forced_error,
-                    "The Send could not be prepared",
-                    forced_error == "mint_unavailable",
-                ), []
+                status, response = operation_error(
+                    forced_error, "Coco could not prepare the Send Operation"
+                )
+                return status, response, []
             if self.send_create_empty_id:
                 self.send_create_empty_id = False
                 return 201, {
@@ -683,7 +631,8 @@ class MockState:
                     "state": "prepared",
                     "mintUrl": mint_url,
                     "unit": "sat",
-                    "amount": amount,
+                    "method": "default",
+                    "requestedAmount": amount,
                     "fee": "0",
                     "inputAmount": amount,
                     "needsSwap": False,
@@ -703,9 +652,10 @@ class MockState:
             exact_match = requested == spendable
             input_amount = requested if exact_match else requested + 10
             if balance is None or input_amount > spendable:
-                return 409, error_document(
-                    "insufficient_balance", "The Mint balance cannot fund this Send"
-                ), []
+                status, response = operation_error(
+                    "coco_error", "Coco could not prepare the Send Operation"
+                )
+                return status, response, []
             self.send_operation_sequence += 1
             operation_id = f"send-{self.send_operation_sequence}"
             operation = {
@@ -714,7 +664,8 @@ class MockState:
                 "state": "prepared",
                 "mintUrl": mint_url,
                 "unit": "sat",
-                "amount": amount,
+                "method": "default",
+                "requestedAmount": amount,
                 "fee": "0" if exact_match else "2",
                 "inputAmount": str(input_amount),
                 "needsSwap": not exact_match,
@@ -757,16 +708,21 @@ class MockState:
                 self.send_reclaim_requests += 1
             operation = self.send_operations.get(operation_id)
             if operation is None:
-                return 404, error_document("operation_not_found", "The Send does not exist"), []
+                status, response = operation_error(
+                    "not_found", "The Send does not exist"
+                )
+                return status, response, []
             if command == "reclaim" and operation["state"] == "finalized":
-                return 409, error_document(
-                    "recipient_won", "The recipient redeemed the Send first"
-                ), []
+                status, response = operation_error(
+                    "invalid_operation_state", "The Send is already finalized"
+                )
+                return status, response, []
             expected_state = "pending" if command == "reclaim" else "prepared"
             if operation["state"] != expected_state:
-                return 409, error_document(
-                    "operation_conflict", f"The Send is not {expected_state}"
-                ), []
+                status, response = operation_error(
+                    "invalid_operation_state", f"The Send is not {expected_state}"
+                )
+                return status, response, []
             forced_error = (
                 self.send_command_error
                 if command == "execute"
@@ -775,9 +731,10 @@ class MockState:
             if command == "execute":
                 self.send_command_error = ""
             if forced_error == "operation_conflict":
-                return 409, error_document(
-                    "operation_conflict", "The Send changed before execution"
-                ), []
+                status, response = operation_error(
+                    "invalid_operation_state", "The Send changed before execution"
+                )
+                return status, response, []
             if forced_error == "operation_not_found":
                 self.resources["sendPrepared"]["items"] = [
                     item
@@ -802,22 +759,23 @@ class MockState:
                     )
                 del self.send_operations[operation_id]
                 self._persist_locked()
-                return 404, error_document(
-                    "operation_not_found", "The Send does not exist"
-                ), []
+                status, response = operation_error(
+                    "not_found", "The Send does not exist"
+                )
+                return status, response, []
             if command == "reclaim":
                 reclaim_outcome = self.send_reclaim_outcome
                 self.send_reclaim_outcome = "success"
                 if reclaim_outcome == "reclaim_inconclusive":
-                    return 503, error_document(
-                        "reclaim_inconclusive",
-                        "The Mint could not establish whether Reclaim succeeded",
-                        True,
-                    ), []
+                    status, response = operation_error(
+                        "coco_error", "Coco could not reclaim the Send Operation"
+                    )
+                    return status, response, []
                 if reclaim_outcome == "operation_conflict":
-                    return 409, error_document(
-                        "operation_conflict", "The Send changed before Reclaim"
-                    ), []
+                    status, response = operation_error(
+                        "invalid_operation_state", "The Send changed before Reclaim"
+                    )
+                    return status, response, []
                 if reclaim_outcome == "operation_not_found":
                     self.resources["sendInFlight"]["items"] = [
                         item
@@ -847,9 +805,10 @@ class MockState:
                     self.send_operations.pop(operation_id, None)
                     self.send_results.pop(operation_id, None)
                     self._persist_locked()
-                    return 404, error_document(
-                        "operation_not_found", "The Send does not exist"
-                    ), []
+                    status, response = operation_error(
+                        "not_found", "The Send does not exist"
+                    )
+                    return status, response, []
             collection = "sendInFlight" if command == "reclaim" else "sendPrepared"
             self.resources[collection]["items"] = [
                 item
@@ -888,9 +847,10 @@ class MockState:
                     self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]})
                 )
                 self._persist_locked()
-                return 409, error_document(
-                    "recipient_won", "The recipient redeemed the Send first"
-                ), events
+                status, response = operation_error(
+                    "coco_error", "Coco could not reclaim the Send Operation"
+                )
+                return status, response, events
             if command in ("cancel", "reclaim"):
                 operation["state"] = "rolled_back"
                 if balance is not None:
@@ -930,18 +890,17 @@ class MockState:
             self.send_refresh_requests += 1
             operation = self.send_operations.get(operation_id)
             if operation is None:
-                return 404, error_document(
-                    "operation_not_found", "The Send does not exist"
-                ), []
+                status, response = operation_error(
+                    "not_found", "The Send does not exist"
+                )
+                return status, response, []
             forced_error = self.send_refresh_error
             self.send_refresh_error = ""
             if forced_error:
-                status = 503 if forced_error == "mint_unavailable" else 409
-                return status, error_document(
-                    forced_error,
-                    "The Send could not be refreshed",
-                    forced_error == "mint_unavailable",
-                ), []
+                status, response = operation_error(
+                    forced_error, "Coco could not reconcile the Send Operation"
+                )
+                return status, response, []
             result = copy.deepcopy(operation)
         event = self.safe_event(
             "operation.updated",
@@ -964,11 +923,11 @@ class MockState:
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 return 404, error_document(
-                    "operation_not_found", "The Send does not exist"
+                    "not_found", "The Send does not exist"
                 ), []
             if operation["state"] != "pending":
                 return 409, error_document(
-                    "operation_conflict", "The Send is not pending"
+                    "invalid_operation_state", "The Send is not pending"
                 ), []
             operation["state"] = "finalized"
             operation["updatedAt"] = FIXED_TIME
@@ -1019,7 +978,7 @@ class MockState:
             operation = self.send_operations.pop(operation_id, None)
             if operation is None:
                 return 404, error_document(
-                    "operation_not_found", "The Send does not exist"
+                    "not_found", "The Send does not exist"
                 ), []
             self.resources["sendPrepared"]["items"] = [
                 item
@@ -1067,13 +1026,21 @@ class MockState:
             self.receive_lookup_requests_active += 1
             delay_ms = self.receive_lookup_delay_ms
             operation = self.receive_operations.get(operation_id)
-            result = copy.deepcopy(operation) if operation else None
+            result = self.safe_receive_operation(operation) if operation else None
         if delay_ms > 0:
             time.sleep(delay_ms / 1000)
         with self.lock:
             self.receive_lookup_requests_active -= 1
             self.receive_lookup_responses += 1
         return result
+
+    @staticmethod
+    def safe_receive_operation(operation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: copy.deepcopy(value)
+            for key, value in operation.items()
+            if key != "creditedAmount"
+        }
 
     def create_receive(
         self, value: object
@@ -1084,28 +1051,28 @@ class MockState:
             self.receive_create_requests += 1
             mints = copy.deepcopy(self.resources["mints"]["items"])
         if details is None:
-            return 422, error_document("invalid_token", "The Cashu token is invalid"), []
-        if details["unit"] != "sat":
-            return 422, error_document("unsupported_unit", "The token unit is not supported"), []
+            return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
+        if details.get("previewError"):
+            return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
         known = next((mint for mint in mints if mint.get("mintUrl") == details["mintUrl"]), None)
         if known is None:
-            return 409, error_document("mint_not_registered", "The Mint is not registered"), []
+            return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
         if known.get("trusted") is not True:
-            return 409, error_document("mint_not_trusted", "The Mint is not trusted"), []
+            return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
         create_error = details.get("createError")
         if create_error:
-            return 409, error_document(create_error, "The Receive cannot be prepared"), []
+            return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
         token_key = hashlib.sha256(token.encode()).hexdigest()
         with self.lock:
             if token_key in self.spent_receive_token_keys:
-                return 409, error_document("token_already_spent", "The token is already spent"), []
+                return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
             for operation_id, existing_key in self.receive_token_keys.items():
                 if existing_key == token_key and self.receive_operations[operation_id]["state"] in (
                     "init",
                     "prepared",
                     "executing",
                 ):
-                    return 409, error_document("operation_conflict", "A Receive already exists"), []
+                    return 500, error_document("coco_error", "Coco could not prepare the Receive Operation"), []
             self.receive_operation_sequence += 1
             operation_id = f"receive-{self.receive_operation_sequence}"
             operation = {
@@ -1116,7 +1083,7 @@ class MockState:
                 "unit": details["unit"],
                 "amount": details["amount"],
                 "fee": details["fee"],
-                "netAmount": details["netAmount"],
+                "creditedAmount": details["creditedAmount"],
                 "createdAt": FIXED_TIME,
                 "updatedAt": FIXED_TIME,
             }
@@ -1124,13 +1091,23 @@ class MockState:
             self.receive_token_keys[operation_id] = token_key
             if "executeError" in details:
                 self.receive_command_errors[operation_id] = details["executeError"]
-            self.resources["receivePrepared"]["items"].append(copy.deepcopy(operation))
+            safe_operation = self.safe_receive_operation(operation)
+            self.resources["receivePrepared"]["items"].append(safe_operation)
             self._persist_locked()
         event = self.safe_event(
             "operation.updated",
             {"operationType": "receive", "operationId": operation_id, "mintUrl": details["mintUrl"]},
         )
-        return 201, copy.deepcopy(operation), [event]
+        with self.lock:
+            interruption = self.receive_create_interruption
+            self.receive_create_interruption = "none"
+            if interruption in ("after_commit", "malformed_after_commit"):
+                self.receive_create_dropped_responses += 1
+        if interruption == "after_commit":
+            return 0, {}, []
+        if interruption == "malformed_after_commit":
+            return 201, {"id": "", "type": "receive", "state": "prepared"}, []
+        return 201, self.safe_receive_operation(operation), [event]
 
     def command_receive(
         self, operation_id: str, command: str
@@ -1142,9 +1119,9 @@ class MockState:
                 self.receive_cancel_requests += 1
             operation = self.receive_operations.get(operation_id)
             if operation is None:
-                return 404, error_document("operation_not_found", "The Receive does not exist"), []
+                return 404, error_document("not_found", "The Receive does not exist"), []
             if operation["state"] != "prepared":
-                return 409, error_document("operation_conflict", "The Receive is not prepared"), []
+                return 409, error_document("invalid_operation_state", "The Receive is not prepared"), []
             command_error = self.receive_command_errors.get(operation_id) if command == "execute" else None
             if command_error:
                 self.resources["receivePrepared"]["items"] = [
@@ -1156,7 +1133,7 @@ class MockState:
                 self.receive_token_keys.pop(operation_id, None)
                 self.receive_command_errors.pop(operation_id, None)
                 self._persist_locked()
-                return 404, error_document(command_error, "The Receive does not exist"), []
+                return 404, error_document("not_found", "The Receive does not exist"), []
             if command == "execute" and self.receive_interruption in (
                 "before_commit",
                 "after_commit",
@@ -1169,7 +1146,7 @@ class MockState:
                     if item.get("id") != operation_id
                 ]
                 self.resources["receiveInFlight"]["items"].append(
-                    copy.deepcopy(operation)
+                    self.safe_receive_operation(operation)
                 )
                 outcome = (
                     "finalized"
@@ -1216,7 +1193,7 @@ class MockState:
                 events.append(
                     self.safe_event("balance.updated", {"mintUrl": operation["mintUrl"]})
                 )
-            result = copy.deepcopy(operation)
+            result = self.safe_receive_operation(operation)
             self._persist_locked()
         return 200, result, events
 
@@ -1241,7 +1218,7 @@ class MockState:
             }
             balances.append(balance)
         balance["spendable"] = str(
-            int(balance["spendable"]) + int(operation["netAmount"])
+            int(balance["spendable"]) + int(operation["creditedAmount"])
         )
         balance["total"] = str(int(balance["spendable"]) + int(balance["reserved"]))
 
@@ -1252,17 +1229,13 @@ class MockState:
             self.receive_refresh_requests += 1
             operation = self.receive_operations.get(operation_id)
             if operation is None:
-                return 404, error_document(
-                    "operation_not_found", "The Receive does not exist"
-                ), []
+                return 404, error_document("not_found", "The Receive does not exist"), []
             if self.receive_refresh_error:
                 code = self.receive_refresh_error
-                status = 503 if code == "mint_unavailable" else 409
-                return status, error_document(
-                    code,
-                    "The Receive could not be refreshed",
-                    code == "mint_unavailable",
-                ), []
+                status, response = operation_error(
+                    code, "Coco could not reconcile the Receive Operation"
+                )
+                return status, response, []
             outcome = self.receive_recovery_outcomes.get(operation_id)
             if operation["state"] == "executing" and outcome:
                 operation["state"] = outcome
@@ -1274,7 +1247,7 @@ class MockState:
                 ]
                 self.receive_recovery_outcomes.pop(operation_id, None)
                 self._persist_locked()
-            result = copy.deepcopy(operation)
+            result = self.safe_receive_operation(operation)
         event = self.safe_event(
             "operation.updated",
             {
@@ -1302,11 +1275,11 @@ class MockState:
                 "recoveryMaterialRequests": self.recovery_material_requests,
                 "recoveryMaterialResponses": self.recovery_material_responses,
                 "recoveryDelayMs": self.recovery_delay_ms,
-                "tokenPreviewRequests": self.token_preview_requests,
                 "mintRegistrationRequests": self.mint_registration_requests,
                 "mintTrustRequests": self.mint_trust_requests,
                 "receiveDelayMs": self.receive_delay_ms,
                 "receiveCreateRequests": self.receive_create_requests,
+                "receiveCreateDroppedResponses": self.receive_create_dropped_responses,
                 "receiveExecuteRequests": self.receive_execute_requests,
                 "receiveCancelRequests": self.receive_cancel_requests,
                 "receiveRefreshRequests": self.receive_refresh_requests,
@@ -1314,8 +1287,8 @@ class MockState:
                 "receiveLookupResponses": self.receive_lookup_responses,
                 "receiveLookupRequestsActive": self.receive_lookup_requests_active,
                 "receiveLookupDelayMs": self.receive_lookup_delay_ms,
+                "receivePrepareReconcileFailures": self.receive_prepare_reconcile_failures,
                 "receiveOperationCount": len(self.receive_operations),
-                "sendMaxRequests": self.send_max_requests,
                 "sendCreateRequests": self.send_create_requests,
                 "sendCreateDelayMs": self.send_create_delay_ms,
                 "sendExecuteRequests": self.send_execute_requests,
@@ -1384,20 +1357,26 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(delay_ms / 1000)
         self.state.finish_resource()
         with self.state.lock:
+            forced_receive_failure = name == "receivePrepared" and (
+                self.state.receive_prepared_failures > 0
+            )
+            if forced_receive_failure:
+                self.state.receive_prepared_failures -= 1
+                self.state.receive_prepare_reconcile_failures += 1
             forced_send_failure = name == "sendPrepared" and (
                 self.state.send_prepared_failures > 0
             )
             if forced_send_failure:
                 self.state.send_prepared_failures -= 1
-        if forced_send_failure:
+        if forced_receive_failure or forced_send_failure:
             self.send_json(
-                503,
-                error_document("temporarily_unavailable", "Resource unavailable", True),
+                500,
+                error_document("internal_error", "Resource unavailable"),
             )
         elif mode == "unavailable":
             self.send_json(
-                503,
-                error_document("temporarily_unavailable", "Resource unavailable", True),
+                500,
+                error_document("internal_error", "Resource unavailable"),
             )
         elif mode == "invalid":
             self.send_invalid_json()
@@ -1437,15 +1416,6 @@ class Handler(BaseHTTPRequestHandler):
             self.resource_response("status", status)
             return
         request_url = urlsplit(self.path)
-        if request_url.path == "/v1/operations/send/max":
-            if not self.wallet_required():
-                return
-            query = parse_qs(request_url.query)
-            status, response = self.state.send_max(
-                query.get("mintUrl", [None])[0], query.get("unit", [None])[0]
-            )
-            self.send_json(status, response)
-            return
         if request_url.path == "/v1/mints/info":
             if not self.wallet_required():
                 return
@@ -1468,7 +1438,7 @@ class Handler(BaseHTTPRequestHandler):
             if mint is None:
                 self.send_json(
                     404,
-                    error_document("mint_not_registered", "The Mint is not registered"),
+                    error_document("not_found", "The Mint is not registered"),
                 )
                 return
             self.send_json(200, mint)
@@ -1496,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
             if operation is None:
                 self.send_json(
                     404,
-                    error_document("operation_not_found", "The Receive does not exist"),
+                    error_document("not_found", "The Receive does not exist"),
                 )
                 return
             self.send_json(200, operation)
@@ -1509,7 +1479,7 @@ class Handler(BaseHTTPRequestHandler):
             if operation is None:
                 self.send_json(
                     404,
-                    error_document("operation_not_found", "The Send does not exist"),
+                    error_document("not_found", "The Send does not exist"),
                 )
                 return
             self.send_json(200, operation)
@@ -1629,6 +1599,24 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.receive_interruption = interruption
+                if "receiveCreateInterruption" in value:
+                    interruption = str(value["receiveCreateInterruption"])
+                    if interruption not in (
+                        "none",
+                        "after_commit",
+                        "malformed_after_commit",
+                    ):
+                        self.send_json(
+                            400,
+                            error_document(
+                                "invalid_request",
+                                "Invalid Receive create interruption",
+                            ),
+                        )
+                        return
+                    self.state.receive_create_interruption = interruption
+                if value.get("receivePrepareReconcileError") is True:
+                    self.state.receive_prepared_failures = 1
                 if "receiveRefreshError" in value:
                     refresh_error = str(value["receiveRefreshError"])
                     if refresh_error not in (
@@ -1678,23 +1666,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.state.send_create_interruption = interruption
                     if interruption in ("after_commit", "malformed_after_commit"):
                         self.state.suppress_next_send_events = True
-                if "sendMaxOverride" in value:
-                    override = value["sendMaxOverride"]
-                    if override is not None and (
-                        not isinstance(override, dict)
-                        or not isinstance(override.get("maxAmount"), str)
-                        or re.fullmatch(r"(0|[1-9][0-9]*)", override["maxAmount"])
-                        is None
-                        or not isinstance(override.get("fee"), str)
-                        or re.fullmatch(r"(0|[1-9][0-9]*)", override["fee"]) is None
-                        or not isinstance(override.get("needsSwap"), bool)
-                    ):
-                        self.send_json(
-                            400,
-                            error_document("invalid_request", "Invalid Send Max override"),
-                        )
-                        return
-                    self.state.send_max_override = copy.deepcopy(override)
                 if "sendCommandError" in value:
                     command_error = str(value["sendCommandError"])
                     if command_error not in (
@@ -1831,24 +1802,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"mnemonic": mnemonic})
             return
-        if self.path == "/v1/token-previews":
-            if not self.wallet_required():
-                return
-            status, response = self.state.token_preview(value)
-            self.send_json(status, response)
-            return
         if self.path == "/v1/mints":
             if not self.wallet_required():
                 return
             self.state.wait_for_receive_transition()
             status, response, events = self.state.register_mint(value)
-            headers = None
-            if status == 201:
-                headers = {
-                    "Location": "/v1/mints/info?mintUrl="
-                    + quote(str(response["mintUrl"]), safe="")
-                }
-            self.send_json(status, response, headers)
+            self.send_json(status, response)
             self.state.publish_events(events)
             return
         if self.path == "/v1/mints/trust":
@@ -1864,10 +1823,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.state.wait_for_receive_transition()
             status, response, events = self.state.create_receive(value)
-            headers = None
-            if status == 201:
-                headers = {"Location": f"/v1/operations/receive/{response['id']}"}
-            self.send_json(status, response, headers)
+            if status == 0:
+                self.close_connection = True
+                return
+            self.send_json(status, response)
             self.state.publish_events(events)
             return
         if self.path == "/v1/operations/send":
@@ -1881,10 +1840,7 @@ class Handler(BaseHTTPRequestHandler):
             if status == 0:
                 self.close_connection = True
                 return
-            headers = None
-            if status == 201:
-                headers = {"Location": f"/v1/operations/send/{response['id']}"}
-            self.send_json(status, response, headers)
+            self.send_json(status, response)
             self.state.publish_events(events)
             return
         match = re.fullmatch(

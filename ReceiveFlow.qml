@@ -15,8 +15,6 @@ Item {
   property string fontFamily: Style.font.family
   property bool opened: false
   property int clipboardReads: 0
-  property bool mintApproved: false
-  property bool confirmationPending: false
 
   readonly property string receiveState: service
     ? String(service.receiveState || "idle") : "idle"
@@ -26,24 +24,19 @@ Item {
   readonly property bool inputVisible: viewState === "entry"
   readonly property bool pasteVisible: viewState === "entry"
   readonly property bool inputFocused: tokenInput.focus || tokenInput.activeFocus
-  readonly property var preview: service ? service.receivePreview : null
+  readonly property var prepared: service ? service.receivePreparedOperation : null
   readonly property string error: service ? service.receiveError : ""
-  readonly property bool approvalVisible: viewState === "preview"
-    && preview && !preview.trusted
-  readonly property bool confirmEnabled: viewState === "preview"
-    && preview && (preview.trusted || mintApproved)
+  readonly property bool confirmEnabled: viewState === "review" && !!prepared
 
   implicitHeight: content.implicitHeight
   visible: viewState !== "closed"
 
   function clearInput() {
     tokenInput.text = ""
-    mintApproved = false
-    confirmationPending = false
   }
 
   function open() {
-    if (!service || !service.resetReceive()) return false
+    if (!service || !service.beginReceiveFlow()) return false
     clearInput()
     opened = true
     Qt.callLater(function() { tokenInput.forceActiveFocus() })
@@ -51,7 +44,7 @@ Item {
   }
 
   function close() {
-    if (service && !service.resetReceive()) return false
+    if (service && !service.dismissReceiveFlow()) return false
     clearInput()
     opened = false
     return true
@@ -70,35 +63,14 @@ Item {
 
   function review() {
     if (viewState !== "entry" || !textPresent || !service) return false
-    return service.previewReceive(tokenInput.text)
-  }
-
-  function toggleMintApproval() {
-    if (!approvalVisible) return false
-    mintApproved = !mintApproved
+    if (!service.prepareReceive(tokenInput.text)) return false
+    clearInput()
     return true
   }
 
   function confirm() {
     if (!confirmEnabled || !service) return false
-    if (preview.trusted) {
-      if (!service.confirmReceive(tokenInput.text)) return false
-      clearInput()
-      return true
-    }
-    confirmationPending = true
-    if (!service.approveReceiveMint()) {
-      confirmationPending = false
-      return false
-    }
-    return true
-  }
-
-  function continueAfterMintApproval() {
-    if (!confirmationPending || receiveState !== "preview" || !preview
-        || !preview.trusted || !service) return
-    confirmationPending = false
-    if (service.confirmReceive(tokenInput.text)) clearInput()
+    return service.confirmReceive()
   }
 
   function backToEntry() {
@@ -119,14 +91,7 @@ Item {
     return formatted
   }
 
-  onReceiveStateChanged: {
-    if (receiveState === "error") clearInput()
-    else if (receiveState === "preview") {
-      if (confirmationPending && preview && preview.trusted)
-        Qt.callLater(root.continueAfterMintApproval)
-      else mintApproved = false
-    }
-  }
+  onReceiveStateChanged: if (receiveState === "error") clearInput()
 
   Column {
     id: content
@@ -141,7 +106,7 @@ Item {
 
     Text {
       width: parent.width
-      text: "Enter a Cashu token to preview its amount, mint, and fee."
+      text: "Enter a Cashu token from a previously Trusted Mint. cocod prepares it before showing the amount and fee."
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -149,12 +114,11 @@ Item {
     }
 
     Text {
-      visible: ["previewing", "approving", "preparing", "executing", "reconciling"]
+      visible: ["preparing", "cancelling", "executing", "reconciling"]
         .indexOf(root.viewState) !== -1
       width: parent.width
-      text: root.viewState === "previewing" ? "Checking token…"
-        : root.viewState === "approving" ? "Approving mint…"
-        : root.viewState === "preparing" ? "Preparing Receive…"
+      text: root.viewState === "preparing" ? "Preparing Receive…"
+        : root.viewState === "cancelling" ? "Cancelling Prepared Receive…"
         : root.viewState === "executing" ? "Receiving ecash…"
         : "Confirming with cocod…"
       color: root.foreground
@@ -165,13 +129,13 @@ Item {
     }
 
     Column {
-      visible: root.viewState === "preview" && !!root.preview
+      visible: root.viewState === "review" && !!root.prepared
       width: parent.width
       spacing: Style.spacing.labelGap
 
       Text {
         width: parent.width
-        text: root.preview ? root.amountText(root.preview.amount) + " sat" : ""
+        text: root.prepared ? root.amountText(root.prepared.amount) + " sat" : ""
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.display
@@ -181,7 +145,7 @@ Item {
 
       Text {
         width: parent.width
-        text: root.preview ? "Mint · " + root.preview.mintUrl : ""
+        text: root.prepared ? "Mint · " + root.prepared.mintUrl : ""
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -190,8 +154,7 @@ Item {
 
       Text {
         width: parent.width
-        text: root.preview ? "Fee · " + root.amountText(root.preview.fee)
-          + " sat · You receive " + root.amountText(root.preview.netAmount) + " sat" : ""
+        text: root.prepared ? "Fee · " + root.amountText(root.prepared.fee) + " sat" : ""
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -199,26 +162,12 @@ Item {
 
       Text {
         width: parent.width
-        text: root.preview && root.preview.trusted
-          ? "This mint is already trusted."
-          : "This mint is not trusted yet. Approve it only if you recognize it."
-        color: root.preview && root.preview.trusted ? root.dim : root.urgent
+        text: "cocod prepared this Receive using a previously Trusted Mint."
+        color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
-        font.bold: root.preview && !root.preview.trusted
         wrapMode: Text.WordWrap
       }
-    }
-
-    Button {
-      visible: root.approvalVisible
-      text: root.mintApproved ? "Mint approved" : "Approve this mint"
-      iconText: root.mintApproved ? "󰄬" : "󰔶"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      bordered: true
-      selected: root.mintApproved
-      onClicked: root.toggleMintApproval()
     }
 
     TextField {
@@ -259,7 +208,7 @@ Item {
     }
 
     Button {
-      visible: root.viewState === "preview"
+      visible: root.viewState === "review"
       text: "Confirm Receive"
       iconText: "󰄬"
       foreground: root.foreground
@@ -304,7 +253,7 @@ Item {
     }
 
     Button {
-      visible: root.viewState === "entry" || root.viewState === "preview"
+      visible: root.viewState === "entry" || root.viewState === "review"
       text: "Cancel"
       iconText: "󰅖"
       foreground: root.foreground

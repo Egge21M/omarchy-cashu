@@ -188,12 +188,8 @@ Item {
     return receiveFlow.paste() ? "ok" : "disabled"
   }
 
-  function smokePreviewReceive() {
+  function smokePrepareReceive() {
     return receiveFlow.review() ? "ok" : "disabled"
-  }
-
-  function smokeApproveReceiveMint() {
-    return receiveFlow.toggleMintApproval() ? "ok" : "disabled"
   }
 
   function smokeConfirmReceive() {
@@ -218,16 +214,8 @@ Item {
     return sendFlow.selectMint(mintUrl) ? "ok" : "disabled"
   }
 
-  function smokeSendMax() {
-    return sendFlow.useMax() ? "ok" : "disabled"
-  }
-
   function smokePrepareSend() {
     return sendFlow.prepare() ? "ok" : "disabled"
-  }
-
-  function smokeUseRefreshedSendMax() {
-    return sendFlow.useRefreshedMax() ? "ok" : "disabled"
   }
 
   function smokeCancelSend() {
@@ -290,14 +278,10 @@ Item {
       receiveTextPresent: receiveFlow.textPresent,
       receivePasteVisible: receiveFlow.pasteVisible,
       receiveClipboardReads: receiveFlow.clipboardReads,
-      receivePreviewAmount: receiveFlow.preview ? receiveFlow.preview.amount : "",
-      receivePreviewFee: receiveFlow.preview ? receiveFlow.preview.fee : "",
-      receivePreviewNetAmount: receiveFlow.preview ? receiveFlow.preview.netAmount : "",
-      receivePreviewUnit: receiveFlow.preview ? receiveFlow.preview.unit : "",
-      receivePreviewMint: receiveFlow.preview ? receiveFlow.preview.mintUrl : "",
-      receiveMintTrusted: receiveFlow.preview ? receiveFlow.preview.trusted : false,
-      receiveApprovalVisible: receiveFlow.approvalVisible,
-      receiveMintApproved: receiveFlow.mintApproved,
+      receivePreparedAmount: receiveFlow.prepared ? receiveFlow.prepared.amount : "",
+      receivePreparedFee: receiveFlow.prepared ? receiveFlow.prepared.fee : "",
+      receivePreparedUnit: receiveFlow.prepared ? receiveFlow.prepared.unit : "",
+      receivePreparedMint: receiveFlow.prepared ? receiveFlow.prepared.mintUrl : "",
       receiveConfirmEnabled: receiveFlow.confirmEnabled,
       receiveError: receiveFlow.error,
       sendViewState: sendFlow.viewState,
@@ -307,8 +291,6 @@ Item {
       sendAmountValid: sendFlow.amountValid,
       sendMintOptionCount: sendFlow.mintOptions.length,
       sendSelectedMint: sendFlow.selectedMintUrl,
-      sendMaxAmount: sendFlow.maxAmount,
-      sendRefreshedMaxAvailable: sendFlow.refreshedMaxAvailable,
       sendPrepareEnabled: sendFlow.prepareEnabled,
       sendConfirmEnabled: sendFlow.confirmEnabled,
       sendReviewMint: sendFlow.prepared ? String(sendFlow.prepared.mintUrl || "") : "",
@@ -756,7 +738,7 @@ Item {
                 bordered: true
                 enabled: root.stateOwner
                   && root.stateOwner.walletState === "unlocked"
-                  && root.stateOwner.receivePreviewAvailable === true
+                  && root.stateOwner.receiveAvailable === true
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
                   && sendFlow.viewState === "closed"
@@ -774,7 +756,7 @@ Item {
                 bordered: true
                 enabled: root.stateOwner
                   && root.stateOwner.walletState === "unlocked"
-                  && root.stateOwner.sendMaxAvailable === true
+                  && root.stateOwner.sendAvailable === true
                   && root.recoveryViewState === "closed"
                   && receiveFlow.viewState === "closed"
                   && sendFlow.viewState === "closed"

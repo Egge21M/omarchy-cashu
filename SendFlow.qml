@@ -16,8 +16,6 @@ Item {
   property string fontFamily: Style.font.family
   property bool opened: false
   property string selectedMintUrl: ""
-  property string maxRequestMintUrl: ""
-  property string visibleMaxMintUrl: ""
   property string outgoingToken: ""
   property int clipboardWrites: 0
   property bool reclaimWarningVisible: false
@@ -34,15 +32,6 @@ Item {
   readonly property var mintOptions: service
     && typeof service.sendMintOptions === "function"
     ? service.sendMintOptions(amount) : []
-  readonly property bool refreshedMaxAvailable: viewState === "error"
-    && service && String(service.sendErrorCode || "") === "insufficient_balance"
-    && service.sendMaxResource
-    && String(service.sendMaxResource.mintUrl || "") === selectedMintUrl
-    && /^[1-9][0-9]*$/.test(String(service.sendMaxResource.maxAmount || ""))
-  readonly property string maxAmount: service && service.sendMaxResource
-    && (visibleMaxMintUrl === selectedMintUrl || refreshedMaxAvailable)
-    && String(service.sendMaxResource.mintUrl || "") === selectedMintUrl
-    ? String(service.sendMaxResource.maxAmount || "") : ""
   readonly property var prepared: service ? service.sendPreparedOperation : null
   readonly property var reviewBalance: service && prepared
     && typeof service.sendBalanceForMint === "function"
@@ -62,12 +51,7 @@ Item {
   visible: viewState !== "closed"
 
   function updateMintSelection() {
-    var selectedStillEligible = service && service.sendMaxResource
-      && typeof service.isTrustedSendMint === "function"
-      && service.isTrustedSendMint(selectedMintUrl)
-      && visibleMaxMintUrl === selectedMintUrl
-      && String(service.sendMaxResource.mintUrl || "") === selectedMintUrl
-      && String(service.sendMaxResource.maxAmount || "") === String(amountInput.text)
+    var selectedStillEligible = false
     for (var index = 0; index < mintOptions.length; index++)
       if (String(mintOptions[index].mintUrl || "") === selectedMintUrl)
         selectedStillEligible = true
@@ -80,8 +64,6 @@ Item {
     if (!service || !service.beginSendFlow()) return false
     amountInput.text = ""
     selectedMintUrl = ""
-    maxRequestMintUrl = ""
-    visibleMaxMintUrl = ""
     outgoingToken = ""
     clipboardWrites = 0
     reclaimWarningVisible = false
@@ -99,8 +81,6 @@ Item {
     amountInput.focus = false
     amountInput.text = ""
     selectedMintUrl = ""
-    maxRequestMintUrl = ""
-    visibleMaxMintUrl = ""
     outgoingToken = ""
     reclaimWarningVisible = false
     opened = false
@@ -114,8 +94,6 @@ Item {
     if (service && !service.dismissSendFlow()) return false
     amountInput.text = ""
     selectedMintUrl = ""
-    maxRequestMintUrl = ""
-    visibleMaxMintUrl = ""
     opened = false
     return true
   }
@@ -137,42 +115,6 @@ Item {
     return false
   }
 
-  function useMax() {
-    if (viewState !== "entry" || !selectedMintUrl || !service) return false
-    if (!commandsAvailable) return false
-    maxRequestMintUrl = selectedMintUrl
-    if (service.requestSendMax(maxRequestMintUrl)) return true
-    maxRequestMintUrl = ""
-    return false
-  }
-
-  function applyRequestedMax() {
-    if (!service || !service.sendMaxResource || !maxRequestMintUrl) return
-    var mintUrl = String(service.sendMaxResource.mintUrl || "")
-    if (mintUrl !== maxRequestMintUrl) return
-    maxRequestMintUrl = ""
-    if (viewState !== "entry" || selectedMintUrl !== mintUrl) return
-    visibleMaxMintUrl = mintUrl
-    amountInput.text = String(service.sendMaxResource.maxAmount || "")
-  }
-
-  function useRefreshedMax() {
-    if (!refreshedMaxAvailable || !service
-        || typeof service.resumeSendAfterInsufficientBalance !== "function") return false
-    var resource = service.sendMaxResource
-    var mintUrl = String(resource.mintUrl || "")
-    var amount = String(resource.maxAmount || "")
-    if (!service.resumeSendAfterInsufficientBalance()) return false
-    maxRequestMintUrl = ""
-    amountInput.text = amount
-    selectedMintUrl = mintUrl
-    visibleMaxMintUrl = mintUrl
-    Qt.callLater(function() {
-      if (root.opened && root.viewState === "entry") amountInput.forceActiveFocus()
-    })
-    return true
-  }
-
   function prepare() {
     if (!prepareEnabled || !service
         || typeof service.prepareSend !== "function") return false
@@ -188,8 +130,6 @@ Item {
       amountInput.focus = false
       amountInput.text = ""
       selectedMintUrl = ""
-      maxRequestMintUrl = ""
-      visibleMaxMintUrl = ""
       outgoingToken = ""
       opened = false
     }
@@ -240,9 +180,6 @@ Item {
     if (["result", "reclaim-warning"].indexOf(viewState) === -1)
       outgoingToken = ""
   }
-  onSelectedMintUrlChanged: {
-    if (visibleMaxMintUrl !== selectedMintUrl) visibleMaxMintUrl = ""
-  }
   onInputVisibleChanged: {
     if (!inputVisible) amountInput.focus = false
   }
@@ -253,10 +190,6 @@ Item {
     function onSendExecuted(token) {
       if (!root.opened || root.viewState !== "result") return
       root.outgoingToken = String(token || "")
-    }
-
-    function onSendMaxResourceChanged() {
-      root.applyRequestedMax()
     }
   }
 
@@ -273,7 +206,7 @@ Item {
 
     Text {
       width: parent.width
-      text: "Choose a Trusted Mint and enter a whole sat amount. cocod calculates Max, fees, and proof selection."
+      text: "Choose a Trusted Mint and enter a whole sat amount. cocod calculates fees and selects proofs when it prepares the Send."
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -281,12 +214,11 @@ Item {
     }
 
     Text {
-      visible: ["maxing", "preparing", "cancelling", "executing",
+      visible: ["preparing", "cancelling", "executing",
         "recovering-result", "reclaiming"]
         .indexOf(root.viewState) !== -1
       width: parent.width
-      text: root.viewState === "maxing" ? "Calculating Send Max with cocod…"
-        : root.viewState === "preparing" ? "Preparing Send and reserving ecash…"
+      text: root.viewState === "preparing" ? "Preparing Send and reserving ecash…"
         : root.viewState === "cancelling" ? "Cancelling Prepared Send…"
         : root.viewState === "recovering-result" ? "Recovering Pending Send…"
         : root.viewState === "reclaiming" ? "Attempting Reclaim with cocod…"
@@ -409,44 +341,17 @@ Item {
       wrapMode: Text.WordWrap
     }
 
-    Text {
-      visible: (root.inputVisible || root.refreshedMaxAvailable)
-        && root.maxAmount !== ""
-      width: parent.width
-      text: "Daemon Max · " + root.maxAmount + " sat · point-in-time"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-    }
-
-    Row {
+    Button {
       visible: root.inputVisible
       width: parent.width
-      spacing: Style.spacing.controlGap
-
-      Button {
-        width: (parent.width - parent.spacing) / 2
-        text: "Max"
-        iconText: "󰾅"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        bordered: true
-        enabled: root.selectedMintUrl !== "" && root.commandsAvailable
-        opacity: enabled ? 1 : 0.5
-        onClicked: root.useMax()
-      }
-
-      Button {
-        width: (parent.width - parent.spacing) / 2
-        text: "Review Send"
-        iconText: "󰄬"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        bordered: true
-        enabled: root.prepareEnabled
-        opacity: enabled ? 1 : 0.5
-        onClicked: root.prepare()
-      }
+      text: "Review Send"
+      iconText: "󰄬"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      bordered: true
+      enabled: root.prepareEnabled
+      opacity: enabled ? 1 : 0.5
+      onClicked: root.prepare()
     }
 
     Button {
@@ -476,24 +381,13 @@ Item {
     Button {
       visible: root.viewState === "pending"
         || (root.viewState === "error" && root.service
-          && ["result_not_available", "mint_unavailable", "reclaim_inconclusive"]
-            .indexOf(String(root.service.sendErrorCode || "")) !== -1)
+          && !!root.service.sendPendingOperation)
       text: "Check Pending Send"
       iconText: "󰑐"
       foreground: root.foreground
       fontFamily: root.fontFamily
       bordered: true
       onClicked: root.retryPending()
-    }
-
-    Button {
-      visible: root.refreshedMaxAvailable
-      text: "Use refreshed Max · " + root.maxAmount + " sat"
-      iconText: "󰾅"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      bordered: true
-      onClicked: root.useRefreshedMax()
     }
 
     Text {

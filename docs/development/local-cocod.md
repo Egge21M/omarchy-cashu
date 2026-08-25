@@ -102,15 +102,23 @@ It does not execute Receive or Send and therefore never requires real-value ecas
 mock remains the default adapter for fault injection, partial SSE frames, Operation races, and the
 normal smoke suite.
 
-## Current transfer gaps
+## Canonical transfer contract
 
-The canonical v1 OpenAPI currently has neither the non-mutating `/v1/token-previews` resource nor
-the daemon-calculated `/v1/operations/send/max` resource assumed by the accepted Wallet Client
-Receive and Send designs. The Shell Adapter discovers those optional paths from OpenAPI and keeps
-the corresponding UI actions disabled when they are absent. It does not decode bearer tokens or
-calculate proof selection locally to compensate.
+Receive review begins with canonical Receive Operation preparation. The encoded token is submitted
+only to cocod, and the Wallet Client reviews the returned safe Prepared Receive before executing or
+cancelling it. Because cocod requires the token's Mint to be trusted before it can prepare and safely
+identify the Receive, unknown-Mint approval cannot occur inside this flow. Establish Mint trust
+through cocod first; the Wallet Client never decodes token material to work around that constraint.
 
-The source-backed test therefore accepts Wallet lifecycle, balances, Known Mints, durable Operation
-collections, and SSE against the canonical branch without claiming the transfer UX is ready.
-Resolving these two product/API gaps belongs upstream before the real Receive and Send acceptance
-tests replace the deterministic mock. Release and package publication remain tracked by issue #14.
+Ordinary amount Send begins with canonical Send Operation preparation and reviews cocod's
+authoritative input and fee data. Send Max is intentionally deferred: the Wallet Client does not
+estimate fees, perform proof selection, or derive a maximum from local balance arithmetic. Prepared
+Receives survive shell reload and ambiguous creation responses through canonical collection
+reconciliation. Untyped transfer failures remain `coco_error`; the Wallet Client does not parse
+diagnostic messages into finer-grained state. A non-sat Prepared Receive is cancelled before review
+because non-sat units remain outside this Wallet Client's MVP.
+
+The source-backed test currently validates Wallet lifecycle, balances, Known Mints, durable
+Operation collections, OpenAPI compatibility, and SSE against the canonical branch without moving
+real-value ecash. Real Receive and Send acceptance journeys remain tracked by issues #10 and #11;
+release and package publication remain tracked by issue #14.

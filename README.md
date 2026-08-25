@@ -15,8 +15,8 @@ Cashu users should be able to use a clean wallet as part of their operating syst
 - Create a new empty wallet through explicit first-run onboarding.
 - Show Wallet State, Spendable Balance, and Reserved Balance.
 - Reveal the Recovery Phrase only after a deliberate warning and confirmation.
-- Receive pasted, sat-denominated Cashu tokens through preview and confirmation.
-- Ask before trusting a mint introduced by an incoming token.
+- Prepare pasted, sat-denominated Cashu tokens through cocod, review the safe Prepared Receive,
+  and confirm or cancel it explicitly.
 - Prepare and confirm a Send before creating its encoded Cashu token.
 - Copy outgoing Cashu tokens explicitly without automatically reading or writing the clipboard.
 - Recover Active Transfers and allow a Pending Send to be reopened or reclaimed.
@@ -74,7 +74,7 @@ The daemon binds to loopback only and defaults to `127.0.0.1:62626`. `/health` i
 - A versioned loopback TCP API lands in `cocod`.
 - `cocod` enforces private state-directory and sensitive-file permissions.
 - The daemon exposes durable Send and Receive preparation, execution, lookup, recovery, cancellation, and reclaim semantics.
-- The daemon supports non-mutating token preview and explicit mint trust.
+- The daemon keeps Known Mint registration and explicit Mint trust separate.
 - Interrupted Receive operations recover reliably after daemon restart.
 - A standalone `cocod-bin` Arch/AUR package provides the executable and systemd user-service template.
 - Quickshell integration tests verify incremental SSE consumption, reconnection, and bounded stream rotation across the supported Omarchy and Qt versions.
@@ -83,7 +83,7 @@ The daemon binds to loopback only and defaults to `127.0.0.1:62626`. `/health` i
 
 1. Install the plugin and a compatible `cocod-bin`.
 2. Provision the user service and create an empty Wallet.
-3. Receive a Cashu token and approve its previously unknown mint.
+3. Provision a Trusted Mint, then prepare, review, and confirm a Cashu token from it.
 4. Observe the Spendable Balance update through SSE.
 5. Prepare, confirm, and copy a Send.
 6. Reload Omarchy and recover the Pending Send from `cocod`.
@@ -107,9 +107,9 @@ tracked by #14.
 
 ## Cocod v1 development
 
-The mock-backed lifecycle and transfer foundation is complete in #15, #6, #5, and #7. The current
-development bridge is [#16](https://github.com/Egge21M/omarchy-cashu/issues/16), which runs that
-client against canonical cocod source without making the plugin own the daemon process. Next,
+The mock-backed lifecycle and transfer foundation is complete in #15, #6, #5, and #7. The
+development bridge implemented by [#16](https://github.com/Egge21M/omarchy-cashu/issues/16) runs
+that client against canonical cocod source without making the plugin own the daemon process. Next,
 [#14](https://github.com/Egge21M/omarchy-cashu/issues/14) publishes cocod and `cocod-bin`; #8 and
 #9 then prove packaged connectivity and real Wallet lifecycle, followed by the real Receive (#10),
 real Send/Reclaim (#11), and complete installable MVP (#12) acceptance journeys. GitHub's native
@@ -129,21 +129,26 @@ startup, reconnect, shell reload, or panel open. Wallet actions remain
 unavailable until the Cashu User initializes the Wallet.
 
 The mock-backed Receive design keeps token material out of the adapter's projected state.
-`POST /v1/token-previews`
-validates a pasted sat token without mutation. An unknown mint is registered
-through `POST /v1/mints` and trusted only after explicit approval through
-`POST /v1/mints/trust`. Confirmation creates a Prepared Receive through
-`POST /v1/operations/receive`, executes its canonical command, and reports
-success only after refetching the finalized Operation and `/v1/balances`.
-Encoded token text remains in the focused input and immediate authenticated
-command bodies; it is excluded from diagnostics IPC, adapter snapshots, SSE,
-logs, and persisted plugin data.
+`POST /v1/operations/receive` validates and prepares the token inside cocod, returning only the
+safe Prepared Receive document for review. Confirmation executes that Operation; cancellation
+rolls it back. Success is reported only after refetching the finalized Operation and
+`/v1/balances`. Encoded token text exists only in the focused input and immediate authenticated
+preparation body; it is excluded from diagnostics IPC, adapter snapshots, SSE, logs, and persisted
+plugin data. Prepared Receives are rediscovered from canonical collections after reload, and a
+dropped preparation response is reconciled before the Wallet offers confirmation or cancellation.
+If canonical preparation returns a non-sat unit, the client cancels that Prepared Receive instead
+of labeling or executing it as sats.
 
-The canonical cocod v1 branch currently exposes neither `/v1/token-previews` nor
-`/v1/operations/send/max`. The adapter treats both as OpenAPI-discovered product extensions and
-disables the corresponding Receive or Send entry point when absent. It never compensates by
-decoding a bearer token, estimating fees, or selecting proofs in the UI process. These gaps must be
-resolved upstream before #10 and #11 can claim real transfer acceptance.
+Canonical v1 requires a Mint to be trusted before Receive preparation and does not reveal an
+unknown Mint from a rejected token. The Wallet Client therefore cannot offer in-flow unknown-Mint
+approval without decoding bearer tokens locally, which it deliberately does not do. The Cashu User
+must establish trust through cocod before reviewing a token from that Mint.
+
+Ordinary amount Send uses `POST /v1/operations/send`; cocod returns authoritative requested amount,
+input amount, fee, and swap requirements for review. The Max affordance is deferred because v1 has
+no daemon-calculated maximum and the Wallet Client does not estimate fees or select proofs. Untyped
+preparation and Reclaim failures use canonical `coco_error`; the client refreshes Operation and
+balance resources instead of inferring draft-specific causes from diagnostic text.
 
 Authenticated `/v1/events` frames are safe invalidation hints. Balance, Known
 Mint, and Operation hints refetch their affected canonical resources. Bootstrap,

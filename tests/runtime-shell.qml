@@ -116,12 +116,8 @@ ShellRoot {
       return walletPanel.smokePasteReceive()
     }
 
-    function previewReceive(): string {
-      return walletPanel.smokePreviewReceive()
-    }
-
-    function approveReceiveMint(): string {
-      return walletPanel.smokeApproveReceiveMint()
+    function prepareReceive(): string {
+      return walletPanel.smokePrepareReceive()
     }
 
     function confirmReceive(): string {
@@ -144,16 +140,8 @@ ShellRoot {
       return walletPanel.smokeSelectSendMint(mintUrl)
     }
 
-    function sendMax(): string {
-      return walletPanel.smokeSendMax()
-    }
-
     function prepareSend(): string {
       return walletPanel.smokePrepareSend()
-    }
-
-    function useRefreshedSendMax(): string {
-      return walletPanel.smokeUseRefreshedSendMax()
     }
 
     function cancelSend(): string {

@@ -75,8 +75,23 @@ rg -q '/v1/operations/receive/prepared' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not discover Receive Operations"
 rg -q '/v1/operations/send/in-flight' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not discover Send Operations"
-rg -q '/v1/operations/send/max' "$project_dir/Service.qml" \
-  || fail "Shell Adapter does not request daemon-calculated Send Max"
+if rg -n --glob '!scripts/check.sh' --glob '!tests/contract.sh' \
+    --glob '!docs/archive/**' \
+    '/v1/token-previews|/v1/operations/send/max' "$project_dir"; then
+  fail "abandoned transfer extension routes remain in current sources or documentation"
+fi
+if rg -n 'requestSendMax|sendMaxResource|text: "Max"' \
+    "$project_dir/Service.qml" "$project_dir/SendFlow.qml"; then
+  fail "deferred Send Max behavior remains in the Wallet Client"
+fi
+if rg -n -U 'error_document\(\s*"(operation_not_found|operation_conflict|result_not_available|mint_not_registered|mint_not_trusted|mint_unavailable|insufficient_balance|reclaim_inconclusive|recipient_won|temporarily_unavailable|unsupported_unit)"' \
+    "$project_dir/scripts/mock-cocod.py"; then
+  fail "mock cocod emits an error code outside the canonical v1 enum"
+fi
+if rg -n '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+    "$project_dir/tests/contract.sh" "$project_dir/tests/runtime.sh"; then
+  fail "canonical test timestamps must include three fractional digits"
+fi
 rg -q 'isSafeInvalidation' "$project_dir/Service.qml" \
   || fail "Shell Adapter does not validate invalidation metadata"
 rg -q 'isLoopbackBaseUrl' "$project_dir/Service.qml" \

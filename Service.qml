@@ -112,9 +112,12 @@ Item {
   property int receiveResourceGeneration: 0
   property var receiveLookupTokens: ({})
   property string receiveState: "idle"
-  property var receivePreview: null
   property string receiveError: ""
   property string receiveOperationId: ""
+  property bool receiveCancelOnPrepared: false
+  property var receiveAmbiguousCreation: null
+  readonly property var receivePreparedOperation: canonicalPreparedReceive(
+    receiveOperationId)
   property var receiveRecoveries: ({})
   property string receiveRecoveryFocusId: ""
   readonly property var receiveRecovery: receiveRecoveryProjection(
@@ -126,7 +129,6 @@ Item {
   property var sendCommandRequest: null
   property var sendReconcileRequests: []
   property string sendState: "idle"
-  property var sendMaxResource: null
   property string sendError: ""
   property string sendErrorCode: ""
   property string sendOperationId: ""
@@ -142,20 +144,19 @@ Item {
   readonly property bool sendCanCancelReservation: sendOperationId !== ""
     && ["review", "error"].indexOf(sendState) !== -1
     && !sendCommandRequest
-    && (!!sendPreparedOperation || (!sendPendingOperation && sendState === "error"
-      && sendErrorCode !== "recipient_won"))
+    && (!!sendPreparedOperation || (!sendPendingOperation && sendState === "error"))
   readonly property bool sendCanReclaim: !!sendPendingOperation
     && ["result", "pending", "error"].indexOf(sendState) !== -1
     && !sendCommandRequest && !sendResultReconciling
     && sendReconcileRequests.length === 0
   readonly property bool sendCommandsAvailable: !fullFetchInProgress
     && connectionState === "connected" && compatibilityState === "compatible"
-    && walletState === "unlocked" && sendMaxAvailable
+    && walletState === "unlocked" && sendAvailable
   readonly property bool receiveCommandsAvailable: !fullFetchInProgress
     && connectionState === "connected" && compatibilityState === "compatible"
-    && walletState === "unlocked" && receivePreviewAvailable
-  readonly property bool receivePreviewAvailable: openApiPathAvailable("/v1/token-previews")
-  readonly property bool sendMaxAvailable: openApiPathAvailable("/v1/operations/send/max")
+    && walletState === "unlocked" && receiveAvailable
+  readonly property bool receiveAvailable: openApiPathAvailable("/v1/operations/receive")
+  readonly property bool sendAvailable: openApiPathAvailable("/v1/operations/send")
 
   readonly property bool fixtureBacked: false
   readonly property string walletState: connectionState === "connected"
@@ -272,8 +273,8 @@ Item {
   function snapshot() {
     return {
       apiVersion: String(openApiResource["x-cocod-interface-version"] || ""),
-      receivePreviewAvailable: receivePreviewAvailable,
-      sendMaxAvailable: sendMaxAvailable,
+      receiveAvailable: receiveAvailable,
+      sendAvailable: sendAvailable,
       daemonUrlAllowed: daemonUrlAllowed,
       refreshCount: refreshCount,
       fixtureBacked: fixtureBacked,
@@ -297,8 +298,6 @@ Item {
       sendState: sendState,
       sendError: sendError,
       sendErrorCode: sendErrorCode,
-      sendMaxMintUrl: sendMaxResource ? String(sendMaxResource.mintUrl || "") : "",
-      sendMaxAmount: sendMaxResource ? String(sendMaxResource.maxAmount || "") : "",
       sendPreparedOperation: projectSendOperation(sendPreparedOperation),
       sendPendingOperation: projectSendOperation(sendPendingOperation),
       creating: creating,
@@ -478,8 +477,8 @@ Item {
       if (["result", "recovering-result", "pending", "reclaiming"]
           .indexOf(sendState) !== -1) return
       if (sendState === "error"
-          && ["result_not_available", "mint_unavailable", "reclaim_inconclusive",
-            "operation_conflict"].indexOf(sendErrorCode) !== -1) return
+          && ["result_not_available", "coco_error", "operation_conflict"]
+            .indexOf(sendErrorCode) !== -1) return
       sendOperationId = ""
       failSend("operation_conflict")
       return
@@ -681,14 +680,6 @@ Item {
     return true
   }
 
-  function isReceivePreview(value) {
-    return value && typeof value === "object" && !containsSensitiveKey(value)
-      && typeof value.mintUrl === "string" && value.mintUrl.length > 0
-      && value.unit === "sat" && decimalString(value.amount)
-      && decimalString(value.fee) && decimalString(value.netAmount)
-      && typeof value.trusted === "boolean"
-  }
-
   function isReceiveOperation(value) {
     if (!isOperationCollection({ items: [value], offset: 0, limit: 1 }, "receive"))
       return false
@@ -699,25 +690,6 @@ Item {
       return false
     if (state === "init") return value.fee === undefined || decimalString(value.fee)
     return decimalString(value.fee)
-  }
-
-  function isSendMax(value) {
-    return value && typeof value === "object" && !containsSensitiveKey(value)
-      && typeof value.mintUrl === "string" && value.mintUrl.length > 0
-      && value.unit === "sat" && decimalString(value.spendable)
-      && decimalString(value.maxAmount) && decimalString(value.fee)
-      && typeof value.needsSwap === "boolean"
-  }
-
-  function projectSendMax(value) {
-    return {
-      mintUrl: String(value.mintUrl),
-      unit: "sat",
-      spendable: String(value.spendable),
-      maxAmount: String(value.maxAmount),
-      fee: String(value.fee),
-      needsSwap: value.needsSwap === true
-    }
   }
 
   function operationAmount(value) {
@@ -906,9 +878,7 @@ Item {
             }
             var valid = specification.type === "balances"
               ? root.isBalanceCollection(result.value)
-              : specification.type === "maximum"
-                ? root.isSendMax(result.value)
-                : root.isOperationCollection(result.value, "send")
+              : root.isOperationCollection(result.value, "send")
             if (result.status !== 200 || !valid) {
               reject("invalid_response")
               return
@@ -939,7 +909,7 @@ Item {
   function sendCanonicalMutationBusy() {
     return !!sendCommandRequest || sendReconcileRequests.length > 0
       || sendResultReconciling
-      || ["maxing", "preparing", "cancelling", "executing",
+      || ["preparing", "cancelling", "executing",
         "recovering-result", "reclaiming"]
         .indexOf(sendState) !== -1
   }
@@ -1160,7 +1130,13 @@ Item {
   function setReceiveRecoveryFailure(operationId, error) {
     updateReceiveRecovery(operationId,
       error && error.retryable ? "unavailable" : "failed",
-      receiveErrorMessage(error ? error.code : "invalid_response"))
+      receiveRecoveryErrorMessage(error ? error.code : "invalid_response"))
+  }
+
+  function receiveRecoveryErrorMessage(code) {
+    if (String(code || "") === "coco_error")
+      return "cocod could not reconcile this Receive. Retry when the Mint is available."
+    return receiveErrorMessage(code)
   }
 
   function reconcileCanonicalReceive(options, callback) {
@@ -1296,15 +1272,6 @@ Item {
               "cocod returned an invalid Receive Operation")
             return
           }
-          if (result.error && !result.error.retryable
-              && result.error.code !== "operation_not_found") {
-            failed = true
-            root.handleFetchFailure({
-              status: 409,
-              error: result.error
-            })
-            return
-          }
           if (result.operation) values.push(result.operation)
           needsFreshBalances = needsFreshBalances || result.needsFreshBalances
           pending--
@@ -1352,6 +1319,7 @@ Item {
     if (connectAfterward && walletState === "unlocked") startStream()
     if (receiveState === "reconciling" && receiveOperationId)
       reconcileReceiveOperation(receiveOperationId)
+    reconcileAmbiguousReceiveFromCanonical()
     for (var operationId in queuedInvalidations)
       refetchReceiveOperation(operationId)
     reconcileAmbiguousSendFromCanonical()
@@ -1408,8 +1376,14 @@ Item {
   }
 
   function resetReceive() {
-    if (["approving", "preparing", "executing", "reconciling"]
+    if (["preparing", "cancelling", "executing", "reconciling"]
         .indexOf(receiveState) !== -1) return false
+    if (receiveState === "review" && receivePreparedOperation) return false
+    if (receiveAmbiguousCreation) {
+      receiveCancelOnPrepared = true
+      retryAmbiguousReceiveReconciliation()
+      return false
+    }
     var request = receiveRequest
     receiveRequest = null
     if (request) {
@@ -1420,10 +1394,48 @@ Item {
     abortRequests(receiveReconcileRequests)
     receiveReconcileRequests = []
     receiveState = "idle"
-    receivePreview = null
     receiveError = ""
     receiveOperationId = ""
+    receiveCancelOnPrepared = false
+    receiveAmbiguousCreation = null
     return true
+  }
+
+  function beginReceiveFlow() {
+    if (["preparing", "cancelling", "executing", "reconciling"]
+        .indexOf(receiveState) !== -1) return false
+    receiveCancelOnPrepared = false
+    var prepared = receivePreparedOperation || firstCanonicalPreparedReceive()
+    if (prepared) {
+      receiveOperationId = String(prepared.id)
+      receiveError = ""
+      if (String(prepared.unit || "") !== "sat")
+        return cancelUnsupportedReceive(receiveOperationId)
+      receiveState = "review"
+      return true
+    }
+    if (receiveState === "error" && receiveAmbiguousCreation) {
+      retryAmbiguousReceiveReconciliation()
+      return true
+    }
+    return resetReceive()
+  }
+
+  function dismissReceiveFlow() {
+    if (receiveState === "preparing") {
+      receiveCancelOnPrepared = true
+      return true
+    }
+    if (receiveState === "cancelling") return true
+    if (["executing", "reconciling"].indexOf(receiveState) !== -1) return false
+    if (receiveAmbiguousCreation) {
+      receiveCancelOnPrepared = true
+      retryAmbiguousReceiveReconciliation()
+      return true
+    }
+    if (receiveState === "review" && receivePreparedOperation)
+      return cancelPreparedReceive()
+    return resetReceive()
   }
 
   function resetSend() {
@@ -1440,7 +1452,6 @@ Item {
     abortRequests(sendReconcileRequests)
     sendReconcileRequests = []
     sendState = "idle"
-    sendMaxResource = null
     sendError = ""
     sendErrorCode = ""
     sendOperationId = ""
@@ -1452,7 +1463,7 @@ Item {
   }
 
   function beginSendFlow() {
-    if (["maxing", "preparing", "cancelling", "executing", "reclaiming"]
+    if (["preparing", "cancelling", "executing", "reclaiming"]
         .indexOf(sendState) !== -1 || sendResultReconciling) return false
     sendCancelOnPrepared = false
     var pending = sendPendingOperation || firstCanonicalPendingSend()
@@ -1460,7 +1471,6 @@ Item {
       sendOperationId = String(pending.id)
       sendError = ""
       sendErrorCode = ""
-      sendMaxResource = null
       return retrievePendingSendResult(sendOperationId)
     }
     var prepared = sendPreparedOperation || firstCanonicalPreparedSend()
@@ -1468,7 +1478,6 @@ Item {
       sendOperationId = String(prepared.id)
       sendError = ""
       sendErrorCode = ""
-      sendMaxResource = null
       sendState = "review"
       return true
     }
@@ -1520,42 +1529,6 @@ Item {
     return resetSend() ? "dismissed" : ""
   }
 
-  function requestSendMax(mintUrl) {
-    var selectedMint = String(mintUrl || "")
-    if (!selectedMint || !isTrustedSendMint(selectedMint)
-        || sendCommandRequest || fullFetchInProgress
-        || sendState !== "idle"
-        || connectionState !== "connected" || compatibilityState !== "compatible"
-        || walletState !== "unlocked" || !sendMaxAvailable) return false
-    sendMaxResource = null
-    sendError = ""
-    sendErrorCode = ""
-    sendState = "maxing"
-    var request = root.sendRequest("GET", "/v1/operations/send/max?mintUrl="
-      + encodeURIComponent(selectedMint) + "&unit=sat", undefined, function(result) {
-        if (request !== root.sendCommandRequest) return
-        root.sendCommandRequest = null
-        if (!result.ok) {
-          root.failSend(result.error.code)
-          return
-        }
-        if (result.status !== 200 || !root.isSendMax(result.value)
-            || String(result.value.mintUrl) !== selectedMint) {
-          root.failSend("invalid_response")
-          return
-        }
-        root.sendState = "idle"
-        root.sendMaxResource = root.projectSendMax(result.value)
-        root.resumeDeferredCanonicalReconcile()
-      })
-    if (!request) {
-      failSend("credential_unavailable")
-      return false
-    }
-    sendCommandRequest = request
-    return true
-  }
-
   function reconcileFailedReclaim(code, operationId) {
     sendErrorCode = String(code || "")
     sendError = sendErrorMessage(code)
@@ -1579,9 +1552,7 @@ Item {
         || fullFetchInProgress
         || sendCommandRequest || sendState !== "idle") return false
     var eligible = sendMintOptions(requestedAmount)
-    var canFund = isTrustedSendMint(selectedMint) && isSendMax(sendMaxResource)
-      && String(sendMaxResource.mintUrl) === selectedMint
-      && String(sendMaxResource.maxAmount) === requestedAmount
+    var canFund = false
     for (var index = 0; index < eligible.length; index++)
       if (String(eligible[index].mintUrl || "") === selectedMint) canFund = true
     if (!canFund) return false
@@ -1610,8 +1581,12 @@ Item {
             knownOperationIds, result.error.code)
           return
         }
-        if (result.error.code === "insufficient_balance") {
-          root.refreshSendAfterInsufficientBalance(selectedMint)
+        if (result.error.code === "coco_error") {
+          root.reconcileSendResources(function() {
+            root.failSend("coco_error")
+          }, function() {
+            root.failSend("coco_error")
+          })
           return
         }
         root.failSend(result.error.code)
@@ -1715,30 +1690,6 @@ Item {
       return
     }
     resumeDeferredCanonicalReconcile()
-  }
-
-  function resumeSendAfterInsufficientBalance() {
-    if (sendState !== "error" || sendErrorCode !== "insufficient_balance"
-        || !isSendMax(sendMaxResource)) return false
-    sendError = ""
-    sendErrorCode = ""
-    sendState = "idle"
-    return true
-  }
-
-  function refreshSendAfterInsufficientBalance(mintUrl) {
-    sendState = "preparing"
-    var specifications = [
-      { key: "balances", path: "/v1/balances", type: "balances" },
-      { key: "maximum", path: "/v1/operations/send/max?mintUrl="
-        + encodeURIComponent(mintUrl) + "&unit=sat", type: "maximum" }
-    ]
-    collectSendResources(specifications, function(values) {
-      root.balancesResource = values.balances
-      root.sendMaxResource = root.projectSendMax(values.maximum)
-      root.refreshCount++
-      root.failSend("insufficient_balance")
-    })
   }
 
   function cancelPreparedSend() {
@@ -1969,15 +1920,10 @@ Item {
   function sendErrorMessage(code) {
     var messages = {
       invalid_request: "Enter a positive whole sat amount.",
-      insufficient_balance: "This Mint can no longer fund that Send. Review the refreshed balance and Max.",
-      mint_not_registered: "This Mint is no longer registered. Choose another Trusted Mint.",
-      mint_not_trusted: "This Mint is no longer trusted. Choose another Trusted Mint.",
-      mint_unavailable: "The Mint is unavailable. Try again later or choose another Mint.",
+      coco_error: "cocod could not complete this Send. Review the refreshed Wallet state, then try again or choose a smaller amount.",
       operation_not_found: "This Send is no longer available in cocod. Canonical Wallet state was refreshed.",
       operation_conflict: "This Send changed in cocod. Review the current Wallet state and try again.",
       result_not_available: "The outgoing token is not available yet. Check the Pending Send again.",
-      reclaim_inconclusive: "Reclaim was inconclusive. The Pending Send remains recoverable.",
-      recipient_won: "The recipient redeemed this Send before Reclaim completed.",
       credential_unavailable: "The cocod Client Credential is unavailable.",
       invalid_response: "cocod returned an invalid Send response.",
       transport_unavailable: "Send could not reach cocod. Try again."
@@ -1985,37 +1931,54 @@ Item {
     return messages[String(code || "")] || "Send could not be completed. Try again."
   }
 
-  function previewReceive(token) {
+  function prepareReceive(token) {
     var normalizedToken = String(token || "").trim()
     if (!normalizedToken || receiveRequest || receiveState !== "idle"
         || connectionState !== "connected" || compatibilityState !== "compatible"
         || walletState !== "unlocked" || !receiveCommandsAvailable) return false
-    receivePreview = null
     receiveError = ""
-    receiveState = "previewing"
-    var request = sendRequest("POST", "/v1/token-previews", {
-      token: normalizedToken,
-      acceptedUnits: ["sat"]
+    receiveOperationId = ""
+    receiveCancelOnPrepared = false
+    receiveAmbiguousCreation = null
+    var knownOperationIds = ({})
+    for (var operationIndex = 0; operationIndex < receiveOperations.length;
+        operationIndex++)
+      knownOperationIds[String(receiveOperations[operationIndex].id || "")] = true
+    receiveState = "preparing"
+    var request = sendRequest("POST", "/v1/operations/receive", {
+      token: normalizedToken
     }, function(result) {
       if (request !== root.receiveRequest) return
       root.receiveRequest = null
       if (!result.ok) {
+        if (result.status === 0
+            || (result.status === 201 && result.error.code === "invalid_response")) {
+          root.reconcileAmbiguousReceiveCreation(
+            knownOperationIds, result.error.code)
+          return
+        }
+        root.fetchOperationGroup("receive")
         root.failReceive(result.error.code)
         return
       }
-      if (result.status !== 200 || !root.isReceivePreview(result.value)) {
-        root.failReceive("invalid_response")
+      if (result.status !== 201 || !root.isReceiveOperation(result.value)
+          || String(result.value.state) !== "prepared") {
+        if (result.status === 201)
+          root.reconcileAmbiguousReceiveCreation(
+            knownOperationIds, "invalid_response")
+        else root.failReceive("invalid_response")
         return
       }
-      root.receivePreview = {
-        mintUrl: String(result.value.mintUrl),
-        unit: String(result.value.unit),
-        amount: String(result.value.amount),
-        fee: String(result.value.fee),
-        netAmount: String(result.value.netAmount),
-        trusted: result.value.trusted === true
+      root.receiveAmbiguousCreation = null
+      root.receiveOperationId = String(result.value.id)
+      root.receiveOperations = root.withReceiveOperation(
+        root.receiveOperations, result.value)
+      if (String(result.value.unit || "") !== "sat") {
+        root.cancelUnsupportedReceive(root.receiveOperationId)
+        return
       }
-      root.receiveState = "preview"
+      root.receiveState = "review"
+      if (root.receiveCancelOnPrepared) root.cancelPreparedReceive()
     })
     normalizedToken = ""
     if (!request) {
@@ -2026,86 +1989,134 @@ Item {
     return true
   }
 
-  function approveReceiveMint() {
-    if (receiveRequest || receiveState !== "preview" || !receivePreview
-        || receivePreview.trusted) return false
-    receiveError = ""
-    registerReceiveMint(String(receivePreview.mintUrl))
-    return true
-  }
-
-  function confirmReceive(token) {
-    var normalizedToken = String(token || "").trim()
-    if (!normalizedToken || receiveRequest || receiveState !== "preview"
-        || !receivePreview || !receivePreview.trusted) return false
-    receiveError = ""
-    createPreparedReceive(normalizedToken)
-    return true
-  }
-
-  function registerReceiveMint(mintUrl) {
-    receiveState = "approving"
-    var request = sendRequest("POST", "/v1/mints", { mintUrl: mintUrl }, function(result) {
-      if (request !== root.receiveRequest) return
-      root.receiveRequest = null
-      if (!result.ok) {
-        root.failReceive(result.error.code)
-        return
-      }
-      if ([200, 201].indexOf(result.status) === -1 || !result.value
-          || String(result.value.mintUrl || "") !== mintUrl
-          || typeof result.value.trusted !== "boolean"
-          || root.containsSensitiveKey(result.value)) {
-        root.failReceive("invalid_response")
-        return
-      }
-      root.trustReceiveMint(mintUrl)
-    })
-    if (!request) {
-      failReceive("credential_unavailable")
-      return
+  function reconcileAmbiguousReceiveCreation(knownOperationIds, failureCode) {
+    receiveAmbiguousCreation = {
+      knownOperationIds: knownOperationIds,
+      failureCode: String(failureCode || "transport_unavailable")
     }
-    receiveRequest = request
-  }
-
-  function trustReceiveMint(mintUrl) {
-    receiveState = "approving"
-    var request = sendRequest("POST", "/v1/mints/trust", { mintUrl: mintUrl },
-      function(result) {
-        if (request !== root.receiveRequest) return
-        root.receiveRequest = null
-        if (!result.ok) {
-          root.failReceive(result.error.code)
-          return
-        }
-        if (result.status !== 200 || !result.value
-            || String(result.value.mintUrl || "") !== mintUrl
-            || result.value.trusted !== true || root.containsSensitiveKey(result.value)) {
-          root.failReceive("invalid_response")
-          return
-        }
-        root.receivePreview = {
-          mintUrl: String(root.receivePreview.mintUrl),
-          unit: String(root.receivePreview.unit),
-          amount: String(root.receivePreview.amount),
-          fee: String(root.receivePreview.fee),
-          netAmount: String(root.receivePreview.netAmount),
-          trusted: true
-        }
-        root.fetchMints()
-        root.receiveState = "preview"
-      })
-    if (!request) {
-      failReceive("credential_unavailable")
-      return
-    }
-    receiveRequest = request
-  }
-
-  function createPreparedReceive(token) {
     receiveState = "preparing"
-    var request = sendRequest("POST", "/v1/operations/receive", { token: token },
-      function(result) {
+    retryAmbiguousReceiveReconciliation()
+  }
+
+  function retryAmbiguousReceiveReconciliation() {
+    if (!receiveAmbiguousCreation) return false
+    receiveState = "preparing"
+    reconcileReceiveResources(function() {
+      root.reconcileAmbiguousReceiveFromCanonical()
+    }, function(code) {
+      var context = root.receiveAmbiguousCreation
+      root.failReceive(code || (context
+        ? context.failureCode : "transport_unavailable"), true)
+    })
+    return true
+  }
+
+  function reconcileReceiveResources(callback, failureCallback) {
+    abortRequests(receiveRequests)
+    receiveRequests = []
+    var paths = [
+      "/v1/operations/receive/prepared",
+      "/v1/operations/receive/in-flight"
+    ]
+    var values = []
+    var pending = paths.length
+    var requests = []
+    var failed = false
+
+    function reject(code) {
+      if (failed) return
+      failed = true
+      root.abortRequests(requests)
+      root.receiveRequests = []
+      failureCallback(code)
+    }
+
+    for (var index = 0; index < paths.length; index++) {
+      (function(collectionIndex) {
+        var request = root.sendRequest("GET", paths[collectionIndex], undefined,
+          function(result) {
+            if (failed || requests.indexOf(request) === -1) return
+            if (!result.ok) {
+              reject(result.error.code)
+              return
+            }
+            if (result.status !== 200
+                || !root.isOperationCollection(result.value, "receive")) {
+              reject("invalid_response")
+              return
+            }
+            values[collectionIndex] = result.value.items
+            pending--
+            if (pending !== 0) return
+            root.receiveRequests = []
+            root.receiveOperations = values[0].concat(values[1])
+            root.refreshCount++
+            callback()
+          })
+        if (!request) {
+          reject("credential_unavailable")
+          return
+        }
+        requests.push(request)
+      })(index)
+    }
+    receiveRequests = requests
+  }
+
+  function matchAmbiguousReceiveCreation(context) {
+    var result = { operation: null, matches: 0 }
+    if (!context) return result
+    var known = context.knownOperationIds || ({})
+    for (var index = 0; index < receiveOperations.length; index++) {
+      var operation = receiveOperations[index]
+      var operationId = String(operation.id || "")
+      if (known[operationId]
+          || String(operation.state || "") !== "prepared") continue
+      result.operation = operation
+      result.matches++
+    }
+    return result
+  }
+
+  function reconcileAmbiguousReceiveFromCanonical() {
+    if (!receiveAmbiguousCreation) return
+    var context = receiveAmbiguousCreation
+    var match = matchAmbiguousReceiveCreation(context)
+    if (match.matches === 1) {
+      receiveAmbiguousCreation = null
+      receiveOperationId = String(match.operation.id)
+      receiveError = ""
+      if (String(match.operation.unit || "") !== "sat") {
+        cancelUnsupportedReceive(receiveOperationId)
+        return
+      }
+      receiveState = "review"
+      if (receiveCancelOnPrepared) cancelPreparedReceive()
+      return
+    }
+    receiveAmbiguousCreation = null
+    if (match.matches > 1) {
+      failReceive("invalid_response")
+      return
+    }
+    if (receiveCancelOnPrepared) {
+      receiveCancelOnPrepared = false
+      resetReceive()
+    } else if (receiveState === "preparing") {
+      failReceive(String(context.failureCode || "transport_unavailable"))
+    }
+  }
+
+  function cancelUnsupportedReceive(operationId) {
+    var id = String(operationId || "")
+    if (!id || receiveRequest || !receiveCommandsAvailable) {
+      failReceive("unsupported_behavior")
+      return false
+    }
+    receiveState = "cancelling"
+    receiveError = ""
+    var request = sendRequest("POST", "/v1/operations/receive/"
+      + encodeURIComponent(id) + "/cancel", undefined, function(result) {
         if (request !== root.receiveRequest) return
         root.receiveRequest = null
         if (!result.ok) {
@@ -2113,23 +2124,70 @@ Item {
           root.failReceive(result.error.code)
           return
         }
-        if (result.status !== 201 || !root.isReceiveOperation(result.value)
-            || String(result.value.state) !== "prepared") {
+        if (result.status !== 200 || !root.isReceiveOperation(result.value)
+            || String(result.value.id || "") !== id
+            || String(result.value.state || "") !== "rolled_back") {
           root.failReceive("invalid_response")
           return
         }
-        root.receiveOperationId = String(result.value.id)
         root.receiveOperations = root.withReceiveOperation(
           root.receiveOperations, result.value)
-        root.receiveState = "executing"
-        root.executePreparedReceive(root.receiveOperationId)
+        root.failReceive("unsupported_behavior")
       })
-    token = ""
     if (!request) {
       failReceive("credential_unavailable")
-      return
+      return false
     }
     receiveRequest = request
+    return true
+  }
+
+  function confirmReceive() {
+    var operation = receivePreparedOperation
+    var operationId = operation ? String(operation.id || "") : ""
+    if (!operationId || receiveRequest || receiveState !== "review"
+        || !receiveCommandsAvailable) return false
+    receiveError = ""
+    receiveState = "executing"
+    executePreparedReceive(operationId)
+    return true
+  }
+
+  function cancelPreparedReceive() {
+    var operation = receivePreparedOperation
+    var operationId = operation ? String(operation.id || "") : ""
+    if (!operationId || receiveRequest
+        || ["review", "cancelling"].indexOf(receiveState) === -1) return false
+    receiveCancelOnPrepared = false
+    receiveError = ""
+    receiveState = "cancelling"
+    var request = sendRequest("POST", "/v1/operations/receive/"
+      + encodeURIComponent(operationId) + "/cancel", undefined, function(result) {
+      if (request !== root.receiveRequest) return
+      root.receiveRequest = null
+      if (!result.ok) {
+        root.fetchOperationGroup("receive")
+        root.failReceive(result.error.code)
+        return
+      }
+      if (result.status !== 200 || !root.isReceiveOperation(result.value)
+          || String(result.value.id || "") !== operationId
+          || String(result.value.state || "") !== "rolled_back") {
+        root.failReceive("invalid_response")
+        return
+      }
+      root.receiveOperations = root.withReceiveOperation(
+        root.receiveOperations, result.value)
+      root.receiveOperationId = ""
+      root.receiveState = "idle"
+      root.receiveError = ""
+    })
+    if (!request) {
+      failReceive("credential_unavailable")
+      return false
+    }
+    receiveRequest = request
+    return true
   }
 
   function executePreparedReceive(operationId) {
@@ -2170,6 +2228,24 @@ Item {
     if (!replaced && ["finalized", "rolled_back"].indexOf(
         String(operation.state || "")) === -1) result.push(operation)
     return result
+  }
+
+  function canonicalPreparedReceive(operationId) {
+    var selected = String(operationId || "")
+    var operations = Array.isArray(receiveOperations) ? receiveOperations : []
+    for (var index = 0; selected && index < operations.length; index++)
+      if (String(operations[index].id || "") === selected
+          && String(operations[index].state || "") === "prepared")
+        return operations[index]
+    return null
+  }
+
+  function firstCanonicalPreparedReceive() {
+    var operations = Array.isArray(receiveOperations) ? receiveOperations : []
+    for (var index = 0; index < operations.length; index++)
+      if (String(operations[index].state || "") === "prepared")
+        return operations[index]
+    return null
   }
 
   function reconcileReceiveOperation(operationId) {
@@ -2234,7 +2310,7 @@ Item {
     receiveReconcileRequests = requests
   }
 
-  function failReceive(code) {
+  function failReceive(code, preserveAmbiguousCreation) {
     receiveReconcileToken++
     abortRequests(receiveReconcileRequests)
     receiveReconcileRequests = []
@@ -2242,17 +2318,14 @@ Item {
     receiveState = "error"
     receiveError = receiveErrorMessage(code)
     receiveOperationId = ""
+    if (preserveAmbiguousCreation !== true) receiveAmbiguousCreation = null
   }
 
   function receiveErrorMessage(code) {
     var messages = {
-      invalid_token: "This Cashu token is invalid. Check it and try again.",
-      unsupported_unit: "Only sat-denominated Cashu tokens are supported.",
-      mint_unavailable: "The mint is unavailable. Try again later.",
-      mint_not_registered: "The mint could not be registered. Try again.",
-      mint_not_trusted: "The mint approval was not accepted. Review it and try again.",
-      token_already_spent: "This Cashu token has already been spent.",
-      operation_not_found: "This Receive is no longer available. Start again.",
+      unsupported_behavior: "Only sat-denominated Cashu tokens are supported.",
+      coco_error: "cocod could not prepare this Receive. Only tokens from a previously Trusted Mint can be reviewed.",
+      operation_not_found: "This Receive is no longer available. Canonical Wallet state was refreshed.",
       operation_conflict: "This Receive conflicts with another Wallet operation. Try again.",
       credential_unavailable: "The cocod Client Credential is unavailable.",
       invalid_response: "cocod returned an invalid Receive response.",

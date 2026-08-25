@@ -16,7 +16,6 @@ stream_output=$(mktemp)
 stream_headers=$(mktemp)
 initialize_headers=$(mktemp)
 recovery_headers=$(mktemp)
-preview_headers=$(mktemp)
 operation_headers=$(mktemp)
 mint_headers=$(mktemp)
 command_headers=$(mktemp)
@@ -39,7 +38,7 @@ cleanup() {
     wait "$stream_pid" 2>/dev/null || true
   fi
   rm -f "$daemon_log" "$recovery_daemon_log" "$stream_output" "$stream_headers" \
-    "$initialize_headers" "$recovery_headers" "$preview_headers" \
+    "$initialize_headers" "$recovery_headers" \
     "$operation_headers" "$mint_headers" "$command_headers"
   rm -f "$result_headers"
   rm -rf "$state_dir" "$recovery_state_dir"
@@ -50,6 +49,8 @@ fail() {
   echo "contract: $*" >&2
   echo "contract: mock log follows" >&2
   sed -n '1,160p' "$daemon_log" >&2
+  echo "contract: recovery mock log follows" >&2
+  sed -n '1,160p' "$recovery_daemon_log" >&2
   echo "contract: stream output follows" >&2
   sed -n '1,120p' "$stream_output" >&2
   exit 1
@@ -103,12 +104,14 @@ jq -e '
   and ."x-cocod-interface-version" == "1"
   and (.paths as $paths | all([
     "/v1/status", "/v1/balances", "/v1/events", "/v1/mints",
-    "/v1/token-previews", "/v1/operations/receive",
+    "/v1/operations/receive",
     "/v1/operations/receive/prepared", "/v1/operations/receive/in-flight",
-    "/v1/operations/send/max", "/v1/operations/send",
+    "/v1/operations/send",
     "/v1/operations/send/prepared", "/v1/operations/send/in-flight",
     "/v1/admin/wallet/initialize", "/v1/admin/wallet/recovery-material"
-  ][]; $paths[.] != null))
+  ][]; $paths[.] != null)
+  and ($paths | has("/v1/token-previews") | not)
+  and ($paths | has("/v1/operations/send/max") | not))
 ' <<<"$openapi" >/dev/null || fail "OpenAPI discovery does not describe the mock-backed slice"
 
 status=$(curl -fsS "${auth[@]}" "$base_url/v1/status") \
@@ -152,13 +155,13 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
       {"mintUrl":"https://mint.two","unit":"sat","spendable":"10","reserved":"3","total":"13"}
     ]},
     "mints": {"items": [
-      {"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}
+      {"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}
     ]},
     "receivePrepared": {"items": []},
     "receiveInFlight": {"items": []},
-    "sendPrepared": {"items": [{"id":"send-1","type":"send","state":"prepared","mintUrl":"https://mint.one","unit":"sat","amount":"60","fee":"2","inputAmount":"70","needsSwap":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}]},
+    "sendPrepared": {"items": [{"id":"send-1","type":"send","state":"prepared","mintUrl":"https://mint.one","unit":"sat","method":"default","requestedAmount":"60","fee":"2","inputAmount":"70","needsSwap":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}]},
     "sendInFlight": {"items": []},
-    "event": {"type":"balance.updated","timestamp":"2026-08-20T12:00:01Z","data":{"mintUrl":"https://mint.one"}},
+    "event": {"type":"balance.updated","timestamp":"2026-08-20T12:00:01.000Z","data":{"mintUrl":"https://mint.one"}},
     "delivery":"partial"
   }' "$base_url/__test__/resources" >/dev/null \
   || fail "could not establish canonical mock resources"
@@ -178,30 +181,16 @@ jq -e '
 jq -e '.items[0].trusted == true' <<<"$mints" >/dev/null || fail "Known Mints shape is invalid"
 jq -e '.items == []' <<<"$receive_prepared" >/dev/null || fail "Receive prepared collection is invalid"
 jq -e '.items == []' <<<"$receive_in_flight" >/dev/null || fail "Receive in-flight collection is invalid"
-jq -e '.items[0].amount == "60" and (.items[0].amount | type == "string")' \
+jq -e '.items[0].method == "default" and .items[0].requestedAmount == "60"
+  and (.items[0].requestedAmount | type == "string")' \
   <<<"$send_prepared" >/dev/null || fail "Send Operation collection is invalid"
 jq -e '.items == []' <<<"$send_in_flight" >/dev/null || fail "Send in-flight collection is invalid"
-
-send_max=$(curl -fsS "${auth[@]}" \
-  "$base_url/v1/operations/send/max?mintUrl=https%3A%2F%2Fmint.one&unit=sat") \
-  || fail "daemon-calculated Send Max failed"
-jq -e '
-  . == {
-    mintUrl: "https://mint.one",
-    unit: "sat",
-    spendable: "90071992547409931234567890",
-    maxAmount: "90071992547409931234567890",
-    fee: "0",
-    needsSwap: false
-  }
-  and (.maxAmount | type == "string")
-' <<<"$send_max" >/dev/null || fail "Send Max was not returned losslessly by cocod"
 
 send_mint='https://mint.send.test'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"100","reserved":"0","total":"100"}]},
-    "mints":{"items":[{"mintUrl":"https://mint.send.test","name":"Send Mint","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}]},
+    "mints":{"items":[{"mintUrl":"https://mint.send.test","name":"Send Mint","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}]},
     "sendPrepared":{"items":[]},
     "sendInFlight":{"items":[]}
   }' "$base_url/__test__/resources" >/dev/null \
@@ -228,15 +217,16 @@ prepared_send_id=$(jq -er '.id' <<<"$prepared_send")
 jq -e --arg id "$prepared_send_id" --arg mint "$send_mint" '
   . == {
     id:$id,type:"send",state:"prepared",mintUrl:$mint,unit:"sat",
-    amount:"60",fee:"2",inputAmount:"70",needsSwap:true,
-    createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"
+    method:"default",requestedAmount:"60",fee:"2",inputAmount:"70",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"
   }
-  and ([.amount,.fee,.inputAmount] | all(type == "string"))
+  and ([.requestedAmount,.fee,.inputAmount] | all(type == "string"))
 ' <<<"$prepared_send" >/dev/null || fail "Send preparation did not return a safe Prepared Send"
 rg -q '^HTTP/.* 201' "$operation_headers" \
   || fail "Send preparation did not return 201 Created"
-rg -qi '^Location: /v1/operations/send/' "$operation_headers" \
-  || fail "Send preparation omitted its canonical Location"
+if rg -qi '^Location:' "$operation_headers"; then
+  fail "Send preparation added a noncanonical Location header"
+fi
 reserved_send_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
 jq -e --arg mint "$send_mint" '
   .items == [{mintUrl:$mint,unit:"sat",spendable:"30",reserved:"70",total:"100"}]
@@ -262,10 +252,6 @@ jq -e '.items == []' \
   <<<"$(curl -fsS "${auth[@]}" "$base_url/v1/operations/send/prepared")" >/dev/null \
   || fail "cancelled Send remained in the Prepared Send collection"
 
-stale_max=$(curl -fsS "${auth[@]}" \
-  "$base_url/v1/operations/send/max?mintUrl=https%3A%2F%2Fmint.send.test&unit=sat")
-jq -e '.maxAmount == "100"' <<<"$stale_max" >/dev/null \
-  || fail "stale-Max fixture did not begin at 100 sats"
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"50","reserved":"0","total":"50"}]}}' \
   "$base_url/__test__/resources" >/dev/null
@@ -274,39 +260,40 @@ stale_prepare=$(jq -cn --arg mint "$send_mint" \
   | curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
       -H 'Content-Type: application/json' --data-binary @- \
       "$base_url/v1/operations/send")
-[[ ${stale_prepare##*$'\n'} == 409 ]] \
-  || fail "stale Send Max did not fail preparation"
-jq -e '.error.code == "insufficient_balance"' \
+[[ ${stale_prepare##*$'\n'} == 500 ]] \
+  || fail "stale local balance did not fail canonical Send preparation"
+jq -e '.error.code == "coco_error"' \
   <<<"${stale_prepare%$'\n'*}" >/dev/null \
-  || fail "stale Send Max failure was not actionable"
+  || fail "stale balance failure did not use canonical Coco error mapping"
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"balances":{"items":[{"mintUrl":"https://mint.send.test","unit":"sat","spendable":"100","reserved":"0","total":"100"}]}}' \
   "$base_url/__test__/resources" >/dev/null
-max_prepared_send=$(jq -cn --arg mint "$send_mint" \
+full_balance_send=$(jq -cn --arg mint "$send_mint" \
   '{mintUrl:$mint,unit:"sat",amount:"100"}' \
   | curl -fsS "${auth[@]}" -X POST -H 'Content-Type: application/json' \
       --data-binary @- "$base_url/v1/operations/send") \
-  || fail "exact Send Max preparation failed"
-max_prepared_send_id=$(jq -er '.id' <<<"$max_prepared_send")
-jq -e '.amount == "100" and .fee == "0" and .inputAmount == "100"
-  and .needsSwap == false' <<<"$max_prepared_send" >/dev/null \
-  || fail "exact Send Max was recalculated by the client fixture"
+  || fail "full-balance Send preparation failed"
+full_balance_send_id=$(jq -er '.id' <<<"$full_balance_send")
+jq -e '.method == "default" and .requestedAmount == "100"
+  and .fee == "0" and .inputAmount == "100"
+  and .needsSwap == false' <<<"$full_balance_send" >/dev/null \
+  || fail "full-balance Send preparation changed its requested amount"
 executed_send=$(curl -fsS -D "$command_headers" "${auth[@]}" -X POST \
-  "$base_url/v1/operations/send/$max_prepared_send_id/execute") \
+  "$base_url/v1/operations/send/$full_balance_send_id/execute") \
   || fail "Prepared Send execution failed"
 send_token=$(jq -er '.result.token | select(type == "string" and length > 0)' \
   <<<"$executed_send") || fail "Send execution omitted its outgoing token"
-jq -e --arg id "$max_prepared_send_id" '
+jq -e --arg id "$full_balance_send_id" '
   .operation.id == $id and .operation.state == "pending"
-  and .operation.amount == "100" and .operation.fee == "0"
+  and .operation.requestedAmount == "100" and .operation.fee == "0"
   and (.operation | has("token") | not)
 ' <<<"$executed_send" >/dev/null \
   || fail "Send execution mixed its sensitive result into the Operation"
 rg -qi '^Cache-Control: no-store' "$command_headers" \
   || fail "Send execution result is cacheable"
 safe_send_lookup=$(curl -fsS "${auth[@]}" \
-  "$base_url/v1/operations/send/$max_prepared_send_id")
+  "$base_url/v1/operations/send/$full_balance_send_id")
 safe_send_in_flight=$(curl -fsS "${auth[@]}" \
   "$base_url/v1/operations/send/in-flight")
 send_status=$(curl -fsS "$base_url/__test__/status")
@@ -316,7 +303,7 @@ if rg -Fq "$send_token" <<<"$safe_send_lookup$safe_send_in_flight$send_status" \
 fi
 
 recovered_send_result=$(curl -fsS -D "$result_headers" "${auth[@]}" \
-  "$base_url/v1/operations/send/$max_prepared_send_id/result") \
+  "$base_url/v1/operations/send/$full_balance_send_id/result") \
   || fail "retained Send result was not retrievable"
 [[ $(jq -er '.token' <<<"$recovered_send_result") == "$send_token" ]] \
   || fail "Send result retrieval did not return the retained token"
@@ -324,12 +311,13 @@ rg -qi '^Cache-Control: no-store' "$result_headers" \
   || fail "retrieved Send result is cacheable"
 
 reclaimed_send=$(curl -fsS "${auth[@]}" -X POST \
-  "$base_url/v1/operations/send/$max_prepared_send_id/reclaim") \
+  "$base_url/v1/operations/send/$full_balance_send_id/reclaim") \
   || fail "Pending Send Reclaim failed"
-jq -e --arg id "$max_prepared_send_id" '
+jq -e --arg id "$full_balance_send_id" '
   .id == $id and .type == "send" and .state == "rolled_back"
-  and .amount == "100" and .fee == "0" and .inputAmount == "100"
-  and ([.amount,.fee,.inputAmount] | all(type == "string"))
+  and .method == "default" and .requestedAmount == "100"
+  and .fee == "0" and .inputAmount == "100"
+  and ([.requestedAmount,.fee,.inputAmount] | all(type == "string"))
   and (has("token") | not)
 ' <<<"$reclaimed_send" >/dev/null \
   || fail "successful Reclaim did not return the safe rolled-back Send"
@@ -356,11 +344,11 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$base_url/__test__/mode" >/dev/null
 inconclusive_reclaim=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$inconclusive_send_id/reclaim")
-[[ ${inconclusive_reclaim##*$'\n'} == 503 ]] \
+[[ ${inconclusive_reclaim##*$'\n'} == 500 ]] \
   || fail "inconclusive Reclaim returned the wrong status"
-jq -e '.error.code == "reclaim_inconclusive" and .error.retryable == true' \
+jq -e '.error.code == "coco_error" and .error.retryable == false' \
   <<<"${inconclusive_reclaim%$'\n'*}" >/dev/null \
-  || fail "inconclusive Reclaim was not a structured retryable state"
+  || fail "inconclusive Reclaim did not use canonical Coco error mapping"
 jq -e --arg id "$inconclusive_send_id" '
   .id == $id and .state == "pending"
 ' <<<"$(curl -fsS "${auth[@]}" \
@@ -391,9 +379,9 @@ recipient_won=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$recipient_send_id/reclaim")
 [[ ${recipient_won##*$'\n'} == 409 ]] \
   || fail "recipient-won Reclaim race returned the wrong status"
-jq -e '.error.code == "recipient_won" and .error.retryable == false' \
+jq -e '.error.code == "invalid_operation_state" and .error.retryable == false' \
   <<<"${recipient_won%$'\n'*}" >/dev/null \
-  || fail "recipient-won Reclaim race was not a stable terminal state"
+  || fail "recipient-won Reclaim race did not expose canonical terminal state"
 jq -e --arg id "$recipient_send_id" '
   .id == $id and .state == "finalized"
 ' <<<"$(curl -fsS "${auth[@]}" \
@@ -424,11 +412,11 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   "$base_url/__test__/mode" >/dev/null
 unavailable_refresh=$(curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id/refresh")
-[[ ${unavailable_refresh##*$'\n'} == 503 ]] \
+[[ ${unavailable_refresh##*$'\n'} == 500 ]] \
   || fail "unavailable Mint Send refresh returned the wrong status"
-jq -e '.error.code == "mint_unavailable" and .error.retryable == true' \
+jq -e '.error.code == "coco_error" and .error.retryable == false' \
   <<<"${unavailable_refresh%$'\n'*}" >/dev/null \
-  || fail "unavailable Mint Send refresh was not a stable retryable state"
+  || fail "unavailable Mint Send refresh did not use canonical Coco error mapping"
 jq -e --arg id "$unavailable_refresh_send_id" '.id == $id and .state == "pending"' \
   <<<"$(curl -fsS "${auth[@]}" \
   "$base_url/v1/operations/send/$unavailable_refresh_send_id")" >/dev/null \
@@ -445,60 +433,14 @@ spent_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1zcGVudCJ9'
 conflicting_token='cashuAeyJ0ZXN0Ijoic2xpY2UtNC1jb25mbGljdCJ9'
 receive_mint='https://mint.slice4.test'
 
-before_preview_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
-before_preview_mints=$(curl -fsS "${auth[@]}" "$base_url/v1/mints")
-before_preview_operations=$(curl -fsS "${auth[@]}" \
-  "$base_url/v1/operations/receive/prepared")
-preview=$(post_token "/v1/token-previews" true -fsS -D "$preview_headers" \
-  <<<"$receive_token") || fail "valid Receive preview failed"
-jq -e --arg mint "$receive_mint" '
-  . == {
-    mintUrl: $mint,
-    unit: "sat",
-    amount: "1200",
-    fee: "2",
-    netAmount: "1198",
-    trusted: false
-  }
-' <<<"$preview" >/dev/null || fail "Receive preview does not match the accepted DTO"
-rg -qi '^Cache-Control: no-store' "$preview_headers" \
-  || fail "token preview response is cacheable"
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/balances") == "$before_preview_balances" ]] \
-  || fail "token preview mutated balances"
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/mints") == "$before_preview_mints" ]] \
-  || fail "token preview registered or trusted a mint"
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/operations/receive/prepared") \
-    == "$before_preview_operations" ]] || fail "token preview created an Operation"
-
-for preview_case in \
-  "$invalid_token|invalid_token|422" \
-  "$unsupported_token|unsupported_unit|422" \
-  "$unavailable_token|mint_unavailable|503"; do
-  token=${preview_case%%|*}
-  remainder=${preview_case#*|}
-  expected_code=${remainder%%|*}
-  expected_status=${remainder##*|}
-  failure=$(post_token "/v1/token-previews" true -sS -w '\n%{http_code}' \
-    <<<"$token")
-  [[ ${failure##*$'\n'} == "$expected_status" ]] \
-    || fail "$expected_code preview returned the wrong status"
-  jq -e --arg code "$expected_code" \
-    '.error.code == $code and (.error.retryable | type == "boolean")' \
-    <<<"${failure%$'\n'*}" >/dev/null \
-    || fail "$expected_code preview did not return a structured error"
-done
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/balances") == "$before_preview_balances" ]] \
-  || fail "rejected previews mutated balances"
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/mints") == "$before_preview_mints" ]] \
-  || fail "rejected previews mutated Known Mints"
-
+before_receive_balances=$(curl -fsS "${auth[@]}" "$base_url/v1/balances")
 not_registered=$(post_token "/v1/operations/receive" false -sS -w '\n%{http_code}' \
   <<<"$receive_token")
-[[ ${not_registered##*$'\n'} == 409 ]] \
-  || fail "Receive creation accepted an unregistered mint"
-jq -e '.error.code == "mint_not_registered"' \
+[[ ${not_registered##*$'\n'} == 500 ]] \
+  || fail "Receive preparation accepted a token from an unknown Mint"
+jq -e '.error.code == "coco_error"' \
   <<<"${not_registered%$'\n'*}" >/dev/null \
-  || fail "unregistered mint failure did not use mint_not_registered"
+  || fail "unknown-Mint preparation failure did not use canonical error mapping"
 
 registered=$(curl -fsS -D "$mint_headers" "${auth[@]}" -X POST \
   -H 'Content-Type: application/json' \
@@ -509,20 +451,13 @@ rg -q '^HTTP/.* 201' "$mint_headers" \
 jq -e --arg mint "$receive_mint" \
   '.mintUrl == $mint and .trusted == false' <<<"$registered" >/dev/null \
   || fail "Known Mint registration implicitly trusted the mint"
-mint_location=$(sed -n 's/^Location: //p' "$mint_headers" | tr -d '\r')
-[[ $mint_location == /v1/mints/info\?mintUrl=* ]] \
-  || fail "Known Mint registration omitted its canonical Location"
-canonical_mint=$(curl -fsS "${auth[@]}" "$base_url$mint_location") \
-  || fail "Known Mint canonical Location was not readable"
-[[ $canonical_mint == "$registered" ]] \
-  || fail "Known Mint canonical Location returned a different resource"
 not_trusted=$(post_token "/v1/operations/receive" false -sS -w '\n%{http_code}' \
   <<<"$receive_token")
-[[ ${not_trusted##*$'\n'} == 409 ]] \
+[[ ${not_trusted##*$'\n'} == 500 ]] \
   || fail "Receive creation accepted an untrusted mint"
-jq -e '.error.code == "mint_not_trusted"' \
+jq -e '.error.code == "coco_error"' \
   <<<"${not_trusted%$'\n'*}" >/dev/null \
-  || fail "untrusted mint failure did not use mint_not_trusted"
+  || fail "untrusted Mint failure did not use canonical error mapping"
 
 trusted=$(curl -fsS -D "$mint_headers" "${auth[@]}" -X POST \
   -H 'Content-Type: application/json' \
@@ -534,6 +469,32 @@ jq -e --arg mint "$receive_mint" \
   '.mintUrl == $mint and .trusted == true' <<<"$trusted" >/dev/null \
   || fail "Known Mint trust did not return the updated resource"
 
+for token in "$invalid_token" "$unavailable_token"; do
+  failure=$(post_token "/v1/operations/receive" false -sS -w '\n%{http_code}' \
+    <<<"$token")
+  [[ ${failure##*$'\n'} == 500 ]] \
+    || fail "canonical Receive preparation failure returned the wrong status"
+  jq -e '.error.code == "coco_error" and .error.retryable == false' \
+    <<<"${failure%$'\n'*}" >/dev/null \
+    || fail "Receive preparation failure did not use canonical error mapping"
+done
+
+unsupported_receive=$(post_token "/v1/operations/receive" false -fsS \
+  <<<"$unsupported_token") || fail "non-sat Receive preparation failed"
+unsupported_receive_id=$(jq -er '.id' <<<"$unsupported_receive")
+jq -e --arg id "$unsupported_receive_id" '
+  .id == $id and .state == "prepared" and .unit == "usd"
+  and .amount == "12" and .fee == "1"
+' <<<"$unsupported_receive" >/dev/null \
+  || fail "non-sat Receive did not expose its canonical safe unit"
+unsupported_cancel=$(curl -fsS "${auth[@]}" -X POST \
+  "$base_url/v1/operations/receive/$unsupported_receive_id/cancel") \
+  || fail "non-sat Prepared Receive could not be cancelled"
+jq -e --arg id "$unsupported_receive_id" \
+  '.id == $id and .state == "rolled_back" and .unit == "usd"' \
+  <<<"$unsupported_cancel" >/dev/null \
+  || fail "non-sat Receive cancellation changed its canonical unit"
+
 cancelled_prepare=$(post_token "/v1/operations/receive" false -fsS \
   <<<"$cancel_token") || fail "cancellable Receive creation failed"
 cancelled_id=$(jq -er '.id' <<<"$cancelled_prepare")
@@ -544,9 +505,10 @@ rg -q '^HTTP/.* 200' "$command_headers" \
   || fail "Receive cancellation did not return 200 OK"
 jq -e --arg id "$cancelled_id" '
   .id == $id and .type == "receive" and .state == "rolled_back"
-  and .amount == "400" and .fee == "1" and .netAmount == "399"
+  and .amount == "400" and .fee == "1"
+  and (keys | sort) == (["amount","createdAt","fee","id","mintUrl","state","type","unit","updatedAt"] | sort)
 ' <<<"$cancelled" >/dev/null || fail "cancel did not return the updated Operation"
-[[ $(curl -fsS "${auth[@]}" "$base_url/v1/balances") == "$before_preview_balances" ]] \
+[[ $(curl -fsS "${auth[@]}" "$base_url/v1/balances") == "$before_receive_balances" ]] \
   || fail "cancelling a Prepared Receive changed balances"
 
 prepared=$(post_token "/v1/operations/receive" false -fsS -D "$operation_headers" \
@@ -561,24 +523,24 @@ jq -e --arg id "$operation_id" --arg mint "$receive_mint" '
     unit: "sat",
     amount: "1200",
     fee: "2",
-    netAmount: "1198",
-    createdAt: "2026-08-20T12:00:00Z",
-    updatedAt: "2026-08-20T12:00:00Z"
+    createdAt: "2026-08-20T12:00:00.000Z",
+    updatedAt: "2026-08-20T12:00:00.000Z"
   }
 ' <<<"$prepared" >/dev/null || fail "Receive creation did not return a safe Prepared Receive"
 rg -qi '^Cache-Control: no-store' "$operation_headers" \
   || fail "token-bearing Receive creation response is cacheable"
 rg -q '^HTTP/.* 201' "$operation_headers" \
   || fail "Receive creation did not return 201 Created"
-rg -qi '^Location: /v1/operations/receive/' "$operation_headers" \
-  || fail "Receive creation omitted its canonical Location"
+if rg -qi '^Location:' "$operation_headers"; then
+  fail "Receive creation added a noncanonical Location header"
+fi
 
 duplicate=$(post_token "/v1/operations/receive" false -sS -w '\n%{http_code}' \
   <<<"$receive_token")
-[[ ${duplicate##*$'\n'} == 409 ]] \
+[[ ${duplicate##*$'\n'} == 500 ]] \
   || fail "one bearer token created two Prepared Receives"
-jq -e '.error.code == "operation_conflict"' <<<"${duplicate%$'\n'*}" >/dev/null \
-  || fail "duplicate Receive creation did not return operation_conflict"
+jq -e '.error.code == "coco_error"' <<<"${duplicate%$'\n'*}" >/dev/null \
+  || fail "duplicate Receive creation did not use canonical error mapping"
 
 canonical_prepared=$(curl -fsS "${auth[@]}" \
   "$base_url/v1/operations/receive/$operation_id")
@@ -598,7 +560,7 @@ rg -q '^HTTP/.* 200' "$command_headers" \
   || fail "Receive execution did not return 200 OK"
 jq -e --arg id "$operation_id" '
   .id == $id and .type == "receive" and .state == "finalized"
-  and .amount == "1200" and .fee == "2" and .netAmount == "1198"
+  and .amount == "1200" and .fee == "2"
 ' <<<"$executed" >/dev/null || fail "execute did not return the finalized Operation"
 canonical_final=$(curl -fsS "${auth[@]}" \
   "$base_url/v1/operations/receive/$operation_id")
@@ -613,13 +575,13 @@ jq -e --arg mint "$receive_mint" '
 
 replay=$(post_token "/v1/operations/receive" false -sS -w '\n%{http_code}' \
   <<<"$receive_token")
-[[ ${replay##*$'\n'} == 409 ]] || fail "redeemed token replay was accepted"
-jq -e '.error.code == "token_already_spent"' <<<"${replay%$'\n'*}" >/dev/null \
-  || fail "redeemed token replay did not return token_already_spent"
+[[ ${replay##*$'\n'} == 500 ]] || fail "redeemed token replay was accepted"
+jq -e '.error.code == "coco_error"' <<<"${replay%$'\n'*}" >/dev/null \
+  || fail "redeemed token replay did not use canonical error mapping"
 
 for operation_case in \
-  "missing|execute|operation_not_found|404" \
-  "$operation_id|execute|operation_conflict|409"; do
+  "missing|execute|not_found|404" \
+  "$operation_id|execute|invalid_operation_state|409"; do
   case_id=${operation_case%%|*}
   remainder=${operation_case#*|}
   command=${remainder%%|*}
@@ -636,8 +598,8 @@ for operation_case in \
 done
 
 for creation_case in \
-  "$spent_token|token_already_spent|409" \
-  "$conflicting_token|operation_conflict|409"; do
+  "$spent_token|coco_error|500" \
+  "$conflicting_token|coco_error|500"; do
   token=${creation_case%%|*}
   remainder=${creation_case#*|}
   expected_code=${remainder%%|*}
@@ -653,7 +615,7 @@ done
 
 mock_receive_status=$(curl -fsS "$base_url/__test__/status")
 if rg -Fq "$receive_token" \
-    <<<"$preview$prepared$canonical_prepared$executed$canonical_final$mock_receive_status" \
+    <<<"$prepared$canonical_prepared$executed$canonical_final$mock_receive_status" \
     || rg -Fq "$receive_token" "$daemon_log" "$stream_output"; then
   fail "Receive bearer token escaped command bodies"
 fi
@@ -670,18 +632,18 @@ done
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "balances":{"items":[{"mintUrl":"https://mint.one","unit":"sat","spendable":"42","reserved":"0","total":"42"}]},
-    "event":{"type":"balance.updated","timestamp":"2026-08-20T12:00:02Z","data":{"mintUrl":"https://mint.one"}},
+    "event":{"type":"balance.updated","timestamp":"2026-08-20T12:00:02.000Z","data":{"mintUrl":"https://mint.one"}},
     "delivery":"partial"
   }' "$base_url/__test__/resources" >/dev/null
 for _attempt in {1..40}; do
-  rg -Fqx 'data: {"type":"balance.updated","timestamp":"2026-08-20T12:00:02Z","data":{"mintUrl":"https://mint.one"}}' \
+  rg -Fqx 'data: {"type":"balance.updated","timestamp":"2026-08-20T12:00:02.000Z","data":{"mintUrl":"https://mint.one"}}' \
     "$stream_output" && break
   sleep 0.05
 done
 rg -qi '^Content-Type: text/event-stream' "$stream_headers" \
   || fail "events did not use the SSE content type"
 rg -q '^retry: 3000$' "$stream_output" || fail "event stream omitted the server retry hint"
-rg -Fqx 'data: {"type":"balance.updated","timestamp":"2026-08-20T12:00:02Z","data":{"mintUrl":"https://mint.one"}}' \
+rg -Fqx 'data: {"type":"balance.updated","timestamp":"2026-08-20T12:00:02.000Z","data":{"mintUrl":"https://mint.one"}}' \
   "$stream_output" || fail "event stream did not emit a safe invalidation envelope"
 if rg -q '^id:' "$stream_output" || rg -qi 'proof|token|90071992547409931234567890' "$stream_output"; then
   fail "event stream exposed replay metadata or wallet material"
@@ -754,9 +716,9 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
       }]},
       mints:{items:[
         {mintUrl:$receiveMint,name:"Receive Mint",trusted:true,
-          createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"},
+          createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"},
         {mintUrl:$sendMint,name:"Recovery Send Mint",trusted:true,
-          createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"}
+          createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"}
       ]}
     }')" "$recovery_base_url/__test__/resources" >/dev/null \
   || fail "could not fund the recovered Send fixture"
@@ -770,7 +732,7 @@ unavailable_send_result=$(curl -sS -w '\n%{http_code}' "${auth[@]}" \
   "$recovery_base_url/v1/operations/send/$recovery_send_id/result")
 [[ ${unavailable_send_result##*$'\n'} == 409 ]] \
   || fail "Prepared Send result did not remain unavailable"
-jq -e '.error.code == "result_not_available" and .error.retryable == true' \
+jq -e '.error.code == "operation_result_not_available" and .error.retryable == false' \
   <<<"${unavailable_send_result%$'\n'*}" >/dev/null \
   || fail "unavailable Send result was not a structured retryable state"
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -838,7 +800,7 @@ jq -e --arg before "$before_interrupt_id" --arg after "$after_interrupt_id" '
   and (.items | any(.id == $before and .state == "executing"
     and .amount == "400" and (.amount | type == "string")))
   and (.items | any(.id == $after and .state == "executing"
-    and .amount == "1200" and (.netAmount | type == "string")))
+    and .amount == "1200" and (.fee | type == "string")))
 ' <<<"$recovered_in_flight" >/dev/null \
   || fail "restart did not rehydrate the same safe executing Operations"
 
@@ -848,10 +810,10 @@ recovered_send_in_flight=$(curl -fsS "${auth[@]}" \
 jq -e --arg id "$recovery_send_id" '
   .items == [{
     id:$id,type:"send",state:"pending",mintUrl:"https://mint.slice7.test",
-    unit:"sat",amount:"60",fee:"2",inputAmount:"70",needsSwap:true,
-    createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"
+    unit:"sat",method:"default",requestedAmount:"60",fee:"2",inputAmount:"70",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"
   }]
-  and ([.items[0].amount,.items[0].fee,.items[0].inputAmount]
+  and ([.items[0].requestedAmount,.items[0].fee,.items[0].inputAmount]
     | all(type == "string"))
 ' <<<"$recovered_send_in_flight" >/dev/null \
   || fail "restart did not recover the same safe Pending Send"
@@ -899,9 +861,9 @@ recovery_replay=$(jq -Rn '{token: input}' <<<"$receive_token" \
   | curl -sS -w '\n%{http_code}' "${auth[@]}" -X POST \
       -H 'Content-Type: application/json' --data-binary @- \
       "$recovery_base_url/v1/operations/receive")
-[[ ${recovery_replay##*$'\n'} == 409 ]] \
+[[ ${recovery_replay##*$'\n'} == 500 ]] \
   || fail "recovered token replay created a second Receive"
-jq -e '.error.code == "token_already_spent"' \
+jq -e '.error.code == "coco_error"' \
   <<<"${recovery_replay%$'\n'*}" >/dev/null \
   || fail "recovered token replay did not remain actionable"
 [[ $(curl -fsS "${auth[@]}" "$recovery_base_url/v1/balances") \

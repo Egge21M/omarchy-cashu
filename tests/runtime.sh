@@ -148,13 +148,13 @@ close_receive_panel() {
   ' >/dev/null
 }
 
-preview_clipboard_receive() {
+prepare_clipboard_receive() {
   local token=$1
   set_sensitive_clipboard "$token"
   open_receive_panel >/dev/null
   require_receive_action pasteReceive "Receive Paste action"
   wait_panel_snapshot '.receiveTextPresent == true' >/dev/null
-  require_receive_action previewReceive "Receive preview"
+  require_receive_action prepareReceive "Receive preparation"
 }
 
 prepare_receive_fixture() {
@@ -175,7 +175,7 @@ fund_send_fixture() {
     }]},
     mints:{items:[{
       mintUrl:"https://mint.one",name:"Mint One",trusted:true,
-      createdAt:"2026-08-20T12:00:00Z",updatedAt:"2026-08-20T12:00:00Z"
+      createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"
     }]},
     sendPrepared:{items:[]},sendInFlight:{items:[]}
   }' | curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -238,8 +238,8 @@ shell_pid=$!
 wait_snapshot '
   .connectionState == "connected"
   and .compatibilityState == "compatible"
-  and .receivePreviewAvailable == true
-  and .sendMaxAvailable == true
+  and .receiveAvailable == true
+  and .sendAvailable == true
   and .walletState == "uninitialized"
   and .spendableBalance == "0"
   and .reservedBalance == "0"
@@ -296,6 +296,17 @@ wait_mock_status '
   and .resourceRequests.sendInFlight >= 1
   and .streamConnections == 1
 ' >/dev/null
+
+[[ $(panel_action openPanel) == "ok" ]] \
+  || fail "panel could not be opened for canonical transfer actions"
+[[ $(panel_action openReceive) == "ok" ]] \
+  || fail "Receive entry point was unavailable with canonical OpenAPI"
+[[ $(panel_action cancelReceive) == "ok" ]] \
+  || fail "canonical Receive entry point could not be dismissed"
+[[ $(panel_action openSend) == "ok" ]] \
+  || fail "Send entry point was unavailable with canonical OpenAPI"
+[[ $(panel_action cancelSend) == "ok" ]] \
+  || fail "canonical Send entry point could not be dismissed"
 
 kill "$shell_pid"
 wait "$shell_pid" 2>/dev/null || true
@@ -365,10 +376,7 @@ if rg -Fq "$receive_token" <<<"$(adapter_call snapshot)$panel_snapshot"; then
   fail "opening Receive read or exposed the clipboard token"
 fi
 wait_mock_status '
-  .tokenPreviewRequests == 0
-  and .mintRegistrationRequests == 0
-  and .mintTrustRequests == 0
-  and .receiveCreateRequests == 0
+  .receiveCreateRequests == 0
 ' >/dev/null
 
 wtype 'x'
@@ -379,6 +387,17 @@ wait_panel_snapshot '
 ' >/dev/null
 close_receive_panel "manual entry"
 
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data "$(jq -cn '{
+    mints:{items:[{
+      mintUrl:"https://mint.slice4.test",name:"Slice 4 Mint",trusted:true,
+      createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:00:00.000Z"
+    }]},
+    event:{type:"mint.updated",timestamp:"2026-08-20T12:00:00.000Z",
+      data:{mintUrl:"https://mint.slice4.test"}}
+  }')" "$base_url/__test__/resources" >/dev/null
+wait_snapshot '.trustedMintCount == 1' >/dev/null
+
 open_receive_panel >/dev/null
 require_receive_action pasteReceive "explicit Receive Paste action"
 wait_panel_snapshot '
@@ -386,87 +405,140 @@ wait_panel_snapshot '
   and .receiveTextPresent == true
   and .receiveClipboardReads == 1
 ' >/dev/null
-require_receive_action previewReceive "pasted Cashu token preview"
+before_prepared_receive=$(curl -fsS "$base_url/__test__/status")
+before_prepared_receive_creates=$(jq -r '.receiveCreateRequests' \
+  <<<"$before_prepared_receive")
+before_prepared_receive_cancels=$(jq -r '.receiveCancelRequests' \
+  <<<"$before_prepared_receive")
+require_receive_action prepareReceive "canonical Receive preparation"
 panel_snapshot=$(wait_panel_snapshot '
-  .receiveViewState == "preview"
-  and .receivePreviewAmount == "1200"
-  and .receivePreviewFee == "2"
-  and .receivePreviewNetAmount == "1198"
-  and .receivePreviewUnit == "sat"
-  and .receivePreviewMint == "https://mint.slice4.test"
-  and .receiveMintTrusted == false
-  and .receiveApprovalVisible == true
-  and .receiveMintApproved == false
-  and .receiveConfirmEnabled == false
-')
-[[ $(panel_action confirmReceive) == "disabled" ]] \
-  || fail "a mint could be received before explicit trust approval"
-require_receive_action approveReceiveMint "Trusted Mint approval selection"
-wait_panel_snapshot '
-  .receiveViewState == "preview"
-  and .receiveMintApproved == true
-  and .receiveMintTrusted == false
+  .receiveViewState == "review"
+  and .receivePreparedAmount == "1200"
+  and .receivePreparedFee == "2"
+  and .receivePreparedUnit == "sat"
+  and .receivePreparedMint == "https://mint.slice4.test"
   and .receiveConfirmEnabled == true
-' >/dev/null
-close_receive_panel "local Mint approval"
-wait_mock_status '
-  .tokenPreviewRequests == 1
-  and .mintRegistrationRequests == 0
-  and .mintTrustRequests == 0
-  and .receiveCreateRequests == 0
-  and .receiveExecuteRequests == 0
-' >/dev/null
+')
+if rg -Fq "$receive_token" <<<"$(adapter_call snapshot)$panel_snapshot"; then
+  fail "Prepared Receive review exposed bearer-token text"
+fi
+close_receive_panel "Prepared Receive review"
+wait_mock_status ".receiveCreateRequests == $((before_prepared_receive_creates + 1))
+  and .receiveCancelRequests == $((before_prepared_receive_cancels + 1))
+  and .receiveExecuteRequests == 0" >/dev/null
 after_cancel_balances=$(curl -fsS -H "Authorization: Bearer $credential" \
   "$base_url/v1/balances")
-after_cancel_mints=$(curl -fsS -H "Authorization: Bearer $credential" \
-  "$base_url/v1/mints")
 jq -e '.items == []' <<<"$after_cancel_balances" >/dev/null \
-  || fail "cancelling before confirmation changed balances"
-jq -e '.items == []' <<<"$after_cancel_mints" >/dev/null \
-  || fail "cancelling after local approval trusted a mint"
+  || fail "cancelling a Prepared Receive changed balances"
 
-for preview_error in \
-  "$invalid_token|This Cashu token is invalid. Check it and try again." \
-  "$unsupported_token|Only sat-denominated Cashu tokens are supported." \
-  "$unavailable_token|The mint is unavailable. Try again later."; do
-  token=${preview_error%%|*}
-  expected_message=${preview_error#*|}
-  preview_clipboard_receive "$token"
-  panel_snapshot=$(wait_panel_snapshot \
-    ".receiveViewState == \"error\" and .receiveError == \"$expected_message\" and .receiveTextPresent == false")
-  if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
-      || rg -Fq "$token" "$shell_log" "$mock_log"; then
-    fail "Receive preview error exposed bearer-token text"
-  fi
-  close_receive_panel "preview error"
-done
-
-preview_clipboard_receive "$receive_token"
+durable_prepared_receive=$(prepare_receive_fixture "$receive_token") \
+  || fail "durable Prepared Receive fixture creation failed"
+durable_prepared_receive_id=$(jq -er '.id' <<<"$durable_prepared_receive")
+adapter_call reconnect >/dev/null
+wait_snapshot ".connectionState == \"connected\"
+  and (.activeTransfers | any(.id == \"$durable_prepared_receive_id\"
+    and .state == \"prepared\"))" >/dev/null
+panel_action openPanel >/dev/null
+require_receive_action openReceive "durable Prepared Receive reopen"
 wait_panel_snapshot '
-  .receiveViewState == "preview"
-  and .receiveApprovalVisible == true
-  and .receiveConfirmEnabled == false
-' >/dev/null
-require_receive_action approveReceiveMint "Trusted Mint approval selection"
-wait_panel_snapshot '
-  .receiveMintApproved == true
+  .receiveViewState == "review"
+  and .receivePreparedAmount == "1200"
   and .receiveConfirmEnabled == true
 ' >/dev/null
+close_receive_panel "reopened durable preparation"
+
+before_ambiguous_receive_creates=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.receiveCreateRequests')
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveCreateInterruption":"after_commit"}' \
+  "$base_url/__test__/mode" >/dev/null
+prepare_clipboard_receive "$receive_token"
+wait_panel_snapshot '
+  .receiveViewState == "review"
+  and .receivePreparedAmount == "1200"
+  and .receiveConfirmEnabled == true
+' >/dev/null
+wait_mock_status ".receiveCreateRequests == $((before_ambiguous_receive_creates + 1))
+  and .receiveCreateDroppedResponses == 1" >/dev/null
+close_receive_panel "ambiguous committed preparation"
+
+before_malformed_receive=$(curl -fsS "$base_url/__test__/status")
+before_malformed_receive_creates=$(jq -r '.receiveCreateRequests' \
+  <<<"$before_malformed_receive")
+before_malformed_receive_responses=$(jq -r '.receiveCreateDroppedResponses' \
+  <<<"$before_malformed_receive")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveCreateInterruption":"malformed_after_commit"}' \
+  "$base_url/__test__/mode" >/dev/null
+prepare_clipboard_receive "$receive_token"
+wait_panel_snapshot '
+  .receiveViewState == "review"
+  and .receivePreparedAmount == "1200"
+  and .receiveConfirmEnabled == true
+' >/dev/null
+wait_mock_status ".receiveCreateRequests == $((before_malformed_receive_creates + 1))
+  and .receiveCreateDroppedResponses == $((before_malformed_receive_responses + 1))" >/dev/null
+close_receive_panel "malformed committed preparation"
+
+before_dismissed_ambiguous=$(curl -fsS "$base_url/__test__/status")
+before_dismissed_ambiguous_cancels=$(jq -r '.receiveCancelRequests' \
+  <<<"$before_dismissed_ambiguous")
+before_dismissed_ambiguous_failures=$(jq -r '.receivePrepareReconcileFailures // 0' \
+  <<<"$before_dismissed_ambiguous")
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveCreateInterruption":"after_commit","receivePrepareReconcileError":true,"receiveDelayMs":300}' \
+  "$base_url/__test__/mode" >/dev/null
+prepare_clipboard_receive "$receive_token"
+wait_panel_snapshot '.receiveViewState == "preparing"' >/dev/null
+require_receive_action cancelReceive "ambiguous Receive dismissal"
+wait_snapshot '.receiveState == "error"' >/dev/null
+wait_mock_status ".receivePrepareReconcileFailures == $((before_dismissed_ambiguous_failures + 1))" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"receiveDelayMs":0}' "$base_url/__test__/mode" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected" and .activeTransfers == []' >/dev/null
+wait_mock_status ".receiveCancelRequests == $((before_dismissed_ambiguous_cancels + 1))" >/dev/null
+
+before_unsupported_receive_cancels=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.receiveCancelRequests')
+prepare_clipboard_receive "$unsupported_token"
+wait_panel_snapshot '
+  .receiveViewState == "error"
+  and .receiveError == "Only sat-denominated Cashu tokens are supported."
+  and .receiveConfirmEnabled == false
+' >/dev/null
+wait_mock_status ".receiveCancelRequests == $((before_unsupported_receive_cancels + 1))" >/dev/null
+close_receive_panel "unsupported unit"
+
+canonical_prepare_error='cocod could not prepare this Receive. Only tokens from a previously Trusted Mint can be reviewed.'
+for token in \
+  "$invalid_token" \
+  "$unavailable_token" \
+  "$conflicting_token" \
+  "$not_registered_token" \
+  "$not_trusted_token"; do
+  prepare_clipboard_receive "$token"
+  panel_snapshot=$(wait_panel_snapshot \
+    ".receiveViewState == \"error\" and .receiveError == \"$canonical_prepare_error\" and .receiveTextPresent == false")
+  if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
+      || rg -Fq "$token" "$shell_log" "$mock_log"; then
+    fail "Receive preparation error exposed bearer-token text"
+  fi
+  close_receive_panel "preparation error"
+done
+
+before_successful_receive=$(curl -fsS "$base_url/__test__/status")
+before_successful_receive_creates=$(jq -r '.receiveCreateRequests' \
+  <<<"$before_successful_receive")
+before_successful_receive_executes=$(jq -r '.receiveExecuteRequests' \
+  <<<"$before_successful_receive")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"resources":"ok","delayMs":150,"receiveDelayMs":150}' \
   "$base_url/__test__/mode" >/dev/null
-require_receive_action confirmReceive "approved Receive confirmation"
-wait_panel_snapshot '
-  .receiveViewState == "approving"
-  and .receiveTextPresent == true
-' >/dev/null
-[[ $(panel_action cancelReceive) == "disabled" ]] \
-  || fail "Receive cancellation did not report a rejected approving transition"
-wait_panel_snapshot '
-  .receiveViewState == "approving"
-  and .receiveTextPresent == true
-' >/dev/null
-wait_panel_snapshot '.receiveViewState == "preparing"' >/dev/null
+prepare_clipboard_receive "$receive_token"
+wait_panel_snapshot '.receiveViewState == "preparing" and .receiveTextPresent == false' >/dev/null
+wait_panel_snapshot '.receiveViewState == "review" and .receiveConfirmEnabled == true' >/dev/null
+require_receive_action confirmReceive "Prepared Receive confirmation"
 wait_panel_snapshot '.receiveViewState == "executing"' >/dev/null
 wait_panel_snapshot '.receiveViewState == "reconciling"' >/dev/null
 adapter_snapshot=$(wait_snapshot '
@@ -481,12 +553,10 @@ panel_snapshot=$(wait_panel_snapshot '
   and .spendableBalance == "1198"
 ')
 status=$(wait_mock_status '
-  .mintRegistrationRequests == 1
-  and .mintTrustRequests == 1
-  and .receiveCreateRequests == 1
-  and .receiveExecuteRequests == 1
-  and .receiveOperationCount == 1
+  .receiveOperationCount >= 1
 ')
+wait_mock_status ".receiveCreateRequests == $((before_successful_receive_creates + 1))
+  and .receiveExecuteRequests == $((before_successful_receive_executes + 1))" >/dev/null
 if rg -Fq "$receive_token" <<<"$adapter_snapshot$panel_snapshot$status" \
     || rg -Fq "$receive_token" "$shell_log" "$mock_log"; then
   fail "successful Receive retained bearer-token text"
@@ -496,46 +566,24 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"resources":"ok","delayMs":0,"receiveDelayMs":0}' \
   "$base_url/__test__/mode" >/dev/null
 
-for receive_error in \
-  "$receive_token|trusted|This Cashu token has already been spent." \
-  "$conflicting_token|trusted|This Receive conflicts with another Wallet operation. Try again." \
-  "$not_registered_token|approve|The mint could not be registered. Try again." \
-  "$not_trusted_token|approve|The mint approval was not accepted. Review it and try again." \
-  "$not_found_token|trusted|This Receive is no longer available. Start again."; do
-  token=${receive_error%%|*}
-  remainder=${receive_error#*|}
-  receive_mode=${remainder%%|*}
-  expected_message=${remainder#*|}
-  preview_clipboard_receive "$token"
-  if [[ $receive_mode == approve ]]; then
-    wait_panel_snapshot '
-      .receiveViewState == "preview"
-      and .receiveMintTrusted == false
-      and .receiveConfirmEnabled == false
-    ' >/dev/null
-    require_receive_action approveReceiveMint "Trusted Mint approval selection"
-    wait_panel_snapshot '
-      .receiveMintApproved == true
-      and .receiveConfirmEnabled == true
-    ' >/dev/null
-  else
-    wait_panel_snapshot '.receiveViewState == "preview" and .receiveMintTrusted == true' >/dev/null
-  fi
-  require_receive_action confirmReceive "Receive confirmation"
-  panel_snapshot=$(wait_panel_snapshot \
-    ".receiveViewState == \"error\" and .receiveError == \"$expected_message\"")
-  if rg -Fq "$token" <<<"$(adapter_call snapshot)$panel_snapshot" \
-      || rg -Fq "$token" "$shell_log" "$mock_log"; then
-    fail "Receive execution error exposed bearer-token text"
-  fi
-  close_receive_panel "structured execution error"
-done
+prepare_clipboard_receive "$not_found_token"
+wait_panel_snapshot '.receiveViewState == "review" and .receiveConfirmEnabled == true' >/dev/null
+require_receive_action confirmReceive "Receive confirmation"
+panel_snapshot=$(wait_panel_snapshot '
+  .receiveViewState == "error"
+  and .receiveError == "This Receive is no longer available. Canonical Wallet state was refreshed."
+')
+if rg -Fq "$not_found_token" <<<"$(adapter_call snapshot)$panel_snapshot" \
+    || rg -Fq "$not_found_token" "$shell_log" "$mock_log"; then
+  fail "Receive execution error exposed bearer-token text"
+fi
+close_receive_panel "structured execution error"
 
 if rg -Fq 'Binding loop detected for property "receiveState"' "$shell_log"; then
   fail "Receive transitions triggered a receiveState binding loop"
 fi
 
-echo "runtime: Receive input, preview, approval, cancellation, execution, and errors passed"
+echo "runtime: canonical Prepared Receive review, cancellation, execution, and errors passed"
 
 # Reconcile interruptions on both sides of the Wallet commit point through the
 # public HTTP/SSE and diagnostics seams. The token is streamed on stdin and is
@@ -556,18 +604,18 @@ wait_snapshot ".receiveRecoveryState == \"recovering\"
   and .receiveRecoveryOperationId == \"$before_recovery_id\"
   and (.activeTransfers | length) == 1
   and .activeTransfers[0].stateLabel == \"Recovering Receive\"" >/dev/null
-wait_snapshot ".receiveRecoveryState == \"unavailable\"
+wait_snapshot ".receiveRecoveryState == \"failed\"
   and .receiveRecoveryOperationId == \"$before_recovery_id\"
   and .spendableBalance == \"1198\"
   and (.activeTransfers | length) == 1
   and .activeTransfers[0].id == \"$before_recovery_id\"
-  and .activeTransfers[0].stateLabel == \"Receive temporarily unavailable\"
-  and .activeTransfers[0].detail == \"The mint is unavailable. Try again later.\"" >/dev/null
+  and .activeTransfers[0].stateLabel == \"Receive needs attention\"
+  and .activeTransfers[0].detail == \"cocod could not reconcile this Receive. Retry when the Mint is available.\"" >/dev/null
 wait_panel_snapshot '
-  .receiveRecoveryState == "unavailable"
-  and .receiveRecoveryMessage == "Interrupted Receive is temporarily unavailable"
-  and .activeTransferStateLabel == "Receive temporarily unavailable"
-  and .activeTransferDetail == "The mint is unavailable. Try again later."
+  .receiveRecoveryState == "failed"
+  and .receiveRecoveryMessage == "Interrupted Receive needs attention"
+  and .activeTransferStateLabel == "Receive needs attention"
+  and .activeTransferDetail == "cocod could not reconcile this Receive. Retry when the Mint is available."
 ' >/dev/null
 wait_mock_status ".receiveRefreshRequests > $before_recovery_refreshes" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -576,7 +624,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
     receiveDelayMs: 0,
     event: {
       type: "operation.updated",
-      timestamp: "2026-08-20T12:04:00Z",
+      timestamp: "2026-08-20T12:04:00.000Z",
       data: {
         operationType: "receive",
         operationId: $id,
@@ -588,7 +636,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "$(jq -cn --arg id "$before_recovery_id" '{
     event: {
       type: "operation.updated",
-      timestamp: "2026-08-20T12:04:00Z",
+      timestamp: "2026-08-20T12:04:00.000Z",
       data: {
         operationType: "receive",
         operationId: $id,
@@ -690,7 +738,7 @@ wait_snapshot ".activeTransfers == [{
   \"unit\": \"sat\"
 }]" >/dev/null
 
-for timestamp in 2026-08-20T12:05:02Z 2026-08-20T12:05:01Z; do
+for timestamp in 2026-08-20T12:05:02.000Z 2026-08-20T12:05:01.000Z; do
   curl -fsS -X POST -H 'Content-Type: application/json' \
     --data "$(jq -cn --arg id "$pending_recovery_id" --arg timestamp "$timestamp" '{
       event: {
@@ -733,7 +781,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "event": {
       "type":"operation.updated",
-      "timestamp":"2026-08-20T12:05:00Z",
+      "timestamp":"2026-08-20T12:05:00.000Z",
       "data": {
         "operationType":"receive",
         "operationId":"missing-receive",
@@ -743,7 +791,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   }' "$base_url/__test__/resources" >/dev/null
 wait_snapshot '.receiveRecoveryState == "failed"
   and .receiveRecoveryOperationId == "missing-receive"
-  and .receiveRecoveryError == "This Receive is no longer available. Start again."
+  and .receiveRecoveryError == "This Receive is no longer available. Canonical Wallet state was refreshed."
   and (.activeTransfers | length) == 1' >/dev/null
 
 before_stale_lookup=$(curl -fsS "$base_url/__test__/status")
@@ -755,7 +803,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "$(jq -cn --arg id "$pending_recovery_id" '{
     event: {
       type: "operation.updated",
-      timestamp: "2026-08-20T12:05:03Z",
+      timestamp: "2026-08-20T12:05:03.000Z",
       data: {
         operationType: "receive",
         operationId: $id,
@@ -784,7 +832,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "$(jq -cn --arg id "$pending_recovery_id" '{
     event: {
       type: "operation.updated",
-      timestamp: "2026-08-20T12:05:04Z",
+      timestamp: "2026-08-20T12:05:04.000Z",
       data: {
         operationType: "receive",
         operationId: $id,
@@ -826,7 +874,7 @@ COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
 shell_pid=$!
 wait_snapshot ".connectionState == \"connected\"
   and (.activeTransfers | length) == 2
-  and (.activeTransfers | all(.stateLabel == \"Receive temporarily unavailable\"))
+  and (.activeTransfers | all(.stateLabel == \"Receive needs attention\"))
   and (.activeTransfers | any(.id == \"$first_concurrent_id\"))
   and (.activeTransfers | any(.id == \"$second_concurrent_id\"))" >/dev/null
 
@@ -838,7 +886,7 @@ for concurrent_id in "$first_concurrent_id" "$second_concurrent_id"; do
     --data "$(jq -cn --arg id "$concurrent_id" '{
       event: {
         type: "operation.updated",
-        timestamp: "2026-08-20T12:05:05Z",
+        timestamp: "2026-08-20T12:05:05.000Z",
         data: {
           operationType: "receive",
           operationId: $id,
@@ -886,13 +934,13 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
       {"mintUrl":"https://mint.init","unit":"sat","spendable":"40","reserved":"10","total":"50"}
     ]},
     "mints":{"items":[
-      {"mintUrl":"https://mint.init","name":"Init Mint","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}
+      {"mintUrl":"https://mint.init","name":"Init Mint","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}
     ]},
     "sendPrepared":{"items":[]},
     "sendInFlight":{"items":[{
       "id":"send-init","type":"send","state":"init","mintUrl":"https://mint.init",
-      "unit":"sat","amount":"10","createdAt":"2026-08-20T12:00:00Z",
-      "updatedAt":"2026-08-20T12:00:00Z"
+      "unit":"sat","method":"default","requestedAmount":"10","createdAt":"2026-08-20T12:00:00.000Z",
+      "updatedAt":"2026-08-20T12:00:00.000Z"
     }]}
   }' "$base_url/__test__/resources" >/dev/null
 adapter_call reconnect >/dev/null
@@ -913,9 +961,9 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
       {"mintUrl":"https://mint.untrusted","unit":"sat","spendable":"500","reserved":"0","total":"500"}
     ]},
     "mints":{"items":[
-      {"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"},
-      {"mintUrl":"https://mint.two","name":"Mint Two","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"},
-      {"mintUrl":"https://mint.untrusted","name":"Untrusted Mint","trusted":false,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}
+      {"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"},
+      {"mintUrl":"https://mint.two","name":"Mint Two","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"},
+      {"mintUrl":"https://mint.untrusted","name":"Untrusted Mint","trusted":false,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}
     ]},
     "sendPrepared":{"items":[]},
     "sendInFlight":{"items":[]}
@@ -939,7 +987,6 @@ wait_panel_snapshot '
   and .sendAmount == ""
   and .sendMintOptionCount == 2
   and .sendSelectedMint == ""
-  and .sendMaxAmount == ""
   and .sendClipboardWrites == 0
 ' >/dev/null
 [[ $(panel_action setSendAmount 60) == "ok" ]] \
@@ -952,33 +999,14 @@ wait_panel_snapshot '
 ' >/dev/null
 [[ $(panel_action selectSendMint https://mint.two) == "ok" ]] \
   || fail "Cashu User could not choose between eligible Trusted Mints"
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"sendMaxOverride":{"maxAmount":"73","fee":"7","needsSwap":true}}' \
-  "$base_url/__test__/mode" >/dev/null
-before_send_max=$(curl -fsS "$base_url/__test__/status" | jq -r '.sendMaxRequests')
-[[ $(panel_action sendMax) == "ok" ]] \
-  || fail "Send Max action was unavailable"
-wait_mock_status ".sendMaxRequests > $before_send_max" >/dev/null
-wait_panel_snapshot '
-  .sendViewState == "entry"
-  and .sendSelectedMint == "https://mint.two"
-  and .sendAmount == "73"
-  and .sendMaxAmount == "73"
-  and .sendMintOptionCount == 2
-' >/dev/null
-[[ $(panel_action setSendAmount 60) == "ok" ]] \
-  || fail "Send amount could not be edited after Max"
 [[ $(panel_action selectSendMint https://mint.one) == "ok" ]] \
-  || fail "Send mint could not be changed after Max"
+  || fail "Send mint could not be changed"
 [[ $(panel_action selectSendMint https://mint.two) == "ok" ]] \
-  || fail "Send mint could not be restored after Max"
+  || fail "Send mint could not be restored"
 wait_panel_snapshot '
   .sendAmount == "60"
   and .sendSelectedMint == "https://mint.two"
-  and .sendMaxAmount == ""
 ' >/dev/null
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"sendMaxOverride":null}' "$base_url/__test__/mode" >/dev/null
 [[ $(panel_action setSendAmount 90) == "ok" ]] \
   || fail "Send amount could not be changed"
 wait_panel_snapshot '
@@ -994,7 +1022,7 @@ wait_panel_snapshot '
   and .keyCatcherBlocked == false
 ' >/dev/null
 
-echo "runtime: Send Mint selection and daemon-only Max passed"
+echo "runtime: ordinary Send Mint and amount selection passed without Max"
 
 open_send_flow 60 https://mint.one
 before_send_prepare=$(curl -fsS "$base_url/__test__/status")
@@ -1045,13 +1073,13 @@ before_mint_revalidation=$(curl -fsS "$base_url/__test__/status" \
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "mints":{"items":[
-      {"mintUrl":"https://mint.one","name":"Mint One","trusted":false,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:06:00Z"},
-      {"mintUrl":"https://mint.two","name":"Mint Two","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"},
-      {"mintUrl":"https://mint.untrusted","name":"Untrusted Mint","trusted":false,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}
+      {"mintUrl":"https://mint.one","name":"Mint One","trusted":false,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:06:00.000Z"},
+      {"mintUrl":"https://mint.two","name":"Mint Two","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"},
+      {"mintUrl":"https://mint.untrusted","name":"Untrusted Mint","trusted":false,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}
     ]},
     "event":{
       "type":"mint.updated",
-      "timestamp":"2026-08-20T12:06:00Z",
+      "timestamp":"2026-08-20T12:06:00.000Z",
       "data":{"mintUrl":"https://mint.one"}
     }
   }' "$base_url/__test__/resources" >/dev/null
@@ -1083,24 +1111,17 @@ wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 echo "runtime: Prepared Send review, reservation, and cancellation passed"
 
 fund_send_fixture 80
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"balances":{"items":[{
-    "mintUrl":"https://mint.one","unit":"sat","spendable":"120",
-    "reserved":"0","total":"120"
-  }]}}' "$base_url/__test__/resources" >/dev/null
 open_send_flow 60
-panel_action sendMax >/dev/null
-wait_panel_snapshot '.sendAmount == "120" and .sendPrepareEnabled == true' >/dev/null
-before_revoked_max_prepare=$(curl -fsS "$base_url/__test__/status" \
+before_revoked_mint_prepare=$(curl -fsS "$base_url/__test__/status" \
   | jq -r '.sendCreateRequests')
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
     "mints":{"items":[{
       "mintUrl":"https://mint.one","name":"Mint One","trusted":false,
-      "createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:07:00Z"
+      "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:07:00.000Z"
     }]},
     "event":{
-      "type":"mint.updated","timestamp":"2026-08-20T12:07:00Z",
+      "type":"mint.updated","timestamp":"2026-08-20T12:07:00.000Z",
       "data":{"mintUrl":"https://mint.one"}
     }
   }' "$base_url/__test__/resources" >/dev/null
@@ -1111,35 +1132,12 @@ wait_panel_snapshot '
   and .sendPrepareEnabled == false
 ' >/dev/null
 [[ $(panel_action prepareSend) == "disabled" ]] \
-  || fail "cached Send Max authorized a revoked Mint"
-wait_mock_status ".sendCreateRequests == $before_revoked_max_prepare" >/dev/null
+  || fail "stale local selection authorized a revoked Mint"
+wait_mock_status ".sendCreateRequests == $before_revoked_mint_prepare" >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: daemon Max never bypasses canonical Mint trust"
-
-fund_send_fixture 80
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"balances":{"items":[{
-    "mintUrl":"https://mint.one","unit":"sat","spendable":"120",
-    "reserved":"0","total":"120"
-  }]}}' "$base_url/__test__/resources" >/dev/null
-open_send_flow 60
-panel_action sendMax >/dev/null
-wait_panel_snapshot '
-  .sendAmount == "120"
-  and .sendSelectedMint == "https://mint.one"
-  and .sendPrepareEnabled == true
-' >/dev/null
-[[ $(panel_action prepareSend) == "ok" ]] \
-  || fail "daemon Max was rejected against a stale local balance"
-wait_panel_snapshot '.sendViewState == "review" and .sendReviewAmount == "120"' >/dev/null
-panel_action cancelSend >/dev/null
-wait_panel_snapshot '.sendViewState == "entry" and .reservedBalance == "0"' >/dev/null
-panel_action cancelSend >/dev/null
-wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
-
-echo "runtime: daemon Max remains authoritative over a stale local balance"
+echo "runtime: canonical Known Mint trust gates ordinary Send"
 
 fund_send_fixture 100
 open_send_flow 60
@@ -1147,12 +1145,12 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":800}' "$base_url/__test__/mode" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"event":{
-    "type":"operation.updated","timestamp":"2026-08-20T12:00:00Z",
+    "type":"operation.updated","timestamp":"2026-08-20T12:00:00.000Z",
     "data":{"operationType":"send","operationId":"stale-send","mintUrl":"https://mint.one"}
   }}' "$base_url/__test__/resources" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"event":{
-    "type":"balance.updated","timestamp":"2026-08-20T12:00:00Z",
+    "type":"balance.updated","timestamp":"2026-08-20T12:00:00.000Z",
     "data":{"mintUrl":"https://mint.one"}
   }}' "$base_url/__test__/resources" >/dev/null
 wait_mock_status '.resourceRequestsActive > 0' >/dev/null
@@ -1186,7 +1184,7 @@ panel_action prepareSend >/dev/null
 wait_panel_snapshot '.sendViewState == "preparing"' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"event":{
-    "type":"operation.updated","timestamp":"2026-08-20T12:00:00Z",
+    "type":"operation.updated","timestamp":"2026-08-20T12:00:00.000Z",
     "data":{"operationType":"send","operationId":"external-send","mintUrl":"https://mint.one"}
   }}' "$base_url/__test__/resources" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -1661,49 +1659,21 @@ for invalid_send_amount in 0 01 -1 1.5; do
     || fail "invalid Send amount $invalid_send_amount reached cocod"
 done
 panel_action setSendAmount 60 >/dev/null
-panel_action sendMax >/dev/null
-wait_panel_snapshot '.sendAmount == "100" and .sendMaxAmount == "100"' >/dev/null
 before_stale_send=$(curl -fsS "$base_url/__test__/status")
 before_stale_balances=$(jq -r '.resourceRequests.balances' <<<"$before_stale_send")
-before_stale_max=$(jq -r '.sendMaxRequests' <<<"$before_stale_send")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"balances":{"items":[{"mintUrl":"https://mint.one","unit":"sat","spendable":"50","reserved":"0","total":"50"}]}}' \
   "$base_url/__test__/resources" >/dev/null
 panel_action setSendAmount 60 >/dev/null
 [[ $(panel_action prepareSend) == "ok" ]] \
-  || fail "stale point-in-time Send Max did not reach cocod"
+  || fail "ordinary Send preparation did not reach cocod"
 wait_panel_snapshot '
   .sendViewState == "error"
-  and .sendErrorCode == "insufficient_balance"
+  and .sendErrorCode == "coco_error"
   and .sendError != ""
-  and .sendMaxAmount == "50"
   and .spendableBalance == "50"
 ' >/dev/null
-wait_mock_status ".resourceRequests.balances > $before_stale_balances
-  and .sendMaxRequests > $before_stale_max" >/dev/null
-panel_action cancelSend >/dev/null
-wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
-
-fund_send_fixture 100
-open_send_flow 60
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"balances":{"items":[{"mintUrl":"https://mint.one","unit":"sat","spendable":"50","reserved":"0","total":"50"}]}}' \
-  "$base_url/__test__/resources" >/dev/null
-panel_action prepareSend >/dev/null
-wait_panel_snapshot '
-  .sendViewState == "error"
-  and .sendErrorCode == "insufficient_balance"
-  and .sendMaxAmount == "50"
-  and .sendRefreshedMaxAvailable == true
-' >/dev/null
-[[ $(panel_action useRefreshedSendMax) == "ok" ]] \
-  || fail "refreshed Send Max could not recover the insufficient-balance error"
-wait_panel_snapshot '
-  .sendViewState == "entry"
-  and .sendAmount == "50"
-  and .sendSelectedMint == "https://mint.one"
-  and .sendMaxAmount == "50"
-' >/dev/null
+wait_mock_status ".resourceRequests.balances > $before_stale_balances" >/dev/null
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
@@ -1715,7 +1685,7 @@ for send_create_error in mint_not_registered mint_not_trusted mint_unavailable; 
     "$base_url/__test__/mode" >/dev/null
   panel_action prepareSend >/dev/null
   wait_panel_snapshot ".sendViewState == \"error\"
-    and .sendErrorCode == \"$send_create_error\"
+    and .sendErrorCode == \"coco_error\"
     and .sendError != \"\"" >/dev/null
   panel_action cancelSend >/dev/null
   wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
@@ -1773,7 +1743,7 @@ wait_panel_snapshot ".sendViewState == \"entry\"
 panel_action cancelSend >/dev/null
 wait_panel_snapshot '.sendViewState == "closed"' >/dev/null
 
-echo "runtime: stale Send Max, structured errors, and lossless decimal strings passed"
+echo "runtime: stale balances, structured Send errors, and lossless decimal strings passed"
 
 fund_send_fixture 100
 prepare_send_flow 60
@@ -1873,7 +1843,7 @@ before_send_invalidation_creates=$(jq -r '.sendCreateRequests' <<<"$before_send_
 before_send_invalidation_executes=$(jq -r '.sendExecuteRequests' <<<"$before_send_invalidation")
 for _duplicate in 1 2; do
   jq -cn --arg id "$invalidated_send_id" '{event:{
-    type:"operation.updated",timestamp:"2026-08-20T12:08:00Z",
+    type:"operation.updated",timestamp:"2026-08-20T12:08:00.000Z",
     data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
   }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
     "$base_url/__test__/resources" >/dev/null
@@ -1887,7 +1857,7 @@ after_operation_invalidation=$(curl -fsS "$base_url/__test__/status")
 after_operation_lookup=$(jq -r '.sendLookupRequests' <<<"$after_operation_invalidation")
 after_operation_refresh=$(jq -r '.sendRefreshRequests' <<<"$after_operation_invalidation")
 jq -cn '{event:{
-  type:"balance.updated",timestamp:"2026-08-20T12:08:01Z",
+  type:"balance.updated",timestamp:"2026-08-20T12:08:01.000Z",
   data:{mintUrl:"https://mint.one"}
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
@@ -1922,8 +1892,8 @@ panel_action beginReclaimSend >/dev/null
 wait_panel_snapshot '.sendViewState == "reclaim-warning"' >/dev/null
 panel_action confirmReclaimSend >/dev/null
 wait_panel_snapshot '.sendViewState == "error"
-  and .sendErrorCode == "reclaim_inconclusive"
-  and (.sendError | test("recoverable"; "i"))
+  and .sendErrorCode == "coco_error"
+  and .sendError != ""
   and .sendCopyAvailable == false
   and .activeTransferStateLabel == "Pending Send"
   and .spendableBalance == "30"
@@ -1943,8 +1913,8 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   || fail "concurrent recipient redemption fixture failed"
 panel_action confirmReclaimSend >/dev/null
 wait_panel_snapshot '.sendViewState == "error"
-  and .sendErrorCode == "recipient_won"
-  and (.sendError | test("recipient"; "i"))
+  and .sendErrorCode == "operation_not_found"
+  and .sendError != ""
   and .sendCopyAvailable == false
   and .activeTransferCount == 0
   and .spendableBalance == "30"
@@ -1964,12 +1934,12 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendRefreshError":"mint_unavailable"}' \
   "$base_url/__test__/mode" >/dev/null
 jq -cn --arg id "$pending_unavailable_id" '{event:{
-  type:"operation.updated",timestamp:"2026-08-20T12:09:00Z",
+  type:"operation.updated",timestamp:"2026-08-20T12:09:00.000Z",
   data:{operationType:"send",operationId:$id,mintUrl:"https://mint.one"}
 }}' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
   "$base_url/__test__/resources" >/dev/null
 wait_panel_snapshot '.sendViewState == "error"
-  and .sendErrorCode == "mint_unavailable"
+  and .sendErrorCode == "coco_error"
   and .sendCopyAvailable == false
   and .activeTransferStateLabel == "Pending Send"
   and .spendableBalance == "30"
@@ -2041,7 +2011,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
       {"mintUrl":"https://mint.one","unit":"sat","spendable":"90071992547409931234567890","reserved":"7","total":"90071992547409931234567897"},
       {"mintUrl":"https://mint.two","unit":"sat","spendable":"10","reserved":"3","total":"13"}
     ]},
-    "event":{"type":"balance.updated","timestamp":"2026-08-20T12:01:00Z","data":{"mintUrl":"https://mint.one"}},
+    "event":{"type":"balance.updated","timestamp":"2026-08-20T12:01:00.000Z","data":{"mintUrl":"https://mint.one"}},
     "delivery":"partial"
   }' "$base_url/__test__/resources" >/dev/null
 wait_snapshot '
@@ -2091,8 +2061,8 @@ before_mint=$(curl -fsS "$base_url/__test__/status")
 before_mint_requests=$(jq -r '.resourceRequests.mints' <<<"$before_mint")
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
-    "mints":{"items":[{"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00Z","updatedAt":"2026-08-20T12:00:00Z"}]},
-    "event":{"type":"mint.updated","timestamp":"2026-08-20T12:01:02Z","data":{"mintUrl":"https://mint.one"}}
+    "mints":{"items":[{"mintUrl":"https://mint.one","name":"Mint One","trusted":true,"createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:00:00.000Z"}]},
+    "event":{"type":"mint.updated","timestamp":"2026-08-20T12:01:02.000Z","data":{"mintUrl":"https://mint.one"}}
   }' "$base_url/__test__/resources" >/dev/null
 wait_snapshot '.trustedMintCount == 1' >/dev/null
 wait_mock_status ".resourceRequests.mints > $before_mint_requests" >/dev/null
@@ -2108,7 +2078,7 @@ wait_mock_status \
    and .resourceRequests.balances > $before_parse_balances" >/dev/null
 wait_snapshot '.connectionState == "connected" and .lastErrorCode == ""' >/dev/null
 
-locked_status='{"daemon":{"version":"0.0.17","interfaceVersion":"1"},"wallet":{"configuredAt":"2026-08-20T12:00:00Z"},"seedAccess":{"state":"locked","requiresPassphrase":true},"cocoSession":{"state":"stopped","startedAt":null,"lastFailure":null}}'
+locked_status='{"daemon":{"version":"0.0.17","interfaceVersion":"1"},"wallet":{"configuredAt":"2026-08-20T12:00:00.000Z"},"seedAccess":{"state":"locked","requiresPassphrase":true},"cocoSession":{"state":"stopped","startedAt":null,"lastFailure":null}}'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "{\"status\":$locked_status}" "$base_url/__test__/resources" >/dev/null
 adapter_call reconnect >/dev/null
@@ -2118,7 +2088,7 @@ wait_snapshot '
   and .barAttention == true
 ' >/dev/null
 
-running_status='{"daemon":{"version":"0.0.17","interfaceVersion":"1"},"wallet":{"configuredAt":"2026-08-20T12:00:00Z"},"seedAccess":{"state":"available","requiresPassphrase":false},"cocoSession":{"state":"running","startedAt":"2026-08-20T12:00:00Z","lastFailure":null}}'
+running_status='{"daemon":{"version":"0.0.17","interfaceVersion":"1"},"wallet":{"configuredAt":"2026-08-20T12:00:00.000Z"},"seedAccess":{"state":"available","requiresPassphrase":false},"cocoSession":{"state":"running","startedAt":"2026-08-20T12:00:00.000Z","lastFailure":null}}'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data "{\"status\":$running_status}" "$base_url/__test__/resources" >/dev/null
 adapter_call reconnect >/dev/null
@@ -2184,7 +2154,7 @@ curl -fsS -H "Authorization: Bearer $credential" -X POST \
   || fail "rotation recovery fixture cleanup failed"
 jq -cn --arg id "$rotation_receive_id" '{
   event:{
-    type:"operation.updated",timestamp:"2026-08-20T12:07:00Z",
+    type:"operation.updated",timestamp:"2026-08-20T12:07:00.000Z",
     data:{operationType:"receive",operationId:$id,mintUrl:"https://mint.one"}
   }
 }' | curl -fsS -X POST -H 'Content-Type: application/json' --data-binary @- \
@@ -2197,7 +2167,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 adapter_call reconnect >/dev/null
 wait_snapshot '
   .connectionState == "unavailable"
-  and .lastErrorCode == "temporarily_unavailable"
+  and .lastErrorCode == "internal_error"
   and .walletState == "unavailable"
 ' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \

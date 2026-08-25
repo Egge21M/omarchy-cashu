@@ -166,8 +166,6 @@ jq -e '
   ][]; $paths[.] != null))
 ' <<<"$openapi" >/dev/null \
   || fail "local cocod does not expose the canonical Wallet Client OpenAPI surface"
-receive_preview_available=$(jq -r '.paths | has("/v1/token-previews")' <<<"$openapi")
-send_max_available=$(jq -r '.paths | has("/v1/operations/send/max")' <<<"$openapi")
 
 status=$(auth_curl -fsS "$base_url/v1/status") \
   || fail "authenticated lifecycle status failed"
@@ -194,8 +192,8 @@ wait_snapshot "
   and .compatibilityState == \"compatible\"
   and .walletState == \"uninitialized\"
   and .fixtureBacked == false
-  and .receivePreviewAvailable == $receive_preview_available
-  and .sendMaxAvailable == $send_max_available
+  and .receiveAvailable == true
+  and .sendAvailable == true
 " >/dev/null
 [[ $(adapter_call canonicalDtosCompatible) == "ok" ]] \
   || fail "Shell Adapter rejected canonical cocod Receive, Send, or error DTOs"
