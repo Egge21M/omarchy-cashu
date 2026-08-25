@@ -192,6 +192,7 @@ Item {
   readonly property string unit: "sat"
   readonly property var activeTransfers: composeActiveTransfers(
     receiveOperations, sendOperations, receiveRecoveries)
+  readonly property var activeSends: composeActiveSends(sendOperations)
   readonly property var trustedMints: trustedKnownMints(mintsResource)
   readonly property bool hasActiveTransfers: activeTransfers.length > 0
   readonly property bool needsAttention: compatibilityState === "incompatible"
@@ -287,6 +288,7 @@ Item {
       reservedBalance: reservedBalance,
       unit: unit,
       activeTransfers: activeTransfers,
+      activeSends: activeSends,
       trustedMintCount: trustedMints.length,
       receiveState: receiveState,
       receiveError: receiveError,
@@ -582,6 +584,82 @@ Item {
       })
     }
     return result
+  }
+
+  function sendStateLabel(state) {
+    var labels = {
+      prepared: "Prepared",
+      executing: "Executing",
+      pending: "Pending",
+      rolling_back: "Reclaiming"
+    }
+    return labels[String(state || "")] || ""
+  }
+
+  function mintHostname(mintUrl) {
+    var match = /^https?:\/\/(\[[^\]]+\]|[^\/:?#]+)(?::[0-9]+)?(?:[\/?#]|$)/
+      .exec(String(mintUrl || ""))
+    return match ? String(match[1]) : String(mintUrl || "")
+  }
+
+  function updateTimestampValue(timestamp) {
+    var value = Date.parse(String(timestamp || ""))
+    return isNaN(value) ? 0 : value
+  }
+
+  function composeActiveSends(sends) {
+    var activeStates = ["prepared", "executing", "pending", "rolling_back"]
+    var byId = ({})
+    var source = Array.isArray(sends) ? sends : []
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation.id || "")
+      var state = String(operation.state || "")
+      if (!id || activeStates.indexOf(state) === -1) continue
+      var previous = byId[id]
+      if (previous && updateTimestampValue(previous.updatedAt)
+          > updateTimestampValue(operation.updatedAt)) continue
+      byId[id] = operation
+    }
+
+    var result = []
+    for (var operationId in byId) {
+      var value = byId[operationId]
+      var valueState = String(value.state || "")
+      result.push({
+        id: operationId,
+        type: "send",
+        state: valueState,
+        stateLabel: sendStateLabel(valueState),
+        amount: operationAmount(value) || "0",
+        unit: String(value.unit || "sat"),
+        mintUrl: String(value.mintUrl || ""),
+        mintHostname: mintHostname(value.mintUrl),
+        updatedAt: String(value.updatedAt || ""),
+        reservedInput: valueState === "prepared"
+          ? String(value.inputAmount || "0") : ""
+      })
+    }
+    result.sort(function(left, right) {
+      var timestampOrder = updateTimestampValue(right.updatedAt)
+        - updateTimestampValue(left.updatedAt)
+      return timestampOrder !== 0 ? timestampOrder
+        : String(left.id).localeCompare(String(right.id))
+    })
+    return result
+  }
+
+  function relativeUpdateTime(timestamp, nowMs) {
+    var updatedMs = Date.parse(String(timestamp || ""))
+    var referenceMs = Number(nowMs)
+    if (isNaN(updatedMs) || isNaN(referenceMs)) return "Update time unavailable"
+    var elapsedSeconds = Math.max(0, Math.floor((referenceMs - updatedMs) / 1000))
+    if (elapsedSeconds < 45) return "Updated just now"
+    if (elapsedSeconds < 3600)
+      return "Updated " + Math.floor(elapsedSeconds / 60) + "m ago"
+    if (elapsedSeconds < 86400)
+      return "Updated " + Math.floor(elapsedSeconds / 3600) + "h ago"
+    return "Updated " + Math.floor(elapsedSeconds / 86400) + "d ago"
   }
 
   function projectWalletState(status) {

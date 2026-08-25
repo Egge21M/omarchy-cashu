@@ -49,6 +49,11 @@ panel_call() {
     io.github.egge21m.omarchy-cashu.runtime-test panelSnapshot 2>/dev/null
 }
 
+bar_call() {
+  quickshell ipc --any-display -p "$shell_qml" call \
+    io.github.egge21m.omarchy-cashu.runtime-test barSnapshot 2>/dev/null
+}
+
 panel_action() {
   quickshell ipc --any-display -p "$shell_qml" call \
     io.github.egge21m.omarchy-cashu.runtime-test "$@" 2>/dev/null
@@ -219,6 +224,7 @@ cp "$project_dir/Service.qml" "$runtime_dir/Service.qml"
 cp "$project_dir/Panel.qml" "$runtime_dir/Panel.qml"
 cp "$project_dir/ReceiveFlow.qml" "$runtime_dir/ReceiveFlow.qml"
 cp "$project_dir/SendFlow.qml" "$runtime_dir/SendFlow.qml"
+cp "$project_dir/BarWidget.qml" "$runtime_dir/BarWidget.qml"
 cp "$project_dir/tests/runtime-shell.qml" "$shell_qml"
 ln -s /usr/share/omarchy/shell/Commons "$runtime_dir/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$runtime_dir/Ui"
@@ -952,6 +958,154 @@ wait_snapshot '
 ' >/dev/null
 
 echo "runtime: canonical init Send accepts its state-specific safe shape"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "balances":{"items":[
+      {"mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","spendable":"401","reserved":"99","total":"500"}
+    ]},
+    "sendPrepared":{"items":[{
+      "id":"send-browse-prepared","type":"send","state":"prepared",
+      "mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","method":"default",
+      "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+      "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:01:00.000Z"
+    }]},
+    "sendInFlight":{"items":[
+      {"id":"send-browse-executing","type":"send","state":"executing",
+       "mintUrl":"https://mint.executing.test","unit":"sat","method":"default",
+       "requestedAmount":"21","fee":"1","inputAmount":"22","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:02:00.000Z"},
+      {"id":"send-browse-pending","type":"send","state":"pending",
+       "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+       "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:03:00.000Z"},
+      {"id":"send-browse-reclaiming","type":"send","state":"rolling_back",
+       "mintUrl":"https://mint.reclaiming.test","unit":"sat","method":"default",
+       "requestedAmount":"41","fee":"1","inputAmount":"42","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:04:00.000Z"},
+      {"id":"send-browse-prepared","type":"send","state":"prepared",
+       "mintUrl":"https://mint.prepared.test:3338/path","unit":"sat","method":"default",
+       "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:01:00.000Z"},
+      {"id":"send-browse-terminal","type":"send","state":"finalized",
+       "mintUrl":"https://mint.terminal.test","unit":"sat","method":"default",
+       "requestedAmount":"51","fee":"1","inputAmount":"52","needsSwap":false,
+       "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:05:00.000Z"},
+      {"id":"send-browse-init","type":"send","state":"init",
+       "mintUrl":"https://mint.init.test","unit":"sat","method":"default",
+       "requestedAmount":"61","createdAt":"2026-08-25T00:00:00.000Z",
+       "updatedAt":"2026-08-25T00:06:00.000Z"}
+    ]}
+  }' "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '
+  .connectionState == "connected"
+  and .reservedBalance == "99"
+  and (.activeSends | length) == 4
+  and [.activeSends[].id] == [
+    "send-browse-reclaiming","send-browse-pending",
+    "send-browse-executing","send-browse-prepared"
+  ]
+  and [.activeSends[].stateLabel] == ["Reclaiming","Pending","Executing","Prepared"]
+  and .activeSends[1].amount == "31"
+  and .activeSends[1].mintHostname == "mint.pending.test"
+  and .activeSends[3].mintHostname == "mint.prepared.test"
+  and .activeSends[3].reservedInput == "12"
+  and (.activeSends | all(.id != "send-browse-terminal" and .id != "send-browse-init"))
+' >/dev/null
+
+bar_snapshot=$(bar_call)
+jq -e '
+  .stateLabel == "Unlocked"
+  and (.text | contains("Unlocked"))
+  and (.tooltipText | contains("Active Transfer"))
+  and ([.text,.tooltipText] | all(test("4|11|21|31|41|99") | not))
+' <<<"$bar_snapshot" >/dev/null \
+  || fail "Omarchy bar exposed an Active Sends count or transfer amount"
+
+panel_action openPanel >/dev/null
+wait_panel_snapshot '
+  .activeSendsCount == 4
+  and .activeSendsCountText == "4 Active Sends"
+  and .activeSendsViewState == "closed"
+' >/dev/null
+before_active_browse=$(curl -fsS "$base_url/__test__/status")
+before_active_browse_executes=$(jq -r '.sendExecuteRequests' <<<"$before_active_browse")
+before_active_browse_cancels=$(jq -r '.sendCancelRequests' <<<"$before_active_browse")
+before_active_browse_reclaims=$(jq -r '.sendReclaimRequests' <<<"$before_active_browse")
+before_active_browse_results=$(jq -r '.sendResultRequests' <<<"$before_active_browse")
+before_active_browse_refreshes=$(jq -r '.sendRefreshRequests' <<<"$before_active_browse")
+[[ $(panel_action openActiveSends) == "ok" ]] \
+  || fail "Active Sends count did not open its full panel subpage"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsBackVisible == true
+  and .activeSendsEmptyVisible == false
+  and [.activeSendRows[].id] == [
+    "send-browse-reclaiming","send-browse-pending",
+    "send-browse-executing","send-browse-prepared"
+  ]
+  and .activeSendRows[0].amount == "41"
+  and .activeSendRows[0].mintHostname == "mint.reclaiming.test"
+  and .activeSendRows[0].stateLabel == "Reclaiming"
+  and (.activeSendRows | all(.relativeUpdate | startswith("Updated ")))
+  and .activeSendRows[3].reservedInput == "12"
+' >/dev/null
+[[ $(panel_action selectActiveSend send-browse-pending) == "ok" ]] \
+  || fail "exact Pending Send row could not be selected"
+wait_panel_snapshot '
+  .activeSendsViewState == "detail"
+  and .selectedActiveSendOperationId == "send-browse-pending"
+  and .selectedActiveSend.id == "send-browse-pending"
+  and .selectedActiveSend.amount == "31"
+  and .selectedActiveSend.mintHostname == "mint.pending.test"
+  and .activeSendDetailReadOnly == true
+  and .activeSendMutationActionCount == 0
+' >/dev/null
+wait_mock_status ".sendExecuteRequests == $before_active_browse_executes
+  and .sendCancelRequests == $before_active_browse_cancels
+  and .sendReclaimRequests == $before_active_browse_reclaims
+  and .sendResultRequests == $before_active_browse_results
+  and .sendRefreshRequests == $before_active_browse_refreshes" >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Active Send detail Back action failed"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsCount == 4
+  and .selectedActiveSendOperationId == ""
+' >/dev/null
+[[ $(panel_action selectActiveSend send-browse-pending) == "ok" ]] \
+  || fail "Pending Send could not be reselected for terminal reconciliation"
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "sendPrepared":{"items":[]},
+    "sendInFlight":{"items":[{
+      "id":"send-browse-pending","type":"send","state":"rolled_back",
+      "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+      "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+      "createdAt":"2026-08-25T00:00:00.000Z","updatedAt":"2026-08-25T00:07:00.000Z"
+    }]}
+  }' "$base_url/__test__/resources" >/dev/null
+adapter_call reconnect >/dev/null
+wait_snapshot '.connectionState == "connected" and .activeSends == []' >/dev/null
+wait_panel_snapshot '
+  .activeSendsViewState == "detail"
+  and .selectedActiveSendOperationId == "send-browse-pending"
+  and .selectedActiveSend == null
+' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "terminal Send detail could not return to the collection"
+wait_panel_snapshot '
+  .activeSendsViewState == "list"
+  and .activeSendsCount == 0
+  and .activeSendsEmptyVisible == true
+' >/dev/null
+[[ $(panel_action backActiveSends) == "ok" ]] \
+  || fail "Active Sends list Back action failed"
+wait_panel_snapshot '.activeSendsViewState == "closed"' >/dev/null
+
+echo "runtime: mixed-state Active Sends browsing, navigation, empty state, and bar privacy passed"
 
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{

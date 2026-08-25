@@ -48,6 +48,14 @@ BarWidget {
     button.triggerPress(Qt.LeftButton)
   }
 
+  function smokeSnapshot() {
+    return JSON.stringify({
+      stateLabel: stateLabel,
+      text: button.text,
+      tooltipText: button.tooltipText
+    })
+  }
+
   function closeForPopoutSwitch() {
     popoutSwitchClosing = true
     close()

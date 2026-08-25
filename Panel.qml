@@ -24,10 +24,21 @@ Item {
   property string recoveryViewState: "closed"
   property string recoveryPhrase: ""
   property string recoveryError: ""
+  property string activeSendsViewState: "closed"
+  property string selectedActiveSendOperationId: ""
+  property double relativeTimeEpoch: Date.now()
   readonly property Item anchorItem: hostWidget && hostWidget.anchorItem
     ? hostWidget.anchorItem : null
   readonly property var activeTransfer: stateOwner
     && stateOwner.activeTransfers.length > 0 ? stateOwner.activeTransfers[0] : null
+  readonly property var activeSends: stateOwner
+    && Array.isArray(stateOwner.activeSends) ? stateOwner.activeSends : []
+  readonly property var selectedActiveSend: {
+    for (var index = 0; index < activeSends.length; index++)
+      if (String(activeSends[index].id || "") === selectedActiveSendOperationId)
+        return activeSends[index]
+    return null
+  }
 
   readonly property color foreground: shell && shell.bar
     ? shell.bar.foreground : Color.foreground
@@ -82,6 +93,7 @@ Item {
   function close() {
     if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
+    closeActiveSends()
     opened = false
     return true
   }
@@ -89,6 +101,7 @@ Item {
   function dismiss() {
     if (!receiveFlow.panelClosed() || !sendFlow.panelClosed()) return false
     clearRecoveryPhrase()
+    closeActiveSends()
     if (shell && typeof shell.hide === "function") shell.hide(pluginId)
     else opened = false
     return true
@@ -103,6 +116,72 @@ Item {
     for (var index = firstGroup; index < digits.length; index += 3)
       formatted += "," + digits.slice(index, index + 3)
     return formatted + " " + (stateOwner ? stateOwner.unit : "sat")
+  }
+
+  function relativeUpdateText(timestamp) {
+    if (!stateOwner || typeof stateOwner.relativeUpdateTime !== "function")
+      return "Update time unavailable"
+    return stateOwner.relativeUpdateTime(timestamp, relativeTimeEpoch)
+  }
+
+  function activeSendRowsSnapshot() {
+    var rows = []
+    for (var index = 0; index < activeSends.length; index++) {
+      var send = activeSends[index]
+      rows.push({
+        id: String(send.id || ""),
+        state: String(send.state || ""),
+        stateLabel: String(send.stateLabel || ""),
+        amount: String(send.amount || "0"),
+        mintHostname: String(send.mintHostname || ""),
+        updatedAt: String(send.updatedAt || ""),
+        relativeUpdate: relativeUpdateText(send.updatedAt),
+        reservedInput: String(send.reservedInput || "")
+      })
+    }
+    return rows
+  }
+
+  function openActiveSends() {
+    if (!stateOwner || activeSendsViewState !== "closed") return false
+    clearRecoveryPhrase()
+    selectedActiveSendOperationId = ""
+    activeSendsViewState = "list"
+    panelFlick.contentY = 0
+    return true
+  }
+
+  function selectActiveSend(operationId) {
+    var selected = String(operationId || "")
+    if (activeSendsViewState !== "list" || !selected) return false
+    for (var index = 0; index < activeSends.length; index++) {
+      if (String(activeSends[index].id || "") !== selected) continue
+      selectedActiveSendOperationId = selected
+      activeSendsViewState = "detail"
+      panelFlick.contentY = 0
+      return true
+    }
+    return false
+  }
+
+  function backActiveSends() {
+    if (activeSendsViewState === "detail") {
+      selectedActiveSendOperationId = ""
+      activeSendsViewState = "list"
+      panelFlick.contentY = 0
+      return true
+    }
+    if (activeSendsViewState === "list") {
+      closeActiveSends()
+      panelFlick.contentY = 0
+      return true
+    }
+    return false
+  }
+
+  function closeActiveSends() {
+    selectedActiveSendOperationId = ""
+    activeSendsViewState = "closed"
   }
 
   function smokeCreateWallet() {
@@ -247,6 +326,18 @@ Item {
     return sendFlow.retryPending() ? "ok" : "disabled"
   }
 
+  function smokeOpenActiveSends() {
+    return openActiveSends() ? "ok" : "disabled"
+  }
+
+  function smokeSelectActiveSend(operationId) {
+    return selectActiveSend(operationId) ? "ok" : "disabled"
+  }
+
+  function smokeBackActiveSends() {
+    return backActiveSends() ? "ok" : "disabled"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -319,6 +410,16 @@ Item {
       activeTransferCount: stateOwner ? stateOwner.activeTransfers.length : 0,
       activeTransferStateLabel: activeTransfer ? activeTransfer.stateLabel : "",
       activeTransferDetail: activeTransfer ? activeTransfer.detail : "",
+      activeSendsCount: activeSends.length,
+      activeSendsCountText: activeSendsButton.text,
+      activeSendsViewState: activeSendsViewState,
+      activeSendsBackVisible: backActiveSendsButton.visible,
+      activeSendsEmptyVisible: activeSendsEmpty.visible,
+      activeSendRows: activeSendRowsSnapshot(),
+      selectedActiveSendOperationId: selectedActiveSendOperationId,
+      selectedActiveSend: selectedActiveSend,
+      activeSendDetailReadOnly: activeSendsViewState === "detail",
+      activeSendMutationActionCount: 0,
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
@@ -326,6 +427,7 @@ Item {
   onOpenedChanged: {
     if (!opened) {
       clearRecoveryPhrase()
+      closeActiveSends()
       receiveFlow.panelClosed()
       sendFlow.panelClosed()
     }
@@ -374,6 +476,13 @@ Item {
     onTriggered: root.hostWidget = root.resolveHostWidget()
   }
 
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.opened && root.activeSendsViewState !== "closed"
+    onTriggered: root.relativeTimeEpoch = Date.now()
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -408,7 +517,8 @@ Item {
 
           PanelHero {
             width: parent.width
-            title: "Cashu Wallet"
+            title: root.activeSendsViewState === "closed" ? "Cashu Wallet"
+              : root.activeSendsViewState === "detail" ? "Active Send" : "Active Sends"
             meta: root.stateOwner
               ? root.stateOwner.walletStateDetail + " · " + root.stateOwner.walletStateLabel
               : "Wallet State unavailable"
@@ -432,7 +542,8 @@ Item {
           }
 
           Column {
-            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            visible: root.activeSendsViewState === "closed"
+              && root.stateOwner && root.stateOwner.walletState === "unlocked"
               && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             width: parent.width
             spacing: Style.space(10)
@@ -547,12 +658,14 @@ Item {
           }
 
           PanelSeparator {
-            visible: root.stateOwner && root.stateOwner.walletState === "unlocked"
+            visible: root.activeSendsViewState === "closed"
+              && root.stateOwner && root.stateOwner.walletState === "unlocked"
               && receiveFlow.viewState === "closed" && sendFlow.viewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.spacing.labelGap
 
@@ -645,10 +758,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -711,10 +826,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -787,10 +904,12 @@ Item {
           }
 
           PanelSeparator {
+            visible: root.activeSendsViewState === "closed"
             foreground: root.foreground
           }
 
           Column {
+            visible: root.activeSendsViewState === "closed"
             width: parent.width
             spacing: Style.space(10)
 
@@ -798,6 +917,20 @@ Item {
               text: "ACTIVE TRANSFERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
+            }
+
+            Button {
+              id: activeSendsButton
+              visible: !!root.stateOwner
+              width: parent.width
+              text: root.activeSends.length + " Active Send"
+                + (root.activeSends.length === 1 ? "" : "s")
+              iconText: "󰒊"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              leftAlign: true
+              onClicked: root.openActiveSends()
             }
 
             Row {
@@ -874,6 +1007,140 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               horizontalAlignment: Text.AlignHCenter
+            }
+          }
+
+          Column {
+            visible: root.activeSendsViewState !== "closed"
+            width: parent.width
+            spacing: Style.space(10)
+
+            Button {
+              id: backActiveSendsButton
+              width: parent.width
+              text: root.activeSendsViewState === "detail"
+                ? "Back to Active Sends" : "Back"
+              iconText: "󰁍"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              leftAlign: true
+              onClicked: root.backActiveSends()
+            }
+
+            Column {
+              visible: root.activeSendsViewState === "list"
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "ACTIVE SENDS · " + root.activeSends.length
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.activeSends
+
+                Button {
+                  required property var modelData
+                  width: parent ? parent.width : 0
+                  text: String(modelData.stateLabel || "") + " · "
+                    + root.amountText(modelData.amount) + " · "
+                    + String(modelData.mintHostname || "") + " · "
+                    + root.relativeUpdateText(modelData.updatedAt)
+                    + (String(modelData.state || "") === "prepared"
+                      ? " · Reserved input " + root.amountText(modelData.reservedInput) : "")
+                  iconText: "󰅂"
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  bordered: true
+                  leftAlign: true
+                  onClicked: root.selectActiveSend(modelData.id)
+                }
+              }
+
+              Text {
+                id: activeSendsEmpty
+                visible: root.activeSends.length === 0
+                width: parent.width
+                text: "No Active Sends"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                horizontalAlignment: Text.AlignHCenter
+              }
+            }
+
+            Column {
+              visible: root.activeSendsViewState === "detail"
+              width: parent.width
+              spacing: Style.space(10)
+
+              PanelSectionHeader {
+                text: "OPERATION"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                width: parent.width
+                text: root.selectedActiveSendOperationId
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WrapAnywhere
+              }
+
+              Text {
+                visible: !root.selectedActiveSend
+                width: parent.width
+                text: "This Send is no longer active in cocod. Return to Active Sends."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: !!root.selectedActiveSend
+                width: parent.width
+                text: root.selectedActiveSend
+                  ? "STATE\n" + root.selectedActiveSend.stateLabel
+                    + "\n\nAMOUNT\n" + root.amountText(root.selectedActiveSend.amount)
+                    + "\n\nMINT\n" + root.selectedActiveSend.mintHostname
+                    + "\n\nUPDATED\n"
+                    + root.relativeUpdateText(root.selectedActiveSend.updatedAt)
+                  : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: root.selectedActiveSend
+                  && root.selectedActiveSend.state === "prepared"
+                width: parent.width
+                text: root.selectedActiveSend
+                  ? "RESERVED INPUT\n"
+                    + root.amountText(root.selectedActiveSend.reservedInput) : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              Text {
+                visible: !!root.selectedActiveSend
+                width: parent.width
+                text: "Read-only canonical Send details"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignHCenter
+              }
             }
           }
         }

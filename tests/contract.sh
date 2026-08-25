@@ -186,6 +186,61 @@ jq -e '.items[0].method == "default" and .items[0].requestedAmount == "60"
   <<<"$send_prepared" >/dev/null || fail "Send Operation collection is invalid"
 jq -e '.items == []' <<<"$send_in_flight" >/dev/null || fail "Send in-flight collection is invalid"
 
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{
+    "sendPrepared":{"items":[{
+      "id":"send-browse-prepared","type":"send","state":"prepared",
+      "mintUrl":"https://mint.prepared.test","unit":"sat","method":"default",
+      "requestedAmount":"11","fee":"1","inputAmount":"12","needsSwap":true,
+      "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:01:00.000Z"
+    }]},
+    "sendInFlight":{"items":[
+      {"id":"send-browse-executing","type":"send","state":"executing",
+       "mintUrl":"https://mint.executing.test","unit":"sat","method":"default",
+       "requestedAmount":"21","fee":"1","inputAmount":"22","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:02:00.000Z"},
+      {"id":"send-browse-pending","type":"send","state":"pending",
+       "mintUrl":"https://mint.pending.test","unit":"sat","method":"default",
+       "requestedAmount":"31","fee":"1","inputAmount":"32","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:03:00.000Z"},
+      {"id":"send-browse-reclaiming","type":"send","state":"rolling_back",
+       "mintUrl":"https://mint.reclaiming.test","unit":"sat","method":"default",
+       "requestedAmount":"41","fee":"1","inputAmount":"42","needsSwap":false,
+       "createdAt":"2026-08-20T12:00:00.000Z","updatedAt":"2026-08-20T12:04:00.000Z"}
+    ]}
+  }' "$base_url/__test__/resources" >/dev/null \
+  || fail "could not establish mixed-state Active Sends"
+mixed_send_prepared=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/prepared")
+mixed_send_in_flight=$(curl -fsS "${auth[@]}" \
+  "$base_url/v1/operations/send/in-flight")
+jq -e '
+  .items == [{
+    id:"send-browse-prepared",type:"send",state:"prepared",
+    mintUrl:"https://mint.prepared.test",unit:"sat",method:"default",
+    requestedAmount:"11",fee:"1",inputAmount:"12",needsSwap:true,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:01:00.000Z"
+  }]
+' <<<"$mixed_send_prepared" >/dev/null \
+  || fail "Prepared Active Send collection lost its authoritative fields"
+jq -e '
+  [.items[] | {id,state,requestedAmount,mintUrl,updatedAt}] == [
+    {id:"send-browse-executing",state:"executing",requestedAmount:"21",mintUrl:"https://mint.executing.test",updatedAt:"2026-08-20T12:02:00.000Z"},
+    {id:"send-browse-pending",state:"pending",requestedAmount:"31",mintUrl:"https://mint.pending.test",updatedAt:"2026-08-20T12:03:00.000Z"},
+    {id:"send-browse-reclaiming",state:"rolling_back",requestedAmount:"41",mintUrl:"https://mint.reclaiming.test",updatedAt:"2026-08-20T12:04:00.000Z"}
+  ]
+' <<<"$mixed_send_in_flight" >/dev/null \
+  || fail "mixed-state Active Send collection is not canonical"
+jq -e '
+  [.items[] | select(.id == "send-browse-pending")] == [{
+    id:"send-browse-pending",type:"send",state:"pending",
+    mintUrl:"https://mint.pending.test",unit:"sat",method:"default",
+    requestedAmount:"31",fee:"1",inputAmount:"32",needsSwap:false,
+    createdAt:"2026-08-20T12:00:00.000Z",updatedAt:"2026-08-20T12:03:00.000Z"
+  }]
+' <<<"$mixed_send_in_flight" >/dev/null \
+  || fail "Active Send collection could not address exactly one Operation"
+
 send_mint='https://mint.send.test'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{
