@@ -205,6 +205,16 @@ ShellRoot {
       return walletPanel.smokeBackActiveSends()
     }
 
+    function refreshActiveSends(): string {
+      return walletPanel.smokeRefreshActiveSends()
+    }
+
+    function setActiveSendsPollInterval(intervalMs: int): string {
+      if (intervalMs < 50) return "disabled"
+      adapter.activeSendsPollIntervalMs = intervalMs
+      return "ok"
+    }
+
     function copyActivePendingSend(): string {
       return walletPanel.smokeCopyActivePendingSend()
     }

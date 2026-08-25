@@ -27,6 +27,12 @@ Item {
   property string activeSendsViewState: "closed"
   property string selectedActiveSendOperationId: ""
   property double relativeTimeEpoch: Date.now()
+  readonly property bool activeSendsReconnecting: activeSends.length > 0
+    && stateOwner && ["connecting", "reconnecting", "unavailable"]
+      .indexOf(String(stateOwner.connectionState || "")) !== -1
+  readonly property bool activeSendsRefreshing: stateOwner
+    && stateOwner.connectionState === "connected"
+    && stateOwner.sendCanonicalSynchronized === false
   readonly property Item anchorItem: hostWidget && hostWidget.anchorItem
     ? hostWidget.anchorItem : null
   readonly property var activeTransfer: stateOwner
@@ -173,8 +179,16 @@ Item {
     clearRecoveryPhrase()
     selectedActiveSendOperationId = ""
     activeSendsViewState = "list"
+    if (typeof stateOwner.refreshActiveSends === "function")
+      stateOwner.refreshActiveSends("active-sends-open")
     panelFlick.contentY = 0
     return true
+  }
+
+  function refreshActiveSends() {
+    if (!stateOwner || activeSendsViewState === "closed"
+        || typeof stateOwner.refreshActiveSends !== "function") return false
+    return stateOwner.refreshActiveSends("explicit")
   }
 
   function selectActiveSend(operationId) {
@@ -379,6 +393,10 @@ Item {
     return backActiveSends() ? "ok" : "disabled"
   }
 
+  function smokeRefreshActiveSends() {
+    return refreshActiveSends() ? "ok" : "disabled"
+  }
+
   function smokeCopyActivePendingSend() {
     return activePendingSendFlow.copyPendingToken() ? "ok" : "disabled"
   }
@@ -499,6 +517,14 @@ Item {
       activeSendsCount: activeSends.length,
       activeSendsCountText: activeSendsButton.text,
       activeSendsViewState: activeSendsViewState,
+      activeSendsReconnecting: activeSendsReconnecting,
+      activeSendsRefreshing: activeSendsRefreshing,
+      activeSendsCanonicalSynchronized: stateOwner
+        ? stateOwner.sendCanonicalSynchronized : false,
+      activeSendsCanonicalRefreshCount: stateOwner
+        ? stateOwner.activeSendsCanonicalRefreshCount : 0,
+      activeSendsPolling: activeSendsPoll.running,
+      activeSendsPollIntervalMs: activeSendsPoll.interval,
       activeSendsBackVisible: backActiveSendsButton.visible,
       activeSendsEmptyVisible: activeSendsEmpty.visible,
       activeSendRows: activeSendRowsSnapshot(),
@@ -589,6 +615,12 @@ Item {
           sendFlow.panelClosed()
       }
     }
+
+    function onConnectionStateChanged() {
+      if (root.stateOwner && root.stateOwner.connectionState === "connected"
+          && activeSendsPoll.running)
+        activeSendsPoll.restart()
+    }
   }
 
   Timer {
@@ -597,6 +629,18 @@ Item {
     repeat: true
     running: root.opened && !root.hostWidget
     onTriggered: root.hostWidget = root.resolveHostWidget()
+  }
+
+  Timer {
+    id: activeSendsPoll
+    interval: root.stateOwner
+      ? Number(root.stateOwner.activeSendsPollIntervalMs || 15000) : 15000
+    repeat: true
+    running: root.opened && root.activeSends.length > 0
+    onTriggered: {
+      if (root.stateOwner && typeof root.stateOwner.refreshActiveSends === "function")
+        root.stateOwner.refreshActiveSends("visible-poll")
+    }
   }
 
   Timer {
@@ -1151,6 +1195,19 @@ Item {
               onClicked: root.backActiveSends()
             }
 
+            Text {
+              visible: root.activeSendsReconnecting || root.activeSendsRefreshing
+              width: parent.width
+              text: root.activeSendsReconnecting
+                ? "Reconnecting · showing the last canonical Active Sends read-only"
+                : "Refreshing canonical Active Sends…"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              wrapMode: Text.WordWrap
+            }
+
             Column {
               visible: root.activeSendsViewState === "list"
               width: parent.width
@@ -1160,6 +1217,25 @@ Item {
                 text: "ACTIVE SENDS · " + root.activeSends.length
                 foreground: root.foreground
                 fontFamily: root.fontFamily
+              }
+
+              Button {
+                id: refreshActiveSendsButton
+                width: parent.width
+                text: "Refresh Active Sends"
+                iconText: "󰑐"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                bordered: true
+                enabled: root.stateOwner
+                  && root.stateOwner.connectionState === "connected"
+                  && root.stateOwner.compatibilityState === "compatible"
+                  && root.stateOwner.walletState === "unlocked"
+                  && !root.stateOwner.fullFetchInProgress
+                  && !root.stateOwner.sendCommandRequest
+                  && root.stateOwner.sendReconcileRequests.length === 0
+                opacity: enabled ? 1 : 0.5
+                onClicked: root.refreshActiveSends()
               }
 
               Repeater {
@@ -1317,6 +1393,17 @@ Item {
                 wrapMode: Text.WordWrap
               }
 
+              Text {
+                visible: root.selectedPreparedSendTerminalState === "completed"
+                width: parent.width
+                text: "This exact Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                wrapMode: Text.WordWrap
+              }
+
               Row {
                 visible: root.selectedActiveSend
                   && root.selectedActiveSend.state === "prepared"
@@ -1358,7 +1445,7 @@ Item {
                 fontFamily: root.fontFamily
                 bordered: true
                 enabled: !root.selectedPreparedSendBusy
-                  && root.stateOwner && !root.stateOwner.sendCommandRequest
+                  && root.selectedPreparedSendCommandsAvailable
                 opacity: enabled ? 1 : 0.5
                 onClicked: root.smokeRefreshActivePreparedSend()
               }

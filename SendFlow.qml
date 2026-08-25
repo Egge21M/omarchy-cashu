@@ -329,8 +329,7 @@ Item {
     }
 
     function onSendPresentationInvalidated() {
-      if (!root.pendingDetailMode) return
-      root.pendingPresentationGeneration++
+      if (root.pendingDetailMode) root.pendingPresentationGeneration++
       root.clearPendingToken()
     }
 
@@ -814,7 +813,9 @@ Item {
         ? "Reclaim succeeded. The reserved ecash is spendable again."
         : root.pendingTerminalState === "recipient_won"
           ? "The recipient redeemed this Send before Reclaim completed."
-          : root.pendingError
+          : root.pendingTerminalState === "completed"
+            ? "This Send reached a terminal cocod outcome. Return to Active Sends to acknowledge the result."
+            : root.pendingError
       color: root.pendingTerminalState === "reclaimed"
         ? root.foreground : root.urgent
       font.family: root.fontFamily

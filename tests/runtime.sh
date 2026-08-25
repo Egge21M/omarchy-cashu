@@ -1065,6 +1065,41 @@ wait_panel_snapshot '
   and (.activeSendRows | all(.relativeUpdate | startswith("Updated ")))
   and .activeSendRows[3].reservedInput == "12"
 ' >/dev/null
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_active_browse")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_active_browse")" >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+
+before_explicit_active_refresh=$(curl -fsS "$base_url/__test__/status")
+[[ $(panel_action refreshActiveSends) == "ok" ]] \
+  || fail "explicit Active Sends Refresh action was unavailable"
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_explicit_active_refresh")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_explicit_active_refresh")" >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+
+[[ $(panel_action setActiveSendsPollInterval 200) == "ok" ]] \
+  || fail "Active Sends poll test interval could not be configured"
+before_visible_poll=$(curl -fsS "$base_url/__test__/status")
+wait_panel_snapshot '.activeSendsPolling == true and .activeSendsPollIntervalMs == 200' >/dev/null
+wait_mock_status ".resourceRequests.sendPrepared > $(jq -r '.resourceRequests.sendPrepared' <<<"$before_visible_poll")
+  and .resourceRequests.sendInFlight > $(jq -r '.resourceRequests.sendInFlight' <<<"$before_visible_poll")" >/dev/null
+[[ $(panel_action closePanel) == "ok" ]] \
+  || fail "panel could not close after visible Active Sends polling"
+wait_panel_snapshot '.opened == false and .activeSendsPolling == false' >/dev/null
+sleep 0.3
+hidden_poll_baseline=$(curl -fsS "$base_url/__test__/status")
+sleep 0.6
+hidden_poll_after=$(curl -fsS "$base_url/__test__/status")
+jq -e --argjson before "$(jq '.resourceRequests' <<<"$hidden_poll_baseline")" '
+  .resourceRequests.sendPrepared == $before.sendPrepared
+  and .resourceRequests.sendInFlight == $before.sendInFlight
+' <<<"$hidden_poll_after" >/dev/null \
+  || fail "background Shell Adapter polled Active Sends while the panel was hidden"
+panel_action setActiveSendsPollInterval 15000 >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true
+  and .activeSendsPolling == true and .activeSendsPollIntervalMs == 15000' >/dev/null
+
 [[ $(panel_action selectActiveSend send-browse-pending) == "ok" ]] \
   || fail "exact Pending Send row could not be selected"
 wait_panel_snapshot '
@@ -1112,6 +1147,7 @@ wait_panel_snapshot '
   .activeSendsViewState == "detail"
   and .selectedActiveSendOperationId == "send-browse-pending"
   and .selectedActiveSend == null
+  and .activePendingTerminalState == "reclaimed"
 ' >/dev/null
 [[ $(panel_action backActiveSends) == "ok" ]] \
   || fail "terminal Send detail could not return to the collection"
@@ -1119,6 +1155,7 @@ wait_panel_snapshot '
   .activeSendsViewState == "list"
   and .activeSendsCount == 0
   and .activeSendsEmptyVisible == true
+  and .activePendingTerminalState == ""
 ' >/dev/null
 [[ $(panel_action backActiveSends) == "ok" ]] \
   || fail "Active Sends list Back action failed"
@@ -1161,6 +1198,22 @@ wait_mock_status ".sendResultRequests == $before_pending_results
 [[ $(wl-paste --no-newline) == 'pending-send-copy-sentinel' ]] \
   || fail "opening a Pending Send detail changed the clipboard"
 
+curl -fsS -X POST -H 'Content-Type: application/json' --data '{}' \
+  "$base_url/__test__/disconnect" >/dev/null
+wait_snapshot '.connectionState == "unavailable"
+  and .sendCanonicalSynchronized == false and (.activeSends | length) == 2' >/dev/null
+wait_panel_snapshot ".activeSendsReconnecting == true
+  and .selectedActiveSendOperationId == \"$second_pending_id\"
+  and .selectedActiveSend.id == \"$second_pending_id\"
+  and .activePendingCopyAvailable == false
+  and .activePendingRevealAvailable == false
+  and .activePendingRefreshAvailable == false
+  and .activePendingReclaimAvailable == false" >/dev/null
+wait_panel_snapshot '.connectionState == "connected"
+  and .activeSendsReconnecting == false
+  and .activeSendsCanonicalSynchronized == true
+  and .activePendingCopyAvailable == true' >/dev/null
+
 [[ $(panel_action copyActivePendingSend) == "ok" ]] \
   || fail "explicit Copy did not start for the selected Pending Send"
 wait_mock_status ".sendResultRequests == $((before_pending_results + 1))
@@ -1197,12 +1250,26 @@ curl -fsS -X POST -H 'Content-Type: application/json' --data '{
   }
 }' "$base_url/__test__/resources" >/dev/null
 adapter_call reconnect >/dev/null
-wait_snapshot '.connectionState == "connected"' >/dev/null
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and .canonicalRefreshInProgress == false' >/dev/null
 wait_panel_snapshot '.activePendingTokenRevealed == false' >/dev/null
 
 [[ $(panel_action revealActivePendingSend) == "ok" ]] \
   || fail "Pending Send could not be revealed before credential rotation"
 wait_panel_snapshot '.activePendingTokenRevealed == true' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action selectActiveSend "$first_pending_id" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"sendResultUnavailableResponses":1}' \
+  "$base_url/__test__/mode" >/dev/null
+panel_action revealActivePendingSend >/dev/null
+wait_panel_snapshot '.activePendingErrorCode == "result_not_available"' >/dev/null
+panel_action backActiveSends >/dev/null
+panel_action selectActiveSend "$second_pending_id" >/dev/null
+panel_action revealActivePendingSend >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == true' >/dev/null
+wait_snapshot '.sendOperationErrorCount == 1' >/dev/null
 rotated_credential=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
 mkdir -p "$state_dir/credentials/generation-2"
 printf '%s\n' "$rotated_credential" >"$state_dir/credentials/generation-2/client"
@@ -1211,22 +1278,43 @@ chmod 600 "$state_dir/credentials/generation-2/client"
 ln -s generation-2 "$state_dir/credentials/next"
 mv -Tf "$state_dir/credentials/next" "$state_dir/credentials/current"
 adapter_call reconnect >/dev/null
-wait_snapshot '.connectionState != "connected"' >/dev/null
-wait_panel_snapshot '.activePendingTokenRevealed == false' >/dev/null
+wait_snapshot '.connectionState != "connected"
+  and .activeSends == []
+  and .sendOperationErrorCount == 0
+  and .sendCanonicalSynchronized == false' >/dev/null
+wait_panel_snapshot '.activePendingTokenRevealed == false
+  and .selectedActiveSend == null
+  and .activePendingErrorCode == ""' >/dev/null
 ln -s generation-1 "$state_dir/credentials/next"
 mv -Tf "$state_dir/credentials/next" "$state_dir/credentials/current"
 adapter_call reconnect >/dev/null
-wait_snapshot '.connectionState == "connected"' >/dev/null
-
-[[ $(panel_action backActiveSends) == "ok" ]] \
-  || fail "second Pending Send detail could not return to the list"
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and .canonicalRefreshInProgress == false' >/dev/null
+kill "$shell_pid"
+wait "$shell_pid" 2>/dev/null || true
+shell_pid=""
+COCOD_STATE_DIR="$state_dir" OMARCHY_CASHU_DAEMON_URL="$base_url" \
+  quickshell --no-color -p "$shell_qml" >>"$shell_log" 2>&1 &
+shell_pid=$!
+wait_snapshot '.connectionState == "connected"
+  and .sendCanonicalSynchronized == true
+  and (.activeSends | length) == 2
+  and .sendOperationErrorCount == 0' >/dev/null
+panel_action openPanel >/dev/null
+panel_action openActiveSends >/dev/null
+wait_panel_snapshot '.activeSendsViewState == "list"
+  and .activePendingTokenRevealed == false' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendResultUnavailableResponses":1}' \
   "$base_url/__test__/mode" >/dev/null
+before_post_rotation_result=$(curl -fsS "$base_url/__test__/status" \
+  | jq -r '.sendResultRequests')
 [[ $(panel_action selectActiveSend "$first_pending_id") == "ok" ]] \
   || fail "first Pending Send could not be selected by exact ID"
 [[ $(panel_action revealActivePendingSend) == "ok" ]] \
   || fail "temporarily unavailable Pending result request did not start"
+wait_mock_status ".sendResultRequests > $before_post_rotation_result" >/dev/null
 wait_panel_snapshot ".selectedActiveSendOperationId == \"$first_pending_id\"
   and .selectedActiveSend.state == \"pending\"
   and .activePendingActionState == \"error\"
@@ -1613,7 +1701,11 @@ wait_mock_status '.resourceRequestsActive > 0' >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"delayMs":0,"sendCreateInterruption":"malformed_after_commit"}' \
   "$base_url/__test__/mode" >/dev/null
-panel_action prepareSend >/dev/null
+[[ $(panel_action prepareSend) == "disabled" ]] \
+  || fail "Send mutation was enabled before targeted canonical synchronization"
+wait_panel_snapshot '.activeSendsCanonicalSynchronized == true' >/dev/null
+[[ $(panel_action prepareSend) == "ok" ]] \
+  || fail "Send mutation did not recover after targeted canonical synchronization"
 wait_panel_snapshot '.sendViewState == "error" and .sendErrorCode == "invalid_response"
   and .activeSendsCount == 1' >/dev/null
 [[ $(panel_action retrySend) == "ok" ]] \
@@ -1803,7 +1895,9 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCommandDelayMs":0}' "$base_url/__test__/mode" >/dev/null
 wait_snapshot "(.activeSends | any(.id == \"$first_prepared_id\" and .state == \"pending\"))
   and (.activeSends | any(.id == \"$second_prepared_id\" and .state == \"prepared\"))" >/dev/null
-wait_panel_snapshot '.activePreparedCancelAvailable == true' >/dev/null
+wait_panel_snapshot ".selectedActiveSendOperationId == \"$second_prepared_id\"
+  and .selectedActiveSend.id == \"$second_prepared_id\"
+  and .activePreparedCancelAvailable == true" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"sendCommandDelayMs":800}' "$base_url/__test__/mode" >/dev/null
 [[ $(panel_action cancelActivePreparedSend) == "ok" ]] \
@@ -2449,19 +2543,24 @@ jq -cn '{event:{
 wait_mock_status ".sendLookupRequests > $after_operation_lookup
   and .sendRefreshRequests > $after_operation_refresh" >/dev/null
 curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data "$(jq -cn --arg id "$invalidated_send_id" '{operationId:$id}')" \
+  --data "$(jq -cn --arg id "$invalidated_send_id" \
+    '{operationId:$id,suppressEvents:true}')" \
   "$base_url/__test__/redeem-send" >/dev/null \
   || fail "recipient redemption fixture failed"
+sleep 0.3
+wait_snapshot ".activeTransfers | any(.id == \"$invalidated_send_id\")" >/dev/null
+panel_action openPanel >/dev/null
 wait_snapshot "(.activeTransfers | all(.id != \"$invalidated_send_id\"))
   and .spendableBalance == \"30\"
   and .reservedBalance == \"0\"" >/dev/null
+panel_action closePanel >/dev/null
 if rg -Fq "$invalidated_send_token" \
     <<<"$(adapter_call snapshot)$(panel_call)$(curl -fsS "$base_url/__test__/status")" \
     || rg -Fq "$invalidated_send_token" "$shell_log" "$mock_log"; then
   fail "redeemed Pending Send token escaped its explicit result resource"
 fi
 
-echo "runtime: operation and proof-change Send invalidations and recipient redemption passed"
+echo "runtime: duplicate and missed Send invalidations reconcile canonically"
 
 fund_send_fixture 100
 prepare_send_flow 60

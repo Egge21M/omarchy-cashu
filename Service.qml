@@ -61,6 +61,7 @@ Item {
   property int streamRotationMs: 30000
   property int streamMaximumCharacters: 32768
   property int heartbeatTimeoutMs: 20000
+  property int activeSendsPollIntervalMs: 15000
 
   property var openApiResource: ({})
   property var statusResource: ({
@@ -73,6 +74,8 @@ Item {
   property var mintsResource: ({ items: [] })
   property var receiveOperations: []
   property var sendOperations: []
+  property bool sendCanonicalSynchronized: false
+  property int activeSendsCanonicalRefreshCount: 0
   property int refreshCount: 0
 
   property string connectionState: "connecting"
@@ -140,6 +143,9 @@ Item {
   property string privateSendCredentialContext: ""
   property string privateSendDaemonContext: ""
   property string privateSendWalletContext: ""
+  property string privateFullFetchCredentialContext: ""
+  property string privateFullFetchDaemonContext: ""
+  property int sendSecurityContextGeneration: 0
   property string sendState: "idle"
   property string sendError: ""
   property string sendErrorCode: ""
@@ -161,6 +167,7 @@ Item {
     && !sendCommandRequest && !sendResultReconciling
     && sendReconcileRequests.length === 0
   readonly property bool sendCommandsAvailable: !fullFetchInProgress
+    && sendCanonicalSynchronized
     && connectionState === "connected" && compatibilityState === "compatible"
     && walletState === "unlocked" && sendAvailable
   readonly property bool receiveCommandsAvailable: !fullFetchInProgress
@@ -251,6 +258,46 @@ Item {
     sendPresentationInvalidated()
   }
 
+  function clearSendSecurityContextState() {
+    sendSecurityContextGeneration++
+    invalidateSendPresentationContext()
+    if (fullFetchInProgress) {
+      fullFetchToken++
+      fullFetchInProgress = false
+      abortCanonicalRequests()
+    }
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
+    heartbeatTimer.stop()
+    rotationTimer.stop()
+    stopStream()
+    var command = sendCommandRequest
+    sendCommandRequest = null
+    if (command) {
+      command.onreadystatechange = null
+      command.abort()
+    }
+    abortIncrementalSendFetches()
+    abortRequests(sendReconcileRequests)
+    sendReconcileRequests = []
+    sendResultReconciling = false
+    activePendingCommandOperationId = ""
+    activePreparedCommandOperationId = ""
+    pendingSendActions = ({})
+    preparedSendActions = ({})
+    sendOperations = []
+    sendCanonicalSynchronized = false
+    queuedSendInvalidation = false
+    queuedBalanceInvalidation = false
+    deferredReconcileReason = ""
+    sendState = "idle"
+    sendError = ""
+    sendErrorCode = ""
+    sendOperationId = ""
+    sendAmbiguousCreation = null
+    sendDismissAfterResult = false
+  }
+
   function observeSendTransportContext(credential) {
     var daemon = String(daemonBaseUrl || "")
     var value = String(credential || "")
@@ -258,18 +305,25 @@ Item {
         && privateSendDaemonContext !== daemon)
       || (privateSendCredentialContext !== ""
         && privateSendCredentialContext !== value)
-    privateSendDaemonContext = daemon
-    privateSendCredentialContext = value
-    if (changed) invalidateSendPresentationContext()
+    if (changed) clearSendSecurityContextState()
+    return changed
+  }
+
+  function acceptSendTransportContext(credential, daemon) {
+    privateSendDaemonContext = String(daemon || daemonBaseUrl || "")
+    privateSendCredentialContext = String(credential || "")
   }
 
   function observeSendWalletContext(status) {
     var wallet = status && status.wallet ? status.wallet : null
     var configuredAt = wallet ? String(wallet.configuredAt || "") : ""
     var context = String(daemonBaseUrl || "") + "\n" + configuredAt
-    if (privateSendWalletContext !== "" && privateSendWalletContext !== context)
-      invalidateSendPresentationContext()
+    var changed = privateSendWalletContext !== ""
+      && privateSendWalletContext !== context
+    if (changed)
+      clearSendSecurityContextState()
     privateSendWalletContext = context
+    return changed
   }
 
   function setupView() {
@@ -326,6 +380,12 @@ Item {
       unit: unit,
       activeTransfers: activeTransfers,
       activeSends: activeSends,
+      sendCanonicalSynchronized: sendCanonicalSynchronized,
+      activeSendsCanonicalRefreshCount: activeSendsCanonicalRefreshCount,
+      sendOperationErrorCount: sendOperationErrorCount(),
+      sendSecurityContextGeneration: sendSecurityContextGeneration,
+      sendTransportContextCurrent: privateSendDaemonContext === String(daemonBaseUrl || "")
+        && privateSendCredentialContext === clientCredential(),
       trustedMintCount: trustedMints.length,
       receiveState: receiveState,
       receiveError: receiveError,
@@ -500,6 +560,15 @@ Item {
     }
   }
 
+  function sendOperationErrorCount() {
+    var count = 0
+    for (var preparedId in preparedSendActions)
+      if (String(preparedSendActions[preparedId].error || "") !== "") count++
+    for (var pendingId in pendingSendActions)
+      if (String(pendingSendActions[pendingId].error || "") !== "") count++
+    return count
+  }
+
   function updatePreparedSendAction(operationId, state, errorCode, terminalState) {
     var id = String(operationId || "")
     if (!id) return
@@ -580,6 +649,58 @@ Item {
       if (key !== id) actions[key] = pendingSendActions[key]
     pendingSendActions = actions
     return true
+  }
+
+  function annotateMissingCanonicalSends(previous, next) {
+    var retained = ({})
+    var previousById = ({})
+    var source = Array.isArray(previous) ? previous : []
+    for (var previousIndex = 0; previousIndex < source.length; previousIndex++)
+      previousById[String(source[previousIndex].id || "")] = source[previousIndex]
+    var current = Array.isArray(next) ? next : []
+    for (var currentIndex = 0; currentIndex < current.length; currentIndex++) {
+      var currentOperation = current[currentIndex]
+      var currentId = String(currentOperation.id || "")
+      var currentState = String(currentOperation.state || "")
+      if (["init", "prepared", "executing", "pending", "rolling_back"]
+          .indexOf(currentState) !== -1) {
+        retained[currentId] = true
+        continue
+      }
+      var prior = previousById[currentId]
+      var priorState = prior ? String(prior.state || "") : ""
+      if (currentState === "rolled_back" && priorState === "prepared")
+        updatePreparedSendAction(currentId, "terminal", "", "cancelled")
+      else if (currentState === "rolled_back")
+        updatePendingSendAction(currentId, "terminal", "", "reclaimed",
+          prior ? operationAmount(prior) : operationAmount(currentOperation))
+      else if (currentState === "finalized")
+        updatePendingSendAction(currentId, "terminal", "", "recipient_won",
+          prior ? operationAmount(prior) : operationAmount(currentOperation))
+    }
+    for (var index = 0; index < source.length; index++) {
+      var operation = source[index]
+      var id = String(operation.id || "")
+      if (!id || retained[id]) continue
+      var state = String(operation.state || "")
+      if (state === "prepared") {
+        var preparedAction = preparedSendAction(id)
+        if (!preparedAction.terminalState)
+          updatePreparedSendAction(id, "terminal", "", "completed")
+      } else if (["executing", "pending", "rolling_back"].indexOf(state) !== -1) {
+        var pendingAction = pendingSendAction(id)
+        if (!pendingAction.terminalState)
+          updatePendingSendAction(id, "terminal", "", "completed",
+            operationAmount(operation) || "")
+      }
+    }
+  }
+
+  function replaceCanonicalSendOperations(values, annotateMissing) {
+    var next = Array.isArray(values) ? values : []
+    if (annotateMissing !== false)
+      annotateMissingCanonicalSends(sendOperations, next)
+    sendOperations = next
   }
 
   function pendingSendErrorMessage(code) {
@@ -989,7 +1110,10 @@ Item {
   function sendRequest(method, path, body, callback, accept, headers) {
     var credential = clientCredential()
     if (!credential) return null
-    observeSendTransportContext(credential)
+    var protectsSendState = String(path || "").indexOf("/v1/operations/send") === 0
+    var contextChanged = protectsSendState && !fullFetchInProgress
+      ? observeSendTransportContext(credential) : false
+    if (protectsSendState && contextChanged) return null
     var request = new XMLHttpRequest()
     request.onreadystatechange = function() {
       if (request.readyState !== XMLHttpRequest.DONE) return
@@ -1059,8 +1183,10 @@ Item {
     var refreshBalances = queuedBalanceInvalidation
     queuedSendInvalidation = false
     queuedBalanceInvalidation = false
-    if (refreshSends) fetchOperationGroup("send")
-    if (refreshBalances) fetchBalances()
+    if (refreshSends || refreshBalances) {
+      refreshActiveSends("queued-invalidation")
+      return
+    }
     var queuedOperations = queuedSendOperationInvalidations
     queuedSendOperationInvalidations = ({})
     for (var operationId in queuedOperations) refetchSendOperation(operationId)
@@ -1144,6 +1270,30 @@ Item {
 
   function beginReconcile(reason) {
     var requestedReason = String(reason || "manual")
+    if (!daemonUrlAllowed) {
+      compatibilityState = "unknown"
+      connectionState = "error"
+      connectionDetail = "cocod URL must use HTTP on loopback"
+      lastErrorCode = "invalid_daemon_url"
+      retryAttempt = 0
+      retryDelayMs = 0
+      sendCanonicalSynchronized = false
+      return
+    }
+    var credential = clientCredential()
+    if (!credential) {
+      if (privateSendCredentialContext !== "")
+        observeSendTransportContext("")
+      compatibilityState = "unknown"
+      connectionState = "error"
+      connectionDetail = "The cocod Client Credential is unavailable"
+      lastErrorCode = "credential_unavailable"
+      retryAttempt = 0
+      retryDelayMs = 0
+      sendCanonicalSynchronized = false
+      return
+    }
+    observeSendTransportContext(credential)
     if (fullFetchInProgress || sendCanonicalMutationBusy()) {
       if (deferredReconcileReason !== "rotation" || requestedReason === "rotation")
         deferredReconcileReason = requestedReason
@@ -1159,24 +1309,6 @@ Item {
       stopStream()
     }
     abortCanonicalRequests()
-    if (!daemonUrlAllowed) {
-      compatibilityState = "unknown"
-      connectionState = "error"
-      connectionDetail = "cocod URL must use HTTP on loopback"
-      lastErrorCode = "invalid_daemon_url"
-      retryAttempt = 0
-      retryDelayMs = 0
-      return
-    }
-    if (!clientCredential()) {
-      compatibilityState = "unknown"
-      connectionState = "error"
-      connectionDetail = "The cocod Client Credential is unavailable"
-      lastErrorCode = "credential_unavailable"
-      retryAttempt = 0
-      retryDelayMs = 0
-      return
-    }
     if (requestedReason === "startup") {
       connectionState = "connecting"
       connectionDetail = "Connecting to cocod on loopback"
@@ -1196,6 +1328,9 @@ Item {
     receiveResourceGeneration++
     receiveLookupTokens = ({})
     fullFetchInProgress = true
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = clientCredential()
+    privateFullFetchDaemonContext = String(daemonBaseUrl || "")
     var token = ++fullFetchToken
     var capabilityRequest = sendRequest("GET", "/v1/openapi.json", undefined,
       function(result) {
@@ -1504,13 +1639,19 @@ Item {
     queuedReceiveInvalidations = ({})
     fullFetchInProgress = false
     canonicalRequests = []
-    observeSendWalletContext(status)
+    var acceptedCredential = privateFullFetchCredentialContext
+    var acceptedDaemon = privateFullFetchDaemonContext
+    var walletContextChanged = observeSendWalletContext(status)
+    acceptSendTransportContext(acceptedCredential, acceptedDaemon)
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     openApiResource = openApi
     statusResource = status
     balancesResource = balances
     mintsResource = mints
     receiveOperations = receives
-    sendOperations = sends
+    replaceCanonicalSendOperations(sends, true)
+    sendCanonicalSynchronized = true
     compatibilityState = "compatible"
     connectionState = "connected"
     connectionDetail = "Connected to cocod"
@@ -1534,7 +1675,8 @@ Item {
       createError = status.cocoSession.lastFailure
         ? "Wallet created, but its Coco Session could not start" : ""
     }
-    if (connectAfterward && walletState === "unlocked") startStream()
+    if ((connectAfterward || walletContextChanged) && walletState === "unlocked")
+      startStream()
     if (receiveState === "reconciling" && receiveOperationId)
       reconcileReceiveOperation(receiveOperationId)
     reconcileAmbiguousReceiveFromCanonical()
@@ -1546,6 +1688,9 @@ Item {
 
   function handleCredentialUnavailable() {
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     connectionState = "error"
     compatibilityState = "unknown"
@@ -1556,7 +1701,14 @@ Item {
   }
 
   function handleFetchFailure(result) {
+    if (result && result.error
+        && ["unauthenticated", "forbidden"].indexOf(
+          String(result.error.code || "")) !== -1)
+      clearSendSecurityContextState()
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
@@ -1577,6 +1729,9 @@ Item {
 
   function handleContractFailure(code, detail) {
     fullFetchInProgress = false
+    sendCanonicalSynchronized = false
+    privateFullFetchCredentialContext = ""
+    privateFullFetchDaemonContext = ""
     queuedReceiveInvalidations = ({})
     abortCanonicalRequests()
     compatibilityState = "unknown"
@@ -2083,13 +2238,13 @@ Item {
     if (activePendingCommandOperationId === String(operationId || ""))
       activePendingCommandOperationId = ""
     if (values) {
-      sendOperations = values.prepared.items.concat(values.inFlight.items)
+      replaceCanonicalSendOperations(values.prepared.items.concat(values.inFlight.items), true)
       balancesResource = values.balances
       refreshCount++
     } else if (exactOperation) {
-      sendOperations = withSendOperation(sendOperations, exactOperation)
+      replaceCanonicalSendOperations(withSendOperation(sendOperations, exactOperation), true)
     } else if (exactMissing) {
-      sendOperations = withoutSendOperation(sendOperations, operationId)
+      replaceCanonicalSendOperations(withoutSendOperation(sendOperations, operationId), true)
     }
 
     var amount = activePendingSendAmount(operationId, exactOperation)
@@ -2455,17 +2610,47 @@ Item {
   }
 
   function reconcileSendResources(callback, failureCallback) {
+    sendCanonicalSynchronized = false
     var specifications = [
       { key: "prepared", path: "/v1/operations/send/prepared", type: "send" },
       { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
       { key: "balances", path: "/v1/balances", type: "balances" }
     ]
     collectSendResources(specifications, function(values) {
-      root.sendOperations = values.prepared.items.concat(values.inFlight.items)
+      root.replaceCanonicalSendOperations(
+        values.prepared.items.concat(values.inFlight.items), true)
       root.balancesResource = values.balances
       root.refreshCount++
+      root.sendCanonicalSynchronized = true
       callback()
-    }, failureCallback)
+    }, function(code) {
+      root.sendCanonicalSynchronized = false
+      if (typeof failureCallback === "function") failureCallback(code)
+    })
+  }
+
+  function refreshActiveSends(reason) {
+    if (connectionState !== "connected" || compatibilityState !== "compatible"
+        || walletState !== "unlocked") {
+      sendCanonicalSynchronized = false
+      return false
+    }
+    activeSendsCanonicalRefreshCount++
+    if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+      queuedSendInvalidation = true
+      queuedBalanceInvalidation = true
+      sendCanonicalSynchronized = false
+      return true
+    }
+    reconcileSendResources(function() {
+      root.resumeQueuedSendInvalidations()
+    }, function(code) {
+      root.lastErrorCode = String(code || "transport_unavailable")
+      root.connectionState = "unavailable"
+      root.connectionDetail = "Active Sends canonical refresh failed"
+      root.scheduleReconnect(false, !!root.streamRequest)
+    })
+    return true
   }
 
   function failSend(code) {
@@ -2964,7 +3149,20 @@ Item {
     if (request) request.abort()
   }
 
-  function fetchBalances() {
+  function hasSendLookupRequests() {
+    for (var operationId in sendLookupRequestsById) return true
+    return false
+  }
+
+  function maybeMarkSendCanonicalSynchronized() {
+    if (fullFetchInProgress || sendCanonicalMutationBusy() || balanceRequest
+        || sendRequests.length > 0 || hasSendLookupRequests()
+        || queuedSendInvalidation || queuedBalanceInvalidation) return
+    sendCanonicalSynchronized = connectionState === "connected"
+      && compatibilityState === "compatible" && walletState === "unlocked"
+  }
+
+  function fetchBalances(successCallback) {
     if (fullFetchInProgress || sendCanonicalMutationBusy()) {
       queuedBalanceInvalidation = true
       return
@@ -2985,6 +3183,8 @@ Item {
       }
       root.balancesResource = result.value
       root.refreshCount++
+      if (typeof successCallback === "function") successCallback()
+      root.maybeMarkSendCanonicalSynchronized()
     })
     if (!request) {
       handleCredentialUnavailable()
@@ -3026,7 +3226,10 @@ Item {
     var existing = type === "receive" ? receiveRequests : sendRequests
     abortRequests(existing)
     if (type === "receive") receiveRequests = []
-    else sendRequests = []
+    else {
+      sendRequests = []
+      sendCanonicalSynchronized = false
+    }
     var paths = [
       "/v1/operations/" + type + "/prepared",
       "/v1/operations/" + type + "/in-flight"
@@ -3055,7 +3258,8 @@ Item {
               root.receiveOperations = values[0].concat(values[1])
             } else {
               root.sendRequests = []
-              root.sendOperations = values[0].concat(values[1])
+              root.replaceCanonicalSendOperations(values[0].concat(values[1]), true)
+              root.maybeMarkSendCanonicalSynchronized()
             }
             root.refreshCount++
           }
@@ -3117,17 +3321,20 @@ Item {
       queueSendOperationInvalidation(id)
       return
     }
+    sendCanonicalSynchronized = false
 
     function complete(operation, remove) {
       var requests = ({})
       for (var key in root.sendLookupRequestsById)
         if (key !== id) requests[key] = root.sendLookupRequestsById[key]
       root.sendLookupRequestsById = requests
-      if (operation) root.sendOperations = root.withSendOperation(
-        root.sendOperations, operation)
-      else if (remove) root.sendOperations = root.withoutSendOperation(
-        root.sendOperations, id)
-      root.fetchBalances()
+      if (operation) root.replaceCanonicalSendOperations(root.withSendOperation(
+        root.sendOperations, operation), true)
+      else if (remove) root.replaceCanonicalSendOperations(root.withoutSendOperation(
+        root.sendOperations, id), true)
+      root.fetchBalances(function() {
+        root.maybeMarkSendCanonicalSynchronized()
+      })
       root.refreshCount++
       if (root.queuedSendOperationInvalidations[id]) {
         var queued = ({})
@@ -3135,7 +3342,7 @@ Item {
           if (queuedId !== id) queued[queuedId] = true
         root.queuedSendOperationInvalidations = queued
         Qt.callLater(function() { root.refetchSendOperation(id) })
-      }
+      } else root.maybeMarkSendCanonicalSynchronized()
     }
 
     var lookup = sendRequest("GET", "/v1/operations/send/"
@@ -3343,7 +3550,8 @@ Item {
       return
     }
     if (event.type === "balance.updated") {
-      fetchBalances()
+      sendCanonicalSynchronized = false
+      fetchBalances(function() { root.maybeMarkSendCanonicalSynchronized() })
       refetchPendingSendOperations()
     }
     else if (event.type === "mint.updated") fetchMints()
@@ -3361,6 +3569,7 @@ Item {
       } else if (operationType === "send") {
         var sendOperationId = String(event.data.operationId || "")
         if (fullFetchInProgress || sendCanonicalMutationBusy()) {
+          sendCanonicalSynchronized = false
           queueSendOperationInvalidation(sendOperationId)
           queuedSendInvalidation = true
           queuedBalanceInvalidation = true
@@ -3388,6 +3597,7 @@ Item {
     heartbeatTimer.stop()
     rotationTimer.stop()
     connectionState = "unavailable"
+    sendCanonicalSynchronized = false
     connectionDetail = status > 0
       ? "cocod event stream closed with HTTP " + status
       : "cocod event stream disconnected"
@@ -3480,6 +3690,7 @@ Item {
     repeat: false
     onTriggered: {
       root.connectionState = "unavailable"
+      root.sendCanonicalSynchronized = false
       root.connectionDetail = "cocod event stream heartbeat timed out"
       root.lastErrorCode = "event_stream_timeout"
       root.scheduleReconnect(true)
