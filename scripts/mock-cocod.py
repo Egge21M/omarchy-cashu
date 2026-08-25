@@ -233,9 +233,12 @@ class MockState:
         self.send_execute_requests = 0
         self.send_cancel_requests = 0
         self.send_reclaim_requests = 0
+        self.send_reclaim_operation_ids: list[str] = []
         self.send_refresh_requests = 0
         self.send_lookup_requests = 0
         self.send_result_requests = 0
+        self.send_result_operation_ids: list[str] = []
+        self.send_result_delay_ms = 0
         self.send_result_unavailable_responses = 0
         self.send_operation_sequence = 0
         self.send_operations: dict[str, dict[str, Any]] = {}
@@ -247,6 +250,7 @@ class MockState:
         self.send_cancel_error = ""
         self.send_reclaim_outcome = "success"
         self.send_refresh_error = ""
+        self.send_refresh_unavailable_responses = 0
         self.send_execute_interruption = "none"
         self.send_command_delay_ms = 0
         self.send_prepared_failures = 0
@@ -570,6 +574,11 @@ class MockState:
     def send_result(self, operation_id: str) -> tuple[int, dict[str, Any]]:
         with self.lock:
             self.send_result_requests += 1
+            self.send_result_operation_ids.append(operation_id)
+            delay_ms = self.send_result_delay_ms
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+        with self.lock:
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 return operation_error("not_found", "The Send does not exist")
@@ -706,6 +715,7 @@ class MockState:
                 self.send_cancel_requests += 1
             elif command == "reclaim":
                 self.send_reclaim_requests += 1
+                self.send_reclaim_operation_ids.append(operation_id)
             operation = self.send_operations.get(operation_id)
             if operation is None:
                 status, response = operation_error(
@@ -896,6 +906,9 @@ class MockState:
                 return status, response, []
             forced_error = self.send_refresh_error
             self.send_refresh_error = ""
+            if self.send_refresh_unavailable_responses > 0:
+                self.send_refresh_unavailable_responses -= 1
+                forced_error = "mint_unavailable"
             if forced_error:
                 status, response = operation_error(
                     forced_error, "Coco could not reconcile the Send Operation"
@@ -1294,9 +1307,13 @@ class MockState:
                 "sendExecuteRequests": self.send_execute_requests,
                 "sendCancelRequests": self.send_cancel_requests,
                 "sendReclaimRequests": self.send_reclaim_requests,
+                "sendReclaimOperationIds": list(self.send_reclaim_operation_ids),
                 "sendRefreshRequests": self.send_refresh_requests,
                 "sendLookupRequests": self.send_lookup_requests,
                 "sendResultRequests": self.send_result_requests,
+                "sendResultOperationIds": list(self.send_result_operation_ids),
+                "sendResultDelayMs": self.send_result_delay_ms,
+                "sendRefreshUnavailableResponses": self.send_refresh_unavailable_responses,
                 "sendOperationCount": len(self.send_operations),
                 "sendCommandDelayMs": self.send_command_delay_ms,
             }
@@ -1717,6 +1734,22 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.send_refresh_error = refresh_error
+                if "sendRefreshUnavailableResponses" in value:
+                    try:
+                        refresh_unavailable = int(
+                            value["sendRefreshUnavailableResponses"]
+                        )
+                    except (TypeError, ValueError):
+                        refresh_unavailable = -1
+                    if refresh_unavailable < 0 or refresh_unavailable > 10:
+                        self.send_json(
+                            400,
+                            error_document(
+                                "invalid_request", "Invalid Send refresh unavailable count"
+                            ),
+                        )
+                        return
+                    self.state.send_refresh_unavailable_responses = refresh_unavailable
                 if "sendCommandDelayMs" in value:
                     self.state.send_command_delay_ms = max(
                         0, min(5000, int(value["sendCommandDelayMs"]))
@@ -1748,6 +1781,10 @@ class Handler(BaseHTTPRequestHandler):
                         )
                         return
                     self.state.send_result_unavailable_responses = unavailable_responses
+                if "sendResultDelayMs" in value:
+                    self.state.send_result_delay_ms = max(
+                        0, min(5000, int(value["sendResultDelayMs"]))
+                    )
                 if value.get("sendPrepareReconcileError") is True:
                     self.state.send_prepared_failures = 1
                     self.state.suppress_next_send_events = True

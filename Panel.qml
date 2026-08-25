@@ -39,6 +39,14 @@ Item {
         return activeSends[index]
     return null
   }
+  readonly property var selectedPendingSendAction: stateOwner
+    && selectedActiveSendOperationId
+    && typeof stateOwner.pendingSendAction === "function"
+    ? stateOwner.pendingSendAction(selectedActiveSendOperationId) : ({
+      state: "idle", errorCode: "", error: "", terminalState: "", amount: ""
+    })
+  readonly property string selectedPendingSendTerminalState: String(
+    selectedPendingSendAction.terminalState || "")
 
   readonly property color foreground: shell && shell.bar
     ? shell.bar.foreground : Color.foreground
@@ -158,6 +166,9 @@ Item {
       if (String(activeSends[index].id || "") !== selected) continue
       selectedActiveSendOperationId = selected
       activeSendsViewState = "detail"
+      if (String(activeSends[index].state || "") === "pending")
+        activePendingSendFlow.focusPendingDetail(selected,
+          String(activeSends[index].amount || ""))
       panelFlick.contentY = 0
       return true
     }
@@ -166,6 +177,10 @@ Item {
 
   function backActiveSends() {
     if (activeSendsViewState === "detail") {
+      var selected = selectedActiveSendOperationId
+      activePendingSendFlow.leavePendingDetail()
+      if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
+        stateOwner.acknowledgePendingSendTerminal(selected)
       selectedActiveSendOperationId = ""
       activeSendsViewState = "list"
       panelFlick.contentY = 0
@@ -180,6 +195,10 @@ Item {
   }
 
   function closeActiveSends() {
+    var selected = selectedActiveSendOperationId
+    activePendingSendFlow.leavePendingDetail()
+    if (stateOwner && typeof stateOwner.acknowledgePendingSendTerminal === "function")
+      stateOwner.acknowledgePendingSendTerminal(selected)
     selectedActiveSendOperationId = ""
     activeSendsViewState = "closed"
   }
@@ -338,6 +357,30 @@ Item {
     return backActiveSends() ? "ok" : "disabled"
   }
 
+  function smokeCopyActivePendingSend() {
+    return activePendingSendFlow.copyPendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeRevealActivePendingSend() {
+    return activePendingSendFlow.revealPendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeHideActivePendingSend() {
+    return activePendingSendFlow.hidePendingToken() ? "ok" : "disabled"
+  }
+
+  function smokeRefreshActivePendingSend() {
+    return activePendingSendFlow.refreshPending() ? "ok" : "disabled"
+  }
+
+  function smokeBeginActivePendingReclaim() {
+    return activePendingSendFlow.beginActivePendingReclaim() ? "ok" : "disabled"
+  }
+
+  function smokeConfirmActivePendingReclaim() {
+    return activePendingSendFlow.confirmActivePendingReclaim() ? "ok" : "disabled"
+  }
+
   function smokeSnapshot() {
     return JSON.stringify({
       opened: opened,
@@ -418,8 +461,22 @@ Item {
       activeSendRows: activeSendRowsSnapshot(),
       selectedActiveSendOperationId: selectedActiveSendOperationId,
       selectedActiveSend: selectedActiveSend,
-      activeSendDetailReadOnly: activeSendsViewState === "detail",
-      activeSendMutationActionCount: 0,
+      activeSendDetailReadOnly: activeSendsViewState === "detail"
+        && !(selectedActiveSend && selectedActiveSend.state === "pending"),
+      activeSendMutationActionCount: activeSendsViewState === "detail"
+        && selectedActiveSend && selectedActiveSend.state === "pending" ? 4 : 0,
+      activePendingActionState: activePendingSendFlow.pendingActionState,
+      activePendingErrorCode: activePendingSendFlow.pendingErrorCode,
+      activePendingError: activePendingSendFlow.pendingError,
+      activePendingTerminalState: activePendingSendFlow.pendingTerminalState,
+      activePendingCopyAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingRevealAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingRefreshAvailable: activePendingSendFlow.pendingResultAvailable,
+      activePendingReclaimAvailable: activePendingSendFlow.pendingReclaimAvailable,
+      activePendingReclaimWarningVisible: activePendingSendFlow.reclaimWarningVisible,
+      activePendingReclaimWarning: activePendingSendFlow.reclaimWarning,
+      activePendingTokenRevealed: activePendingSendFlow.pendingTokenRevealed,
+      activePendingClipboardWrites: activePendingSendFlow.clipboardWrites,
       setupTitle: stateOwner ? stateOwner.setupTitle : "cocod is not available"
     })
   }
@@ -1095,6 +1152,7 @@ Item {
 
               Text {
                 visible: !root.selectedActiveSend
+                  && root.selectedPendingSendTerminalState === ""
                 width: parent.width
                 text: "This Send is no longer active in cocod. Return to Active Sends."
                 color: root.dim
@@ -1140,6 +1198,17 @@ Item {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 horizontalAlignment: Text.AlignHCenter
+              }
+
+              SendFlow {
+                id: activePendingSendFlow
+                width: parent.width
+                service: root.stateOwner
+                foreground: root.foreground
+                urgent: root.urgent
+                dim: root.dim
+                fontFamily: root.fontFamily
+                pendingDetailMode: true
               }
             }
           }

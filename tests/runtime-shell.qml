@@ -204,5 +204,29 @@ ShellRoot {
     function backActiveSends(): string {
       return walletPanel.smokeBackActiveSends()
     }
+
+    function copyActivePendingSend(): string {
+      return walletPanel.smokeCopyActivePendingSend()
+    }
+
+    function revealActivePendingSend(): string {
+      return walletPanel.smokeRevealActivePendingSend()
+    }
+
+    function hideActivePendingSend(): string {
+      return walletPanel.smokeHideActivePendingSend()
+    }
+
+    function refreshActivePendingSend(): string {
+      return walletPanel.smokeRefreshActivePendingSend()
+    }
+
+    function beginActivePendingReclaim(): string {
+      return walletPanel.smokeBeginActivePendingReclaim()
+    }
+
+    function confirmActivePendingReclaim(): string {
+      return walletPanel.smokeConfirmActivePendingReclaim()
+    }
   }
 }

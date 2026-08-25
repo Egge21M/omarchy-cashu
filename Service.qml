@@ -11,6 +11,9 @@ Item {
   signal recoveryPhraseRevealed(string phrase)
   signal recoveryPhraseRevealFailed(string detail)
   signal sendExecuted(string token)
+  signal pendingSendResultDelivered(string operationId,
+    int presentationGeneration, string intent, string token)
+  signal sendPresentationInvalidated()
 
   property var shell: null
   property var manifest: null
@@ -128,6 +131,12 @@ Item {
   readonly property string receiveRecoveryError: String(receiveRecovery.error || "")
   property var sendCommandRequest: null
   property var sendReconcileRequests: []
+  property string activePendingCommandOperationId: ""
+  property var pendingSendActions: ({})
+  property int sendPresentationContextGeneration: 0
+  property string privateSendCredentialContext: ""
+  property string privateSendDaemonContext: ""
+  property string privateSendWalletContext: ""
   property string sendState: "idle"
   property string sendError: ""
   property string sendErrorCode: ""
@@ -233,6 +242,32 @@ Item {
     var value = String(credentialFile.text() || "")
     if (!/^[A-Za-z0-9_-]{43}\n$/.test(value)) return ""
     return value.slice(0, -1)
+  }
+
+  function invalidateSendPresentationContext() {
+    sendPresentationContextGeneration++
+    sendPresentationInvalidated()
+  }
+
+  function observeSendTransportContext(credential) {
+    var daemon = String(daemonBaseUrl || "")
+    var value = String(credential || "")
+    var changed = (privateSendDaemonContext !== ""
+        && privateSendDaemonContext !== daemon)
+      || (privateSendCredentialContext !== ""
+        && privateSendCredentialContext !== value)
+    privateSendDaemonContext = daemon
+    privateSendCredentialContext = value
+    if (changed) invalidateSendPresentationContext()
+  }
+
+  function observeSendWalletContext(status) {
+    var wallet = status && status.wallet ? status.wallet : null
+    var configuredAt = wallet ? String(wallet.configuredAt || "") : ""
+    var context = String(daemonBaseUrl || "") + "\n" + configuredAt
+    if (privateSendWalletContext !== "" && privateSendWalletContext !== context)
+      invalidateSendPresentationContext()
+    privateSendWalletContext = context
   }
 
   function setupView() {
@@ -449,6 +484,64 @@ Item {
     var operation = canonicalSendOperation(operationId)
     return operation && String(operation.state || "") === "prepared"
       ? operation : null
+  }
+
+  function pendingSendAction(operationId) {
+    var id = String(operationId || "")
+    var action = id ? pendingSendActions[id] : null
+    return action || {
+      operationId: id,
+      state: "idle",
+      errorCode: "",
+      error: "",
+      terminalState: "",
+      amount: ""
+    }
+  }
+
+  function updatePendingSendAction(operationId, state, errorCode,
+      terminalState, amount) {
+    var id = String(operationId || "")
+    if (!id) return
+    var actions = ({})
+    for (var key in pendingSendActions) actions[key] = pendingSendActions[key]
+    var code = String(errorCode || "")
+    actions[id] = {
+      operationId: id,
+      state: String(state || "idle"),
+      errorCode: code,
+      error: code ? pendingSendErrorMessage(code) : "",
+      terminalState: String(terminalState || ""),
+      amount: decimalString(amount) || ""
+    }
+    pendingSendActions = actions
+  }
+
+  function acknowledgePendingSendTerminal(operationId) {
+    var id = String(operationId || "")
+    var action = pendingSendActions[id]
+    if (!action || !action.terminalState) return false
+    var actions = ({})
+    for (var key in pendingSendActions)
+      if (key !== id) actions[key] = pendingSendActions[key]
+    pendingSendActions = actions
+    return true
+  }
+
+  function pendingSendErrorMessage(code) {
+    var messages = {
+      coco_error: "Reclaim was inconclusive. This Send remains Pending; Refresh or try Reclaim again.",
+      operation_conflict: "This Send changed while cocod attempted the request. Its exact canonical state is shown; Refresh or try again.",
+      operation_not_found: "cocod no longer reports this exact Send Operation.",
+      result_not_available: "The outgoing token is temporarily unavailable. This Send remains Pending; Refresh and try again.",
+      mint_unavailable: "The Mint is temporarily unavailable. This Send remains Pending; Refresh or try Reclaim again later.",
+      refresh_unavailable: "Canonical refresh is temporarily unavailable. This Send remains Pending; Refresh or try Reclaim again later.",
+      credential_unavailable: "The cocod Client Credential is unavailable.",
+      invalid_response: "cocod returned an invalid response for this exact Send.",
+      transport_unavailable: "This Send could not reach cocod. It remains unchanged until canonical reconciliation succeeds."
+    }
+    return messages[String(code || "")]
+      || "This exact Send could not be completed. Refresh and try again."
   }
 
   function firstCanonicalPreparedSend() {
@@ -854,6 +947,7 @@ Item {
   function sendRequest(method, path, body, callback, accept) {
     var credential = clientCredential()
     if (!credential) return null
+    observeSendTransportContext(credential)
     var request = new XMLHttpRequest()
     request.onreadystatechange = function() {
       if (request.readyState !== XMLHttpRequest.DONE) return
@@ -1365,6 +1459,7 @@ Item {
     queuedReceiveInvalidations = ({})
     fullFetchInProgress = false
     canonicalRequests = []
+    observeSendWalletContext(status)
     openApiResource = openApi
     statusResource = status
     balancesResource = balances
@@ -1517,6 +1612,7 @@ Item {
   }
 
   function resetSend() {
+    if (activePendingCommandOperationId) return true
     if (["preparing", "cancelling", "executing", "reclaiming"]
         .indexOf(sendState) !== -1
         || (sendState === "review" && sendPreparedOperation)
@@ -1565,6 +1661,7 @@ Item {
   }
 
   function dismissSendFlow() {
+    if (activePendingCommandOperationId) return true
     if (sendState === "preparing") {
       sendCancelOnPrepared = true
       return true
@@ -1875,6 +1972,301 @@ Item {
       })
     if (!request) {
       failSend("credential_unavailable")
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function activePendingSendAmount(operationId, fallback) {
+    var operation = fallback || canonicalSendOperation(operationId)
+    if (!operation) {
+      var action = pendingSendAction(operationId)
+      return String(action.amount || "")
+    }
+    return String(operationAmount(operation) || "")
+  }
+
+  function finishActivePendingReconciliation(operationId, exactOperation,
+      exactMissing, outcomeCode, values) {
+    sendReconcileRequests = []
+    sendResultReconciling = false
+    if (activePendingCommandOperationId === String(operationId || ""))
+      activePendingCommandOperationId = ""
+    if (values) {
+      sendOperations = values.prepared.items.concat(values.inFlight.items)
+      balancesResource = values.balances
+      refreshCount++
+    } else if (exactOperation) {
+      sendOperations = withSendOperation(sendOperations, exactOperation)
+    } else if (exactMissing) {
+      sendOperations = withoutSendOperation(sendOperations, operationId)
+    }
+
+    var amount = activePendingSendAmount(operationId, exactOperation)
+    var state = exactOperation ? String(exactOperation.state || "") : ""
+    if (state === "rolled_back") {
+      updatePendingSendAction(operationId, "terminal", "", "reclaimed", amount)
+    } else if (state === "finalized") {
+      updatePendingSendAction(operationId, "terminal", "", "recipient_won", amount)
+    } else if (exactMissing) {
+      updatePendingSendAction(operationId, "terminal", "operation_not_found",
+        "unavailable", amount)
+    } else {
+      var code = String(outcomeCode || "")
+      if (state && state !== "pending" && !code) code = "operation_conflict"
+      updatePendingSendAction(operationId, code ? "error" : "idle", code, "", amount)
+    }
+    resumeDeferredCanonicalReconcile()
+  }
+
+  function reconcileActivePendingCollections(operationId, exactOperation,
+      exactMissing, outcomeCode) {
+    var specifications = [
+      { key: "prepared", path: "/v1/operations/send/prepared", type: "send" },
+      { key: "inFlight", path: "/v1/operations/send/in-flight", type: "send" },
+      { key: "balances", path: "/v1/balances", type: "balances" }
+    ]
+    var values = ({})
+    var requests = []
+    var pending = specifications.length
+    var failed = false
+
+    function reject(code) {
+      if (failed) return
+      failed = true
+      root.abortRequests(requests)
+      root.sendReconcileRequests = []
+      root.finishActivePendingReconciliation(operationId, exactOperation,
+        exactMissing, code || outcomeCode || "transport_unavailable", null)
+    }
+
+    for (var index = 0; index < specifications.length; index++) {
+      (function(specification) {
+        var request = root.sendRequest("GET", specification.path, undefined,
+          function(result) {
+            if (failed || requests.indexOf(request) === -1) return
+            if (!result.ok) {
+              reject(result.error.code)
+              return
+            }
+            var valid = specification.type === "balances"
+              ? root.isBalanceCollection(result.value)
+              : root.isOperationCollection(result.value, "send")
+            if (result.status !== 200 || !valid) {
+              reject("invalid_response")
+              return
+            }
+            values[specification.key] = result.value
+            pending--
+            if (pending === 0)
+              root.finishActivePendingReconciliation(operationId, exactOperation,
+                exactMissing, outcomeCode, values)
+          })
+        if (!request) {
+          reject("credential_unavailable")
+          return
+        }
+        requests.push(request)
+      })(specifications[index])
+    }
+    sendReconcileRequests = requests
+  }
+
+  function reconcileActivePendingSend(operationId, outcomeCode, fallbackOperation) {
+    var id = String(operationId || "")
+    if (!id) return
+    activePendingCommandOperationId = id
+    sendResultReconciling = true
+    var lookup = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id), undefined, function(result) {
+        if (root.sendReconcileRequests.indexOf(lookup) === -1) return
+        root.sendReconcileRequests = []
+        if (!result.ok) {
+          if (result.error.code === "operation_not_found") {
+            root.reconcileActivePendingCollections(id, null, true,
+              outcomeCode || "operation_not_found")
+            return
+          }
+          root.reconcileActivePendingCollections(id, fallbackOperation || null,
+            false, result.error.code || outcomeCode)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id) {
+          root.reconcileActivePendingCollections(id, fallbackOperation || null,
+            false, "invalid_response")
+          return
+        }
+        var exact = result.value
+        if (String(exact.state || "") !== "pending") {
+          root.reconcileActivePendingCollections(id, exact, false, outcomeCode)
+          return
+        }
+        var refresh = root.sendRequest("POST", "/v1/operations/send/"
+          + encodeURIComponent(id) + "/refresh", undefined, function(refreshResult) {
+            if (root.sendReconcileRequests.indexOf(refresh) === -1) return
+            root.sendReconcileRequests = []
+            if (!refreshResult.ok) {
+              if (refreshResult.error.code === "operation_not_found")
+                root.reconcileActivePendingCollections(id, null, true,
+                  outcomeCode || "operation_not_found")
+              else root.reconcileActivePendingCollections(id, exact, false,
+                refreshResult.error.code === "coco_error"
+                  ? "refresh_unavailable" : refreshResult.error.code || outcomeCode)
+              return
+            }
+            if (refreshResult.status !== 200
+                || !root.isSendOperation(refreshResult.value)
+                || String(refreshResult.value.id || "") !== id) {
+              root.reconcileActivePendingCollections(id, exact, false,
+                "invalid_response")
+              return
+            }
+            root.reconcileActivePendingCollections(id, refreshResult.value,
+              false, outcomeCode)
+          })
+        if (!refresh) {
+          root.reconcileActivePendingCollections(id, exact, false,
+            "credential_unavailable")
+          return
+        }
+        root.sendReconcileRequests = [refresh]
+      })
+    if (!lookup) {
+      sendResultReconciling = false
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "",
+        activePendingSendAmount(id, fallbackOperation))
+      resumeDeferredCanonicalReconcile()
+      return
+    }
+    sendReconcileRequests = [lookup]
+  }
+
+  function requestActivePendingSendResult(operationId, presentationGeneration,
+      intent) {
+    var id = String(operationId || "")
+    var requestedIntent = String(intent || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || ["copy", "reveal"].indexOf(requestedIntent) === -1
+        || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id,
+      requestedIntent === "copy" ? "copying" : "revealing", "", "", amount)
+    var contextGeneration = sendPresentationContextGeneration
+    var request = sendRequest("GET", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/result", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (contextGeneration !== root.sendPresentationContextGeneration) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "idle", "", "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        if (!result.ok) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "error", result.error.code, "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        if (result.status !== 200 || !root.isSendResult(result.value)) {
+          root.activePendingCommandOperationId = ""
+          root.updatePendingSendAction(id, "error", "invalid_response", "", amount)
+          root.resumeDeferredCanonicalReconcile()
+          return
+        }
+        var outgoingToken = String(result.value.token)
+        result.value.token = ""
+        root.updatePendingSendAction(id, "idle", "", "", amount)
+        root.activePendingCommandOperationId = ""
+        root.pendingSendResultDelivered(id, presentationGeneration,
+          requestedIntent, outgoingToken)
+        outgoingToken = ""
+        root.resumeDeferredCanonicalReconcile()
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function refreshActivePendingSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id, "refreshing", "", "", amount)
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/refresh", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePendingSend(id,
+            result.error.code === "coco_error"
+              ? "refresh_unavailable" : result.error.code, operation)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id) {
+          root.reconcileActivePendingSend(id, "invalid_response", operation)
+          return
+        }
+        root.reconcileActivePendingCollections(id, result.value, false, "")
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
+      return false
+    }
+    sendCommandRequest = request
+    return true
+  }
+
+  function reclaimActivePendingSend(operationId) {
+    var id = String(operationId || "")
+    var operation = canonicalSendOperation(id)
+    if (!id || !operation || String(operation.state || "") !== "pending"
+        || !sendCommandsAvailable || sendCommandRequest
+        || sendReconcileRequests.length > 0 || sendResultReconciling) return false
+    var amount = activePendingSendAmount(id, operation)
+    abortIncrementalSendFetches()
+    activePendingCommandOperationId = id
+    updatePendingSendAction(id, "reclaiming", "", "", amount)
+    var request = sendRequest("POST", "/v1/operations/send/"
+      + encodeURIComponent(id) + "/reclaim", undefined, function(result) {
+        if (request !== root.sendCommandRequest) return
+        root.sendCommandRequest = null
+        if (!result.ok) {
+          root.reconcileActivePendingSend(id, result.error.code, operation)
+          return
+        }
+        if (result.status !== 200 || !root.isSendOperation(result.value)
+            || String(result.value.id || "") !== id
+            || String(result.value.state || "") !== "rolled_back") {
+          root.reconcileActivePendingSend(id, "invalid_response", operation)
+          return
+        }
+        root.reconcileActivePendingSend(id, "", result.value)
+      })
+    if (!request) {
+      activePendingCommandOperationId = ""
+      updatePendingSendAction(id, "error", "credential_unavailable", "", amount)
+      resumeDeferredCanonicalReconcile()
       return false
     }
     sendCommandRequest = request
